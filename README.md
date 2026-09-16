@@ -53,7 +53,7 @@ claude --version
 codex --version
 ```
 
-The project `.mcp.json` exposes Maestro, and Memvara to Claude Code. Approve the project MCP server once when Claude asks.
+The project `.mcp.json` exposes Maestro to Claude Code. Approve the project MCP server once when Claude asks.
 
 ## Normal use
 
@@ -94,6 +94,12 @@ effort = "high"
 ```
 
 Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, and `xhigh`. The selected values are persisted in Memvara with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
+
+## Task identity and recovery
+
+Memvara is the authoritative task registry. `.maestro/tasks.json` is only a cache for fast CLI startup. If it is deleted or becomes stale, `maestro list` rebuilds it from Memvara, and numeric references such as `maestro status 6` continue to resolve.
+
+The MCP servers use repository-local launchers that prefer `.venv/bin/python`, so Claude Code and the CLI use the same Python environment when the project has a virtualenv.
 
 ## Shared memory
 

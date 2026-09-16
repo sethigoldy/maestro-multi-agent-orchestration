@@ -49,6 +49,12 @@ def main() -> int:
             print(json.dumps(m.codex_defaults(), indent=2))
             return 0
         return 1
+    except KeyError as exc:
+        print(f"maestro: {exc.args[0]}", file=__import__("sys").stderr)
+        return 2
+    except ValueError as exc:
+        print(f"maestro: {exc}", file=__import__("sys").stderr)
+        return 2
     finally:
         m.close()
 

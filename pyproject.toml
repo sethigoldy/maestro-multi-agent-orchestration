@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memvara-maestro"
-version = "0.4.0"
+version = "0.5.0"
 description = "Claude-supervised multi-agent orchestration with Codex implementation and self-hosted Memvara memory"
 requires-python = ">=3.11"
 dependencies = ["memvara>=0.2.0", "mcp>=1.0.0"]

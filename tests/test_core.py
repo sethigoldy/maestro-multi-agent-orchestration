@@ -64,3 +64,50 @@ def test_codex_model_and_effort_are_persisted(tmp_path):
         assert status["effort"] == "high"
     finally:
         m.close()
+
+
+
+def test_registry_survives_deleted_index(tmp_path: Path):
+    m = Maestro(tmp_path)
+    try:
+        task = m.create_handoff("Durable", "Keep it", "D")
+        m.close()
+        (tmp_path / ".maestro" / "tasks.json").unlink()
+        m2 = Maestro(tmp_path)
+        try:
+            assert m2.list_tasks()[0]["task_id"] == task["task_id"]
+            assert m2.status("1")["title"] == "Durable"
+        finally:
+            m2.close()
+    finally:
+        try:
+            m.close()
+        except Exception:
+            pass
+
+
+
+def test_legacy_index_migrates_into_memvara(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    task_id = "task-legacy-001"
+    (state / "tasks.json").write_text(
+        '[{"number": 7, "task_id": "%s", "title": "Legacy", "created_at": "2026-09-16T00:00:00+00:00"}]' % task_id,
+        encoding="utf-8",
+    )
+    m = Maestro(tmp_path)
+    try:
+        assert m.resolve_task("7") == task_id
+        assert m._registry_records()[0]["title"] == "Legacy"
+    finally:
+        m.close()
+
+
+def test_unknown_numeric_task_has_friendly_error(tmp_path: Path):
+    m = Maestro(tmp_path)
+    try:
+        import pytest
+        with pytest.raises(KeyError, match="Unknown task number 6"):
+            m.status("6")
+    finally:
+        m.close()
