@@ -1,0 +1,11 @@
+# Maestro runtime state
+.maestro/memory.db
+.maestro/memory.db-*
+.maestro/tasks.json
+.maestro/tasks/
+.maestro/designs/
+
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/

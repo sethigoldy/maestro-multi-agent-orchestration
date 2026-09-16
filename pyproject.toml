@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memvara-maestro"
+version = "0.4.0"
+description = "Claude-supervised multi-agent orchestration with Codex implementation and self-hosted Memvara memory"
+requires-python = ">=3.11"
+dependencies = ["memvara>=0.2.0", "mcp>=1.0.0"]
+
+[project.scripts]
+maestro = "maestro.cli:main"
+maestro-mcp = "maestro.mcp_server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["maestro"]
+
+[tool.setuptools.package-data]
+"maestro" = ["../.claude/skills/maestro/SKILL.md"]

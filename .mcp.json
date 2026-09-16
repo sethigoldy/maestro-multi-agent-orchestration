@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "maestro": {
+      "command": "python3",
+      "args": ["-m", "maestro.mcp_server"]
+    },
+    "memvara": {
+      "command": "python3",
+      "args": ["-m", "memvara.server"],
+      "env": {
+        "MEMVARA_DB": ".maestro/memory.db",
+        "MEMVARA_USER": "developer",
+        "MEMVARA_TENANT": "default",
+        "MEMVARA_PREDICATES": "engineering,decisions"
+      }
+    }
+  }
+}
