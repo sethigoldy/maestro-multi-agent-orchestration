@@ -1,7 +1,13 @@
-#!/usr/bin/env bash
-set -euo pipefail
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-if [[ -x "$ROOT/.venv/bin/python" ]]; then
-  exec "$ROOT/.venv/bin/python" -m maestro.mcp_server
+#!/bin/sh
+set -eu
+
+REPO_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+PYTHON="$REPO_ROOT/.venv/bin/python"
+
+if [ ! -x "$PYTHON" ]; then
+    echo "maestro-mcp: missing Python environment: $PYTHON" >&2
+    echo "Run: python3.11 -m venv .venv && .venv/bin/python -m pip install -e ." >&2
+    exit 1
 fi
-exec "$(command -v python3)" -m maestro.mcp_server
+
+exec "$PYTHON" -m maestro.mcp_server

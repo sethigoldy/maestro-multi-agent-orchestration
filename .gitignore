@@ -1,26 +1,29 @@
-# Maestro runtime state
-.maestro/state.jsonl
-.maestro/project-state.jsonl
-.maestro/tasks.json
-.maestro/tasks/
-.maestro/staged/
-.maestro/designs/
-
-# Python build artifacts
-build/
-dist/
-*.egg-info/
+# Python
+__pycache__/
+*.py[cod]
+*.so
 
 # Virtual environments
 .venv/
 venv/
+env/
 
-# Test/coverage artifacts
+# Testing / coverage
 .pytest_cache/
 .coverage
-coverage.xml
+.coverage.*
 htmlcov/
+.tox/
+.nox/
 
-# Python caches
-__pycache__/
-*.py[cod]
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Maestro runtime state
+.maestro/*
+!.maestro/config.toml

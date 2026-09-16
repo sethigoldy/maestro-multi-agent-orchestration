@@ -1,10 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "mcp__maestro__delegate_to_codex",
-      "mcp__maestro__task_status",
-      "mcp__maestro__list_tasks",
-      "mcp__maestro__review_task",
+      "mcp__maestro__*"
     ]
   }
 }
