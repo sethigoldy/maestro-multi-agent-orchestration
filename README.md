@@ -385,3 +385,7 @@ The first 0.7 run for a project imports the 0.6 `.maestro/project-state.jsonl` t
 
 Fixes the `codex_followup` worker action mismatch. The worker CLI now accepts `followup` and executes the Codex follow-up path correctly. Maestro also detects an immediate worker exit and records the task as failed with the exit code and log path instead of reporting a successful dispatch.
 
+
+## 0.8.4 hygiene and configuration fixes
+
+0.8.4 keeps user-level task state, supports project/worktree-aware Codex configuration including `gpt-5.6-luna` with `max` reasoning effort, exposes the direct `codex-followup` path, and includes the full coverage CI workflow. The project config in `.maestro/config.toml` remains tracked; generated build artifacts belong in `build/` and `dist/` and are not source files.

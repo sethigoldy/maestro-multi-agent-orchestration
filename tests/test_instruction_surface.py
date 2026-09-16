@@ -5,7 +5,7 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_version_is_084():
+def test_version_is_083():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert data["project"]["version"] == "0.8.4"
 

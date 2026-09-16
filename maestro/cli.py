@@ -12,7 +12,6 @@ VERSION = "0.8.4"
 
 
 def _workspace(value: str | None) -> Path:
-    # An explicitly empty MAESTRO_WORKSPACE means "use user-level Maestro state".
     if value is not None and not str(value).strip():
         return Path.home().resolve()
     env_value = os.environ.get("MAESTRO_WORKSPACE")
@@ -51,7 +50,6 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 
 
 def _scope_for_list(args: argparse.Namespace) -> tuple[Path, str | None]:
-    """Return workspace root used to initialize Maestro and an optional filter."""
     if getattr(args, "project", None):
         project = _project(args.project)
         return project, str(project)
@@ -69,7 +67,7 @@ def _scope_for_list(args: argparse.Namespace) -> tuple[Path, str | None]:
 
 
 def _filter_tasks(tasks: list[dict], project_root: str | None = None, workspace: str | None = None) -> list[dict]:
-    out=[]
+    out = []
     for task in tasks:
         task_project = str(task.get("project_root") or "")
         task_workspace = str(task.get("workspace") or "")
@@ -126,7 +124,8 @@ def main() -> int:
 
     args = p.parse_args(_normalize_argv(sys.argv[1:]))
     if args.cmd == "task" and args.task_cmd is None:
-        task.print_help(); return 2
+        task.print_help()
+        return 2
     try:
         if args.cmd == "storage" and args.storage_cmd == "migrate-memvara":
             m = Maestro(_workspace(getattr(args, "workspace", None)))
@@ -134,7 +133,7 @@ def main() -> int:
                 print(json.dumps(m.migrate_legacy_memvara(), indent=2)); return 0
             finally: m.close()
 
-        if args.cmd == "task" and args.task_cmd == "list" or args.cmd == "list":
+        if (args.cmd == "task" and args.task_cmd == "list") or args.cmd == "list":
             base, scope = _scope_for_list(args)
             m = Maestro(base)
             try:
@@ -182,5 +181,6 @@ def main() -> int:
     except ValueError as exc:
         print(f"maestro: {exc}", file=sys.stderr); return 2
 
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+
+if __name__ == "__main__":
+    raise SystemExit(main())  # pragma: no cover
