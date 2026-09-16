@@ -66,6 +66,7 @@ Run focused tests and report files changed, tests/results, deviations, and remai
 """
 
     task_dir = m.state_dir / "tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
     codex_cmd = ["codex", "exec", "--full-auto"]
     if model:
         codex_cmd.extend(["--model", model])
@@ -127,7 +128,9 @@ def verify(m: Maestro, task_id: str) -> bool:
     tests = subprocess.run(test_cmd, cwd=m.root, text=True, capture_output=True)
     ok = diff.returncode == 0 and tests.returncode == 0
     report = f"workspace: {m.root}\nverification command: {' '.join(test_cmd)}\n\ngit diff --check:\n{diff.stdout}\n{diff.stderr}\n\nverification:\n{tests.stdout}\n{tests.stderr}"
-    report_path = m.state_dir / "tasks" / task_id / "verification.txt"
+    task_dir = m.state_dir / "tasks" / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    report_path = task_dir / "verification.txt"
     report_path.write_text(report, encoding="utf-8")
     episode = m.mem.add(f"Verification for {task_id}.\n{report}", role="system", ts=now())
     m._write_claim(task_id, "task_verification", f"{'PASSED' if ok else 'FAILED'}: {report_path}", episode.episode_ids)

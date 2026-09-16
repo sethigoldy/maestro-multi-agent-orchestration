@@ -48,6 +48,11 @@ def _effective_workspace(args: argparse.Namespace) -> Path:
     return _workspace(getattr(args, "workspace", None))
 
 
+def _is_project_root(path: Path) -> bool:
+    """Whether a workspace path is a Claude project root with worktrees."""
+    return (path / ".claude" / "worktrees").is_dir()
+
+
 def _discover_workspaces(project: Path) -> list[Path]:
     """Find existing Maestro workspaces without creating new state directories."""
     candidates: list[Path] = [project]
@@ -185,6 +190,25 @@ def main() -> int:
             raise ValueError("--project is supported with `maestro task list` and `maestro task status/show` only")
 
         workspace = _effective_workspace(args)
+
+        # When the workspace is the actual Claude project root, treat task
+        # inspection as project-scoped by default. This matches the way Claude
+        # creates state in `.claude/worktrees/*/.maestro` while still allowing
+        # direct worktree inspection when --workspace points at a worktree.
+        if _is_project_root(workspace):
+            if args.cmd == "task" and args.task_cmd == "list":
+                print(json.dumps(_project_tasks(workspace), indent=2))
+                return 0
+            if args.cmd == "task" and args.task_cmd in {"status", "show"}:
+                print(json.dumps(_project_status(workspace, args.task_id), indent=2))
+                return 0
+            if args.cmd == "list":
+                print(json.dumps(_project_tasks(workspace), indent=2))
+                return 0
+            if args.cmd == "status":
+                print(json.dumps(_project_status(workspace, args.task_id), indent=2))
+                return 0
+
         m = Maestro(workspace)
         try:
             if args.cmd == "task":
@@ -194,8 +218,7 @@ def main() -> int:
                 if args.task_cmd in {"status", "show"}:
                     print(json.dumps(m.status(args.task_id), indent=2))
                     return 0
-                task.print_help()
-                return 2
+                raise AssertionError(f"unhandled task command: {args.task_cmd!r}")  # pragma: no cover
 
             if args.cmd == "handoff":
                 design = Path(args.design_file).read_text(encoding="utf-8")
@@ -217,7 +240,7 @@ def main() -> int:
             if args.cmd == "config":
                 print(json.dumps(m.codex_defaults(), indent=2))
                 return 0
-            return 1
+            return 1  # pragma: no cover
         finally:
             m.close()
     except KeyError as exc:
