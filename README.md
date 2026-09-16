@@ -1,391 +1,806 @@
 # Maestro
 
-**Claude supervises. Codex implements. Maestro stores state locally.**
+**Claude supervises. Codex implements. Maestro keeps the work durable.**
 
-Maestro is a local multi-agent orchestration layer designed to run **behind Claude Code**. The normal user experience is simply talking to Claude. Claude researches and designs, calls Maestro automatically, Maestro starts Codex in the background, verification runs, and Claude reviews the result. Rejected reviews automatically create a new Codex fix pass.
+Maestro is a local multi-agent orchestration layer designed to run behind [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
-## The user experience
+You normally talk only to Claude:
 
 ```text
 You
  │
  ▼
 Claude Code
- │ design
  │
- │ delegate_to_codex()
+ │ understands request
+ │ creates compact design
+ │
  ▼
 Maestro
- │ persist task + design
+ │
+ │ persists task state
+ │ starts Codex
+ │
  ▼
-Local filesystem state
- │ shared durable state
- ▼
-Codex (background)
- │ implement
+Codex
+ │
+ │ implements
+ │ runs focused checks
+ │
  ▼
 Maestro
- │ git diff --check + pytest
+ │
+ │ deterministic verification
+ │
  ▼
 Claude Code
- │ review
- ├─ approved ──► complete
- └─ changes ───► Maestro → Codex fix → verify → Claude review
+ │
+ ├── approve → complete
+ │
+ └── reject → Codex follow-up/fix → verify → review
 ```
 
-You normally **do not run `maestro` yourself**.
+Claude is the supervisor and reviewer. Codex owns implementation, testing, debugging, refactoring, and mechanical changes. Maestro provides the durable task lifecycle and the bridge between them.
 
-## Install
+You normally **do not need to run Maestro manually**.
 
-Python 3.11+ is recommended.
+---
 
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -e .
-```
+## 1. What you need
 
-Make sure both coding CLIs are installed and authenticated:
+Before installing Maestro, make sure you have:
+
+* Python **3.11 or newer**
+* [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+* [Codex CLI](https://github.com/openai/codex)
+
+Check that Claude and Codex are available:
 
 ```bash
 claude --version
 codex --version
 ```
 
-The project `.mcp.json` exposes Maestro to Claude Code. Approve the project MCP server once when Claude asks.
+Authenticate both CLIs using their normal setup flow.
 
-## Normal use
+---
 
-Start Claude Code in this repository and say:
+## 2. Install Maestro
 
-```text
-Build the new semantic-search feature. Inspect the existing architecture,
-create an implementation design first, then delegate the implementation,
-verify it, and review the result.
-```
-
-Claude will call `delegate_to_codex` automatically. That call returns immediately with a task number. Codex runs in the background; the task state and artifacts are persisted directly under `.maestro/`.
-
-When Claude checks later, it calls `task_status`. If Claude rejects the implementation, it calls `review_task(..., approved=false, ...)`; Maestro starts Codex again with the review findings and re-runs verification automatically.
-
-## CLI (optional)
-
-The CLI is only for debugging, CI, and operators:
+Clone the repository and enter it:
 
 ```bash
-maestro list
-maestro status 1
-maestro status task-20260916-120000-a1b2c3
-maestro handoff --title "..." --request "..." --design-file .maestro/designs/feature.md
-maestro run 1
+git clone https://github.com/sethigoldy/multi-agent-orchestration.git
+cd multi-agent-orchestration
 ```
 
-`1` is a human-friendly task number. You do not need to remember UUID-like IDs.
-
-## Codex model and reasoning effort
-
-Set task defaults in the project root `.maestro/config.toml` (for example, in the main repository root; Claude worktree sessions inherit it):
-
-```toml
-[codex]
-model = "gpt-5.6-luna"
-effort = "max"
-```
-
-Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. GPT-5.6 Luna supports `max`. The selected values are persisted in `.maestro/state.jsonl` with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
-
-Config precedence is: user-level `~/.maestro/config.toml`, then project-root `.maestro/config.toml`, then the active worktree `.maestro/config.toml`. More specific project/worktree values override user defaults.
-
-## Task identity and recovery
-
-The filesystem state in `.maestro/state.jsonl` is authoritative for task state. `.maestro/tasks.json` is a rebuildable compatibility index. If the index is deleted or becomes stale, `maestro task list` (or the legacy `maestro list`) rebuilds it from the local state file, and numeric references such as `maestro status 6` continue to resolve.
-
-The MCP servers use repository-local launchers that prefer `.venv/bin/python`, so Claude Code and the CLI use the same Python environment when the project has a virtualenv.
-
-## User-level task state
-
-Maestro 0.7 stores task identity and lifecycle state at the user level instead of creating a task registry in every Claude worktree. This makes `maestro task list` independent of worktree-local registry files and keeps task history available even when worktrees are created or removed.
-
-Default locations:
-
-```text
-macOS / Linux: ~/.maestro/
-Windows:       %LOCALAPPDATA%\Maestro\
-```
-
-Set `MAESTRO_HOME` to override the location on any platform. The user-level directory contains the authoritative task registry/state, configuration, locks, and migration markers. Actual designs, Codex results, handoff files, and verification reports remain in each task's workspace under `.maestro/`.
-
-```text
-~/.maestro/
-├── state.jsonl
-├── registry.json
-├── registry.lock
-├── config.toml
-├── tasks/
-└── migrations/
-
-project/.claude/worktrees/<worktree>/.maestro/
-├── staged/
-├── designs/
-└── tasks/
-```
-
-From the project root, this is now enough to list tasks across all Claude worktrees:
+Create a virtual environment:
 
 ```bash
-MAESTRO_WORKSPACE=/path/to/project maestro task list
+python3.11 -m venv .venv
+source .venv/bin/activate
 ```
 
-You can also list everything for the current user with no workspace selector:
+On Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+Upgrade packaging tools and install Maestro:
 
 ```bash
-maestro task list
+python -m pip install -U pip
+python -m pip install -e .
 ```
 
-## Migrating from 0.6.x
-
-Maestro 0.7 automatically imports the 0.6 project-level `project-state.jsonl` journal into the user-level registry the first time that project is opened. The migration is idempotent and preserves the original task number as `legacy_task_number` while assigning a globally unique user-level task number.
-
-If an older release left a worktree-local `~/.maestro/memory.db`, Maestro can also import its Maestro task claims into the selected filesystem backend. This does not switch the project back to Memvara.
-
-## Local task artifacts
-
-Task artifacts remain workspace-local so designs and implementation evidence stay alongside the code they describe. User-level state contains metadata and references, not a second copy of the full design/result files.
-
-## Using Memvara with Maestro
-
-Filesystem storage is the default and requires no external memory service. Memvara is an optional user-level storage backend for users who want Maestro task state persisted through Memvara instead of `~/.maestro/state.jsonl`.
-
-### Install the optional Memvara dependency
-
-Install Maestro with the `memvara` extra:
+Verify the installation:
 
 ```bash
-python -m pip install -e ".[memvara]"
+maestro --version
 ```
 
-Or, for a normal package installation:
+---
 
-```bash
-python -m pip install "maestro[memvara]"
-```
+## 3. Configure Claude Code
 
-### Select the Memvara backend
+Maestro is exposed to Claude Code through the project's `.mcp.json`.
 
-Set the backend in `.maestro/config.toml`:
-
-```toml
-[storage]
-backend = "memvara"
-```
-
-You can also select it for the current shell with:
-
-```bash
-export MAESTRO_STORAGE=memvara
-```
-
-The configuration file is the persistent choice; `MAESTRO_STORAGE` is useful for temporary overrides and CI/testing. The supported values are `filesystem` and `memvara`. Filesystem remains the default when neither is configured.
-
-### Memvara MCP configuration
-
-When Claude also needs direct access to Memvara for broader semantic/project memory, expose Memvara as a separate MCP server in the project `.mcp.json`. A typical setup is:
+The repository should contain:
 
 ```json
 {
   "mcpServers": {
     "maestro": {
-      "command": "python3",
-      "args": ["-m", "maestro.mcp_server"]
-    },
-    "memvara": {
-      "command": "python3",
-      "args": ["-m", "memvara.server"],
-      "env": {
-        "MEMVARA_DB": ".maestro/memory.db",
-        "MEMVARA_USER": "developer",
-        "MEMVARA_TENANT": "default"
-      }
+      "command": "scripts/maestro-mcp"
     }
   }
 }
 ```
 
-The exact Memvara server options can depend on the Memvara version you install. Maestro's `memvara` storage backend and the Memvara MCP server are separate concerns: the backend stores Maestro's task state, while the MCP server can give Claude direct semantic-memory tools.
+The launcher uses the repository's virtual environment:
 
-### When to use each backend
-
-Use **filesystem** for the simplest, fully local setup, easy inspection/debugging, offline use, and CI. Use **Memvara** when you specifically want Maestro's task state to participate in a shared Memvara-backed memory layer. You can switch back at any time with:
-
-```bash
-export MAESTRO_STORAGE=filesystem
+```text
+<maestro-repository>/.venv/bin/python
 ```
 
-or:
+so Claude Code and your local Maestro CLI use the same Python environment.
+
+Make sure the launcher is executable:
+
+```bash
+chmod +x scripts/maestro-mcp
+```
+
+You can verify it exists:
+
+```bash
+ls -l scripts/maestro-mcp
+```
+
+The project also contains `.claude/settings.json` with permission for Maestro's MCP tools.
+
+Start Claude Code from the repository/project where you want to use Maestro. Approve the project MCP server when Claude Code asks.
+
+---
+
+## 4. Configure Codex defaults
+
+Project defaults belong in:
+
+```text
+.maestro/config.toml
+```
+
+A typical configuration is:
 
 ```toml
+[codex]
+model = "gpt-5.6-luna"
+effort = "max"
+
 [storage]
 backend = "filesystem"
 ```
 
-## Architecture
+Supported reasoning effort values are:
 
-- `maestro/core.py` — task identity, numbering, state, delegation and review lifecycle
-- `maestro/worker.py` — detached Codex implementation/fix worker and deterministic verification
-- `maestro/mcp_server.py` — tools used automatically by Claude Code
-- `maestro/cli.py` — optional human/operator CLI
-- `.claude/skills/maestro/SKILL.md` — Claude's automatic orchestration behavior
-- `.mcp.json` — project MCP configuration
-- `CLAUDE.md` — supervisor rules
-- `AGENTS.md` — Codex implementation rules
-
-### Conceptual model
-
-There is one supervisor (Claude), one primary implementation agent (Codex), deterministic verification, and a durable local filesystem state layer. A future version can add specialist agents without changing the user-facing workflow.
-
-
-## Git worktrees (important)
-
-Maestro never uses the MCP server process's current working directory as the project identity. Claude must resolve the active worktree with:
-
-```bash
-git rev-parse --show-toplevel
+```text
+low
+medium
+high
+xhigh
+max
 ```
 
-and pass that absolute path as `workspace` on every Maestro MCP call. This matters because Claude Code can switch between Git worktrees while the long-lived Maestro MCP process remains started from an earlier worktree.
-
-Codex is always launched with the task's explicit `workspace`, and task artifacts, logs, designs, and verification reports are written there. Maestro never `cd`s based on its own startup directory, never commits, and never installs dependencies.
-
-## Verification behavior
-
-Maestro does not repair or provision environments. Verification is deterministic and environment-aware:
-
-1. An explicit `[verification]` command in `.maestro/config.toml` wins.
-2. Otherwise Maestro uses `make check` when a Makefile exists.
-3. Node projects with a `test` script use npm/pnpm/yarn according to the lockfile. Go uses `go test ./...`; Rust uses `cargo test`.
-4. Python projects use the workspace `.venv` (or `MAESTRO_PYTHON`, then the Maestro interpreter) and run pytest only when pytest is actually installed.
-5. When no runnable test command is available, Maestro records a verification note and falls back to `git diff --check` rather than falsely reporting a test failure.
-
-A real non-zero result from the selected test command is still recorded as a verification failure. Maestro never installs dependencies or changes the environment.
-
-For repositories with a precise check, configure it explicitly:
+You can also configure deterministic verification:
 
 ```toml
 [verification]
 command = ["make", "check"]
 ```
 
-## Low-token handoff staging
+Configuration precedence is:
 
-Claude does not send the full design as an MCP argument. It writes the design once under `.maestro/staged/` and sends Maestro only a tiny JSON descriptor. The staged descriptor survives tool, validation, or subprocess failures, so the exact handoff can be retried without regenerating or re-sending the design. On successful launch Maestro archives the descriptor under the task directory.
-
-## Project-level task listing
-
-When `MAESTRO_WORKSPACE` points at the project root, `maestro task list` scans all Claude worktrees and merges task records from `.maestro/tasks`, `tasks.json`, and `state.jsonl`. This means a task can appear even while Claude is still writing its normal registry/index state.
-
-```bash
-MAESTRO_WORKSPACE=/path/to/project maestro task list
-MAESTRO_WORKSPACE=/path/to/project maestro task task-<id>
+```text
+~/.maestro/config.toml
+        ↓
+<project-root>/.maestro/config.toml
+        ↓
+<active-worktree>/.maestro/config.toml
 ```
 
-An explicit worktree path still limits inspection to that one workspace.
+More specific configuration overrides less specific configuration.
 
-## CLI workspace selection
+---
 
-The CLI operates on the target repository's `.maestro` state. When running Maestro from
-a separate checkout (for example the Maestro source repository itself), pass the target
-workspace explicitly or set `MAESTRO_WORKSPACE`: 
+## 5. Your first Maestro task
+
+Start Claude Code in the project you want to modify.
+
+Then ask Claude for normal implementation work, for example:
+
+```text
+Implement semantic search for the existing document API.
+
+First inspect the repository and understand the current architecture.
+Create a compact implementation design, then delegate the implementation
+to Maestro/Codex. Run the relevant tests and review the resulting diff.
+```
+
+Claude will:
+
+1. Inspect the target project.
+2. Create a compact implementation handoff.
+3. Call Maestro through MCP.
+4. Maestro creates a durable task.
+5. Codex runs in the active workspace.
+6. Maestro performs deterministic verification.
+7. Claude reviews the implementation.
+8. Claude can send additional work to Codex through `codex_followup`.
+9. Claude makes the final approval decision.
+
+You do not need to manually copy prompts between Claude and Codex.
+
+---
+
+## 6. How worktrees are handled
+
+Claude Code can work in Git worktrees such as:
+
+```text
+project/
+└── .claude/
+    └── worktrees/
+        └── feature-search/
+```
+
+Maestro preserves the active worktree explicitly.
+
+A task records both:
+
+```text
+workspace
+project_root
+```
+
+For example:
+
+```text
+workspace   = /path/to/project/.claude/worktrees/feature-search
+project_root = /path/to/project
+```
+
+Codex runs in the task's `workspace`.
+
+Maestro does **not** use the MCP server's own current working directory as the task workspace.
+
+Claude should pass the active absolute worktree path as the `workspace` argument on every Maestro MCP call.
+
+---
+
+## 7. Where Maestro stores state
+
+Maestro keeps its authoritative runtime state at the **user level**, not in every Claude worktree.
+
+Default locations:
+
+```text
+macOS / Linux:
+~/.maestro/
+
+Windows:
+%LOCALAPPDATA%\Maestro\
+```
+
+You can override this location:
 
 ```bash
-maestro task list --workspace /path/to/your/project
-maestro task status 20260916-134921-245a01 --workspace /path/to/your/project
+export MAESTRO_HOME=/path/to/maestro-state
+```
 
-export MAESTRO_WORKSPACE=/path/to/your/project
+The user-level directory contains:
+
+```text
+~/.maestro/
+├── registry.json
+├── state.jsonl
+├── registry.lock
+├── config.toml
+├── designs/
+├── staged/
+├── tasks/
+└── migrations/
+```
+
+The important distinction is:
+
+```text
+~/.maestro/
+    persistent Maestro runtime state and task artifacts
+
+<project>/.maestro/config.toml
+    project configuration
+
+<active-worktree>/.maestro/config.toml
+    optional worktree-specific configuration
+```
+
+Runtime task state and artifacts are **not recreated inside every worktree**.
+
+The task record still remembers which worktree was used so Codex can continue working in the correct location.
+
+---
+
+## 8. Task listing and recovery
+
+Task identity is stored in the user-level Maestro registry, so task lookup does not depend on keeping a separate registry inside every worktree.
+
+List all tasks available to the current user:
+
+```bash
 maestro task list
 ```
 
-`maestro task show <id>` is an alias for `maestro task status <id>`. The legacy
-`maestro list` and `maestro status <id>` commands remain supported.
-
-### CLI workspace and project discovery (0.5.5)
-
-The CLI can target the same workspace that Claude/MCP uses:
-
-```bash
-export MAESTRO_WORKSPACE=/path/to/project/.claude/worktrees/my-task
-maestro task list
-maestro task status 10
-maestro task 10
-```
-
-`MAESTRO_WORKSPACE` is used when `--workspace` is omitted. An explicit `--workspace` takes precedence over the environment variable.
-
-To inspect a project and all existing Maestro workspaces under `.claude/worktrees/` without creating new task databases:
+List tasks for a project:
 
 ```bash
 maestro task list --project /path/to/project
-maestro task status <task-id> --project /path/to/project
 ```
 
-Project discovery includes the project root and each immediate `.claude/worktrees/*` directory that already contains Maestro state (`.maestro/state.jsonl` or `.maestro/tasks.json`).
+List tasks using a specific workspace:
 
-## Project-root task discovery
+```bash
+maestro task list --workspace /path/to/project/.claude/worktrees/feature-search
+```
 
-When `MAESTRO_WORKSPACE` points at the project root, Maestro automatically discovers tasks across the Git worktrees used by Claude. Discovery uses `git worktree list` and also checks `.claude/worktrees/*`, so newly-created or partially-initialized worktrees are visible without passing their individual path.
+You can also use:
 
 ```bash
 export MAESTRO_WORKSPACE=/path/to/project
 maestro task list
 ```
 
-A specific worktree can still be queried directly with `--workspace`.
-
-
-## Storage backends
-
-Maestro 0.7 stores task identity and lifecycle state at **user scope**. This is the authoritative task registry, so listing tasks no longer requires scanning every Claude worktree.
-
-On macOS/Linux the default directory is `~/.maestro/`. On Windows it is `%LOCALAPPDATA%\Maestro`. Set `MAESTRO_HOME` to override it on any OS. The registry and task state live there; designs, logs, Codex results, and verification artifacts remain in each task workspace under `.maestro/`.
-
-### Filesystem (default)
-
-```toml
-[storage]
-backend = "filesystem"
-```
-
-### Memvara (optional)
+A task can be referenced by either its human-friendly number or task ID:
 
 ```bash
-pip install "maestro[memvara]"
+maestro task status 10
 ```
+
+```bash
+maestro task status task-20260917-120000-a1b2c3
+```
+
+These are equivalent aliases:
+
+```bash
+maestro task show 10
+maestro status 10
+```
+
+The shorthand below is also supported:
+
+```bash
+maestro task 10
+```
+
+---
+
+## 9. Optional CLI usage
+
+The normal workflow is Claude → Maestro MCP → Codex, but the CLI is useful for debugging, CI, and operators.
+
+### List tasks
+
+```bash
+maestro task list
+```
+
+### Show a task
+
+```bash
+maestro task status 10
+```
+
+### Run an implementation task
+
+```bash
+maestro run 10
+```
+
+### Send a follow-up directly to Codex
+
+```bash
+maestro codex-followup 10 "Fix the failing integration test and rerun the relevant checks."
+```
+
+### Show effective Codex configuration
+
+```bash
+maestro config
+```
+
+### Create a manual handoff
+
+```bash
+maestro handoff \
+  --title "Add semantic search" \
+  --request "Implement semantic search for the document API" \
+  --design-file path/to/design.md
+```
+
+The CLI is optional. Claude normally handles this through MCP.
+
+---
+
+## 10. Deterministic verification
+
+After Codex finishes, Maestro performs deterministic verification.
+
+The selection order is:
+
+1. An explicit `[verification]` command in `.maestro/config.toml`.
+2. `make check` when a `Makefile` exists.
+3. Node projects with a `test` script using npm, pnpm, or yarn according to the lockfile.
+4. Go projects using `go test ./...`.
+5. Rust projects using `cargo test`.
+6. Python projects using the selected Python environment and pytest when pytest is installed.
+7. Otherwise Maestro falls back to `git diff --check`.
+
+Example:
+
+```toml
+[verification]
+command = ["make", "check"]
+```
+
+Maestro does **not** install dependencies, repair the environment, or silently change the project's tooling.
+
+A real non-zero result from the selected verification command is recorded as a verification failure.
+
+---
+
+## 11. Codex follow-ups and reviews
+
+Claude uses `codex_followup` for additional implementation work such as:
+
+* fixing failed tests
+* debugging
+* refactoring
+* implementing review findings
+* making mechanical changes
+
+Claude remains responsible for the final review.
+
+The intended loop is:
+
+```text
+Codex implementation
+        ↓
+verification
+        ↓
+Claude review
+        ↓
+approved ───────────→ complete
+
+rejected
+        ↓
+codex_followup
+        ↓
+verification
+        ↓
+Claude review again
+```
+
+Maestro does not automatically decide that a verification failure requires an implementation change. Verification is evidence; Claude makes the review decision.
+
+---
+
+## 12. Optional Memvara backend
+
+Filesystem storage is the default and requires no additional memory service.
+
+Memvara is optional.
+
+### Install the extra
+
+```bash
+python -m pip install -e ".[memvara]"
+```
+
+### Select Memvara
+
+In `.maestro/config.toml`:
 
 ```toml
 [storage]
 backend = "memvara"
 ```
 
-Or set `MAESTRO_STORAGE=memvara`. The Memvara backend also uses user-level task state, so switching worktrees does not change task visibility.
-
-### Task listing
-
-From a project root:
+Or temporarily for the current shell:
 
 ```bash
-MAESTRO_WORKSPACE=/path/to/project maestro task list
+export MAESTRO_STORAGE=memvara
 ```
 
-That shows tasks for the project, regardless of which `.claude/worktrees/*` created them. A direct worktree path scopes the list to that worktree. You can also use `--project /path/to/project` explicitly.
+Supported values are:
 
-### Migrating from 0.6.x
+```text
+filesystem
+memvara
+```
 
-The first 0.7 run for a project imports the 0.6 `.maestro/project-state.jsonl` task journal into `~/.maestro/`. Existing local task numbers are retained as `legacy_task_number`; 0.7 assigns unique user-level task numbers. The migration is one-time per project.
-## 0.8.1
+Filesystem remains the default.
 
-Fixes the `codex_followup` worker action mismatch. The worker CLI now accepts `followup` and executes the Codex follow-up path correctly. Maestro also detects an immediate worker exit and records the task as failed with the exit code and log path instead of reporting a successful dispatch.
+The Maestro Memvara backend and the Memvara MCP server are separate concepts:
 
+```text
+Maestro Memvara backend
+    → stores Maestro's own task state
 
-## 0.8.4 hygiene and configuration fixes
+Memvara MCP server
+    → optionally gives Claude direct access to broader semantic memory
+```
 
-0.8.4 keeps user-level task state, supports project/worktree-aware Codex configuration including `gpt-5.6-luna` with `max` reasoning effort, exposes the direct `codex-followup` path, and includes the full coverage CI workflow. The project config in `.maestro/config.toml` remains tracked; generated build artifacts belong in `build/` and `dist/` and are not source files.
+You do not need the Memvara MCP server to use Maestro.
+
+---
+
+## 13. Migrating from older Maestro releases
+
+Maestro can migrate legacy project-level task state into the user-level state directory.
+
+Older project journals such as:
+
+```text
+.maestro/project-state.jsonl
+```
+
+can be imported into:
+
+```text
+~/.maestro/
+```
+
+Migration is designed to be idempotent.
+
+Legacy Memvara task state can also be imported into the selected filesystem backend when applicable.
+
+New installations should use the current user-level state model and do not need to create old project-local task registries.
+
+---
+
+## 14. Repository configuration files
+
+The repository uses these files for its orchestration setup:
+
+```text
+.maestro/config.toml
+    Project/worktree Maestro configuration
+
+.mcp.json
+    Claude Code MCP configuration
+
+.claude/settings.json
+    Claude Code MCP permissions
+
+.claude/skills/maestro/SKILL.md
+    Claude's Maestro routing instructions
+
+CLAUDE.md
+    Claude supervisor rules
+
+AGENTS.md
+    Codex implementation rules
+```
+
+Maestro's source code is under:
+
+```text
+maestro/
+```
+
+and the optional MCP launcher is:
+
+```text
+scripts/maestro-mcp
+```
+
+---
+
+## 15. Architecture
+
+The core components are:
+
+```text
+maestro/core.py
+    Task identity, numbering, persistence, configuration,
+    delegation, lifecycle, review, and migration.
+
+maestro/worker.py
+    Background Codex execution and deterministic verification.
+
+maestro/mcp_server.py
+    MCP tools used by Claude Code.
+
+maestro/cli.py
+    Optional human/operator CLI.
+
+scripts/maestro-mcp
+    Selects the repository Python environment and starts the MCP server.
+
+.claude/skills/maestro/SKILL.md
+    Minimal Claude routing contract.
+
+CLAUDE.md
+    Supervisor behavior.
+
+AGENTS.md
+    Implementation-agent rules.
+```
+
+Conceptually:
+
+```text
+                   ┌─────────────────┐
+                   │   Claude Code   │
+                   │   Supervisor    │
+                   └────────┬────────┘
+                            │ MCP
+                            ▼
+                   ┌─────────────────┐
+                   │     Maestro     │
+                   │ Task lifecycle  │
+                   │ Durable state   │
+                   │ Verification    │
+                   └────────┬────────┘
+                            │ subprocess
+                            ▼
+                   ┌─────────────────┐
+                   │      Codex      │
+                   │  Implementation │
+                   │ Tests/debugging │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Active Git      │
+                   │ Worktree        │
+                   └─────────────────┘
+
+                   Persistent state:
+                   ~/.maestro/
+```
+
+There is one supervisor (Claude), one primary implementation agent (Codex), deterministic verification, and one durable Maestro state layer.
+
+---
+
+## 16. Troubleshooting
+
+### Claude cannot start Maestro MCP
+
+Check:
+
+```bash
+ls -l scripts/maestro-mcp
+```
+
+Make it executable:
+
+```bash
+chmod +x scripts/maestro-mcp
+```
+
+Make sure the virtual environment exists:
+
+```bash
+ls -l .venv/bin/python
+```
+
+If it does not:
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+### Maestro is using the wrong Python
+
+Verify:
+
+```bash
+.venv/bin/python -c 'import sys, maestro; print(sys.executable); print(maestro.__file__)'
+```
+
+The MCP server should be launched through:
+
+```text
+scripts/maestro-mcp
+```
+
+rather than a globally installed `python3` environment.
+
+### Codex is not available
+
+Check:
+
+```bash
+codex --version
+```
+
+and authenticate Codex using its normal CLI setup.
+
+Maestro does not install Codex for you.
+
+### A task cannot be found
+
+Check the global registry:
+
+```bash
+maestro task list
+```
+
+You can also inspect:
+
+```text
+~/.maestro/
+```
+
+or set an explicit state directory:
+
+```bash
+export MAESTRO_HOME=/path/to/maestro-state
+```
+
+### Check the active workspace
+
+```bash
+git rev-parse --show-toplevel
+```
+
+Claude should pass the actual active worktree path to Maestro MCP.
+
+---
+
+## 17. Development
+
+Install development dependencies:
+
+```bash
+python -m pip install -e .
+python -m pip install pytest coverage
+```
+
+Run the tests:
+
+```bash
+python -m pytest -q
+```
+
+Run tests with branch coverage:
+
+```bash
+python -m coverage run --branch -m pytest -q
+python -m coverage report --fail-under=100
+```
+
+The project CI enforces 100% line and branch coverage.
+
+Generated files such as these should not be committed:
+
+```text
+build/
+dist/
+*.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+.DS_Store
+```
+
+---
+
+## 18. Design principles
+
+Maestro follows a few simple rules:
+
+**Claude decides what should be built.**
+
+**Codex owns implementation.**
+
+**Maestro owns task lifecycle and durable orchestration state.**
+
+**Verification is deterministic.**
+
+**Claude owns the final review and approval.**
+
+**Maestro never commits code.**
+
+**Maestro never installs project dependencies.**
+
+**The active worktree is explicit.**
+
+**Task state survives worktree creation, switching, and deletion.**
