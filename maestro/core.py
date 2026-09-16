@@ -116,22 +116,36 @@ class Maestro:
 
     def __init__(self, root: str | Path = ".") -> None:
         self.root = self._resolve_workspace(root)
-        self.workspace_state = self.root / ".maestro"
-        self.state_dir = self.workspace_state  # compatibility for worker/legacy callers
-        self.workspace_state.mkdir(parents=True, exist_ok=True)
-        self.design_dir = self.workspace_state / "designs"
-        self.staged_dir = self.workspace_state / "staged"
-        self.task_artifacts = self.workspace_state / "tasks"
+
+        self.user_state_dir = maestro_user_dir()
+        self.user_state_dir.mkdir(parents=True, exist_ok=True)
+
+        (self.user_state_dir / "migrations").mkdir(exist_ok=True)
+        (self.user_state_dir / "tasks").mkdir(exist_ok=True)
+
+        self.workspace_state = self.user_state_dir
+        self.state_dir = self.user_state_dir
+
+        self.design_dir = self.user_state_dir / "designs"
+        self.staged_dir = self.user_state_dir / "staged"
+        self.task_artifacts = self.user_state_dir / "tasks"
+
         self.design_dir.mkdir(exist_ok=True)
         self.staged_dir.mkdir(exist_ok=True)
         self.task_artifacts.mkdir(exist_ok=True)
 
-        self.user_state_dir = maestro_user_dir()
-        self.user_state_dir.mkdir(parents=True, exist_ok=True)
-        (self.user_state_dir / "migrations").mkdir(exist_ok=True)
-        (self.user_state_dir / "tasks").mkdir(exist_ok=True)
         self.index_path = self.user_state_dir / "registry.json"
         self.lock_path = self.user_state_dir / "registry.lock"
+        self.design_dir.mkdir(exist_ok=True)
+        self.staged_dir.mkdir(exist_ok=True)
+        self.task_artifacts.mkdir(exist_ok=True)
+
+        # self.user_state_dir = maestro_user_dir()
+        # self.user_state_dir.mkdir(parents=True, exist_ok=True)
+        # (self.user_state_dir / "migrations").mkdir(exist_ok=True)
+        # (self.user_state_dir / "tasks").mkdir(exist_ok=True)
+        # self.index_path = self.user_state_dir / "registry.json"
+        # self.lock_path = self.user_state_dir / "registry.lock"
 
         self.project_root = self._resolve_project_root(self.root)
         self.project_journal = self.project_root / ".maestro" / "project-state.jsonl"
@@ -193,7 +207,7 @@ class Maestro:
         config_paths = [
             self.user_state_dir / "config.toml",
             self.project_root / ".maestro" / "config.toml",
-            self.workspace_state / "config.toml",
+            self.root / ".maestro" / "config.toml",
         ]
         seen: set[Path] = set()
         for path in config_paths:
@@ -335,10 +349,10 @@ class Maestro:
 
     def _migrate_legacy_memvara(self, strict: bool = False) -> int:
         if self.config["storage_backend"] != "filesystem" or self.memvara_migration_marker.exists(): return 0  # pragma: no branch
-        legacy_db = self.workspace_state / "memory.db"
+        legacy_db = self.root / ".maestro" / "memory.db"
         if not legacy_db.is_file(): return 0
         try:
-            legacy = _MemvaraState(self.workspace_state, "memory.db"); claims = legacy.get_all()
+            legacy = _MemvaraState(self.root / ".maestro", "memory.db"); claims = legacy.get_all()
         except Exception as exc:
             if strict: raise RuntimeError(f"Unable to migrate legacy Memvara state: {exc}") from exc
             return 0

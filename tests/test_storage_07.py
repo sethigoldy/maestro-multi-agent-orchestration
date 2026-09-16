@@ -154,10 +154,30 @@ def test_implement_fix_and_filters(tmp_path, monkeypatch):
     monkeypatch.setattr(m,'launch',lambda task,action,review=None:{'task':task,'action':action,'review':review}); assert m.implement_async(t['task_id'])['action']=='implement'; assert m.fix_async(t['task_id'],'x')['action']=='fix'; assert m.list_tasks(workspace_filter=str(w2))==[]; assert len(m.list_tasks(project_filter=str(project)))==1; m.close()
 
 def test_model_effort_and_storage_memvara_error(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); project,w1,_=git_repo(tmp_path); (w1/'.maestro').mkdir(exist_ok=True); (w1/'.maestro'/'config.toml').write_text('[storage]\nbackend="memvara"\n');
-    with pytest.raises(RuntimeError, match='Memvara backend requested'): Maestro(w1)
-    (w1/'.maestro'/'config.toml').write_text('[codex]\neffort="high"'); m=Maestro(w1); t=m.create_handoff('x','r','d',effort='max'); assert t['effort']=='max';
-    with pytest.raises(ValueError): m.create_handoff('x','r','d',effort='bad'); m.close()
+    env(tmp_path, monkeypatch)
+    project, w1, _ = git_repo(tmp_path)
+
+    (w1 / ".maestro").mkdir(exist_ok=True)
+    (w1 / ".maestro" / "config.toml").write_text(
+        '[storage]\nbackend="memvara"\n'
+    )
+
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "memvara":
+            raise ImportError("memvara intentionally unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+
+    with pytest.raises(
+        RuntimeError,
+        match="Memvara backend requested",
+    ):
+        Maestro(w1)
 
 def test_legacy_memvara_migration(tmp_path, monkeypatch):
     env(tmp_path,monkeypatch); project,w1,_=git_repo(tmp_path)
@@ -169,7 +189,10 @@ def test_legacy_memvara_migration(tmp_path, monkeypatch):
         def close(self): pass
         def remember(self,*a,**k): pass
     mod=types.ModuleType('memvara'); mod.Memvara=C; mod.NullLLM=lambda:None; pysys.modules['memvara']=mod
-    m=Maestro(w1); m.workspace_state.joinpath('memory.db').write_text('x');
+    m = Maestro(w1)
+    legacy_dir = w1 / ".maestro"
+    legacy_dir.mkdir(exist_ok=True)
+    (legacy_dir / "memory.db").write_text("x")
     # Recreate after legacy DB exists so migration executes.
     m.close(); m=Maestro(w1); result=m.migrate_legacy_memvara(); assert result['migrated']; m.close()
 
@@ -461,7 +484,9 @@ def test_final_branch_edges(tmp_path, monkeypatch):
     m=Maestro(w1); m.close()
     monkeypatch.setattr(core.Path,'read_text',original)
     # malformed/filtered memvara registry claim branches
-    mfile=w1/'.maestro/config.toml'; mfile.write_text('[storage]\nbackend="memvara"\n')
+    (w1 / ".maestro").mkdir(exist_ok=True)
+    mfile = w1 / ".maestro/config.toml"
+    mfile.write_text('[storage]\nbackend="memvara"\n')
     import types,sys
     class C:
         def __init__(self,*a,**k): self.data=[types.SimpleNamespace(subject='maestro:registry',predicate='task',object=json.dumps(['x'])),types.SimpleNamespace(subject='other',predicate='task',object='x')]

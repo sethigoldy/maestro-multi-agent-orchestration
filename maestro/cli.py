@@ -79,6 +79,17 @@ def _filter_tasks(tasks: list[dict], project_root: str | None = None, workspace:
     return out
 
 
+def _task_workspace(value: str | None) -> Path:
+    if value is not None and not str(value).strip():
+        return Path.cwd().resolve()
+
+    env_value = os.environ.get("MAESTRO_WORKSPACE")
+    if env_value is not None and env_value.strip():
+        return Path(env_value).expanduser().resolve()
+
+    return Path.cwd().resolve()
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="maestro", description="Claude-supervised orchestration with user-level task state")
     p.add_argument("--version", action="version", version=VERSION)

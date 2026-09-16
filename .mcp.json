@@ -1,8 +1,7 @@
 {
   "mcpServers": {
     "maestro": {
-      "command": "python3",
-      "args": ["-m", "maestro.mcp_server"]
+      "command": "scripts/maestro-mcp"
     }
   }
 }
