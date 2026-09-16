@@ -32,4 +32,4 @@ Maestro/Codex must not commit or install dependencies. Claude owns final review 
 
 Maestro reads the default Codex model and reasoning effort from tracked `.maestro/config.toml`.
 Use the defaults for normal tasks. Override `model` or `effort` in `delegate_to_codex` only when the task clearly warrants it.
-Supported effort values: `low`, `medium`, `high`, `xhigh`.
+Supported effort values: `low`, `medium`, `high`, `xhigh`, `max`.

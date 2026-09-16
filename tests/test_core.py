@@ -111,3 +111,52 @@ def test_unknown_numeric_task_has_friendly_error(tmp_path: Path):
             m.status("6")
     finally:
         m.close()
+
+
+def test_codex_max_effort_is_supported(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text(
+        '[codex]\nmodel = "gpt-5.6-luna"\neffort = "max"\n',
+        encoding="utf-8",
+    )
+    m = Maestro(tmp_path)
+    try:
+        assert m.codex_defaults() == {"model": "gpt-5.6-luna", "effort": "max"}
+        task = m.create_handoff("Luna Max", "R", "D")
+        status = m.status(task["task_id"])
+        assert status["model"] == "gpt-5.6-luna"
+        assert status["effort"] == "max"
+    finally:
+        m.close()
+
+
+def test_staged_handoff_round_trip(tmp_path: Path):
+    stage = tmp_path / ".maestro" / "staged"
+    stage.mkdir(parents=True)
+    design = stage / "feature.md"
+    design.write_text("# Feature\n\nDo the thing.", encoding="utf-8")
+    descriptor = stage / "handoff.json"
+    descriptor.write_text(
+        __import__("json").dumps({
+            "title": "Feature",
+            "request": "Implement it",
+            "design_file": str(design.relative_to(tmp_path)),
+            "model": "gpt-5.6-luna",
+            "effort": "max",
+        }),
+        encoding="utf-8",
+    )
+    m = Maestro(tmp_path)
+    try:
+        task = m.create_handoff_from_file(descriptor)
+        assert task["task_number"] == 1
+        assert task["model"] == "gpt-5.6-luna"
+        assert task["effort"] == "max"
+        assert descriptor.exists()
+        # A retry sees the same staged task and does not create a duplicate.
+        retry = m.create_handoff_from_file(descriptor)
+        assert retry["task_id"] == task["task_id"]
+        assert m.list_tasks()[0]["number"] == 1
+    finally:
+        m.close()

@@ -3,6 +3,7 @@
 .maestro/memory.db-*
 .maestro/tasks.json
 .maestro/tasks/
+.maestro/staged/
 .maestro/designs/
 
 .venv/

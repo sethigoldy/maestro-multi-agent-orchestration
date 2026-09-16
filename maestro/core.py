@@ -35,7 +35,9 @@ class Maestro:
         self.state_dir = self.root / ".maestro"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.design_dir = self.state_dir / "designs"
+        self.staged_dir = self.state_dir / "staged"
         self.design_dir.mkdir(parents=True, exist_ok=True)
+        self.staged_dir.mkdir(parents=True, exist_ok=True)
         (self.state_dir / "tasks").mkdir(parents=True, exist_ok=True)
         self.index_path = self.state_dir / "tasks.json"
         self.lock_path = self.state_dir / "task-index.lock"
@@ -98,7 +100,7 @@ class Maestro:
         effort = config.get("effort") or os.environ.get("MAESTRO_CODEX_EFFORT")
         if effort is not None:
             effort = str(effort).lower()
-            if effort not in {"low", "medium", "high", "xhigh"}:
+            if effort not in {"low", "medium", "high", "xhigh", "max"}:
                 raise ValueError(f"Unsupported Codex reasoning effort: {effort}")
         return {"model": str(model) if model else None, "effort": effort}
 
@@ -311,12 +313,81 @@ class Maestro:
             output.append({**item, **state})
         return sorted(output, key=lambda x: int(x["number"]))
 
+    def _stage_path(self, handoff_file: str | Path) -> Path:
+        path = Path(handoff_file).expanduser()
+        if not path.is_absolute():
+            path = self.root / path
+        path = path.resolve()
+        try:
+            path.relative_to(self.staged_dir.resolve())
+        except ValueError as exc:
+            raise ValueError(f"Handoff file must be under {self.staged_dir}") from exc
+        return path
+
+    def _load_staged_handoff(self, handoff_file: str | Path) -> tuple[Path, dict[str, Any]]:
+        path = self._stage_path(handoff_file)
+        if not path.exists():
+            raise ValueError(f"Handoff file does not exist: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid handoff file: {path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Handoff file must contain a JSON object")
+        for key in ("title", "request", "design_file"):
+            if not payload.get(key):
+                raise ValueError(f"Handoff file is missing required field: {key}")
+        design_path = Path(str(payload["design_file"])).expanduser()
+        if not design_path.is_absolute():
+            design_path = self.root / design_path
+        design_path = design_path.resolve()
+        try:
+            design_path.relative_to(self.root.resolve())
+        except ValueError as exc:
+            raise ValueError("design_file must be inside the active workspace") from exc
+        if not design_path.is_file():
+            raise ValueError(f"Design file does not exist: {design_path}")
+        payload["design_file"] = str(design_path)
+        return path, payload
+
+    def create_handoff_from_file(self, handoff_file: str | Path) -> dict[str, Any]:
+        """Create/reuse a handoff from a tiny staged metadata file.
+
+        The staged file deliberately keeps the large design out of the MCP call. It
+        remains on disk until task creation *and* worker launch succeed, so a transient
+        MCP/subprocess failure can retry the exact same handoff without regenerating the
+        design or paying the context cost again.
+        """
+        stage_path, payload = self._load_staged_handoff(handoff_file)
+        existing_task_id = payload.get("task_id")
+        if existing_task_id:
+            task_id = self.resolve_task(str(existing_task_id))
+            status = self.status(task_id)
+            status["staged_handoff"] = str(stage_path)
+            return status
+
+        design = Path(payload["design_file"]).read_text(encoding="utf-8")
+        task = self.create_handoff(
+            str(payload["title"]),
+            str(payload["request"]),
+            design,
+            model=payload.get("model"),
+            effort=payload.get("effort"),
+        )
+        payload["task_id"] = task["task_id"]
+        payload["task_number"] = task["task_number"]
+        payload["created_at"] = self._now().isoformat()
+        tmp = stage_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(stage_path)
+        return {**task, "staged_handoff": str(stage_path)}
+
     def create_handoff(self, title: str, request: str, design: str, model: str | None = None, effort: str | None = None) -> dict[str, Any]:
         selected_model = model or self.config.get("model")
         selected_effort = effort or self.config.get("effort")
         if selected_effort is not None:
             selected_effort = str(selected_effort).lower()
-            if selected_effort not in {"low", "medium", "high", "xhigh"}:
+            if selected_effort not in {"low", "medium", "high", "xhigh", "max"}:
                 raise ValueError(f"Unsupported Codex reasoning effort: {selected_effort}")
 
         task_id = f"task-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -357,6 +428,16 @@ class Maestro:
         if review is not None:
             cmd.extend(["--review", review])
         return cmd
+
+    def finalize_staged_handoff(self, handoff_file: str | Path, task_id: str) -> str:
+        stage_path = self._stage_path(handoff_file)
+        if not stage_path.exists():
+            return str(stage_path)
+        task_dir = self.state_dir / "tasks" / self.resolve_task(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+        destination = task_dir / "handoff.json"
+        stage_path.replace(destination)
+        return str(destination)
 
     def launch(self, task_id: str, action: str, review: str | None = None) -> dict[str, Any]:
         task_id = self.resolve_task(task_id)

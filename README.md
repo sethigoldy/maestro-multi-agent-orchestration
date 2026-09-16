@@ -89,15 +89,15 @@ Set task defaults in the tracked `.maestro/config.toml`:
 
 ```toml
 [codex]
-model = "gpt-5.3-codex"
-effort = "high"
+model = "gpt-5.6-luna"
+effort = "max"
 ```
 
-Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, and `xhigh`. The selected values are persisted in Memvara with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
+Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. GPT-5.6 Luna supports `max`. The selected values are persisted in Memvara with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
 
 ## Task identity and recovery
 
-Memvara is the authoritative task registry. `.maestro/tasks.json` is only a cache for fast CLI startup. If it is deleted or becomes stale, `maestro list` rebuilds it from Memvara, and numeric references such as `maestro status 6` continue to resolve.
+Memvara is the authoritative task registry. `.maestro/tasks.json` is only a cache for fast CLI startup. If it is deleted or becomes stale, `maestro task list` (or the legacy `maestro list`) rebuilds it from Memvara, and numeric references such as `maestro status 6` continue to resolve.
 
 The MCP servers use repository-local launchers that prefer `.venv/bin/python`, so Claude Code and the CLI use the same Python environment when the project has a virtualenv.
 
@@ -148,3 +148,46 @@ Codex is always launched with the task's explicit `workspace`, and task artifact
 ## Verification behavior
 
 Maestro does not repair or provision environments. It runs `make check` when the repository has a Makefile; otherwise it uses pytest when the repository has Python test configuration. A setup/dependency/network failure is recorded as verification evidence and returned to Claude for interpretation.
+
+## Low-token handoff staging
+
+Claude does not send the full design as an MCP argument. It writes the design once under `.maestro/staged/` and sends Maestro only a tiny JSON descriptor. The staged descriptor survives tool, validation, or subprocess failures, so the exact handoff can be retried without regenerating or re-sending the design. On successful launch Maestro archives the descriptor under the task directory.
+
+## CLI workspace selection
+
+The CLI operates on the target repository's `.maestro` state. When running Maestro from
+a separate checkout (for example the Maestro source repository itself), pass the target
+workspace explicitly or set `MAESTRO_WORKSPACE`: 
+
+```bash
+maestro task list --workspace /path/to/your/project
+maestro task status 20260916-134921-245a01 --workspace /path/to/your/project
+
+export MAESTRO_WORKSPACE=/path/to/your/project
+maestro task list
+```
+
+`maestro task show <id>` is an alias for `maestro task status <id>`. The legacy
+`maestro list` and `maestro status <id>` commands remain supported.
+
+### CLI workspace and project discovery (0.5.5)
+
+The CLI can target the same workspace that Claude/MCP uses:
+
+```bash
+export MAESTRO_WORKSPACE=/path/to/project/.claude/worktrees/my-task
+maestro task list
+maestro task status 10
+maestro task 10
+```
+
+`MAESTRO_WORKSPACE` is used when `--workspace` is omitted. An explicit `--workspace` takes precedence over the environment variable.
+
+To inspect a project and all existing Maestro workspaces under `.claude/worktrees/` without creating new task databases:
+
+```bash
+maestro task list --project /path/to/project
+maestro task status <task-id> --project /path/to/project
+```
+
+Project discovery includes the project root and each immediate `.claude/worktrees/*` directory that already contains Maestro state (`.maestro/memory.db` or `.maestro/tasks.json`).

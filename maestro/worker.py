@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -96,11 +99,24 @@ Run focused tests and report files changed, tests/results, deviations, and remai
     return result.returncode
 
 
+def _python_executable(root: Path) -> str:
+    """Return the same interpreter that is running Maestro when possible."""
+    env_python = os.environ.get("MAESTRO_PYTHON")
+    if env_python and Path(env_python).is_file():
+        return env_python
+
+    repo_python = root / ".venv" / "bin" / "python"
+    if repo_python.is_file() and os.access(repo_python, os.X_OK):
+        return str(repo_python)
+
+    return sys.executable
+
+
 def _verification_command(root: Path) -> list[str]:
     if (root / "Makefile").exists():
         return ["make", "check"]
     if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists():
-        return ["python", "-m", "pytest"]
+        return [_python_executable(root), "-m", "pytest"]
     return ["git", "diff", "--check"]
 
 

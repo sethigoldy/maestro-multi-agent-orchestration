@@ -17,18 +17,22 @@ def _instance(workspace: str) -> Maestro:
 
 
 @mcp.tool()
-def delegate_to_codex(workspace: str, title: str, request: str, design: str, model: str | None = None, effort: str | None = None) -> str:
-    """Persist Claude's approved design and asynchronously start Codex.
+def delegate_to_codex(
+    workspace: str,
+    handoff_file: str,
+) -> str:
+    """Commit and launch a staged Claude→Codex handoff.
 
-    Optional model/effort override the Maestro Codex defaults for this task. Reasoning effort accepts low, medium, high, or xhigh.
-    This is the normal Claude Code entry point. It returns immediately with a human-friendly
-    task number; Claude can use task_status later rather than blocking on implementation.
+    Claude should write the design once to `.maestro/staged/` and pass only the small
+    metadata-file path here. The staged artifact survives validation, MCP, or subprocess
+    failures so the exact same handoff can be retried without regenerating the design.
     """
     m = _instance(workspace)
     try:
-        handoff = m.create_handoff(title, request, design, model=model, effort=effort)
+        handoff = m.create_handoff_from_file(handoff_file)
         launch = m.implement_async(handoff["task_id"])
-        return json.dumps({"handoff": handoff, "launch": launch}, indent=2)
+        archived = m.finalize_staged_handoff(handoff_file, handoff["task_id"])
+        return json.dumps({"handoff": handoff, "launch": launch, "handoff_artifact": archived}, indent=2)
     finally:
         m.close()
 
