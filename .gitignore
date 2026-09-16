@@ -1,11 +1,26 @@
 # Maestro runtime state
 .maestro/state.jsonl
+.maestro/project-state.jsonl
 .maestro/tasks.json
 .maestro/tasks/
 .maestro/staged/
 .maestro/designs/
 
-.venv/
-__pycache__/
-.pytest_cache/
+# Python build artifacts
+build/
+dist/
 *.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test/coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Python caches
+__pycache__/
+*.py[cod]

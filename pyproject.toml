@@ -4,23 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maestro"
-version = "0.5.8"
-description = "Claude-supervised multi-agent orchestration with Codex implementation and local filesystem state"
+version = "0.8.4"
+description = "Claude-supervised multi-agent orchestration with user-level task state"
 requires-python = ">=3.11"
 dependencies = ["mcp>=1.0.0"]
 
 [project.optional-dependencies]
 memvara = ["memvara"]
 
+
 [project.scripts]
 maestro = "maestro.cli:main"
-maestro-mcp = "maestro.mcp_server:main"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.setuptools.packages.find]
+include = ["maestro*"]
 
-[tool.setuptools]
-packages = ["maestro"]
+[tool.coverage.run]
+source = ["maestro"]
+branch = true
 
-[tool.setuptools.package-data]
-"maestro" = ["../.claude/skills/maestro/SKILL.md"]
+[tool.coverage.report]
+fail_under = 100
+show_missing = true

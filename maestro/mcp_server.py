@@ -52,7 +52,17 @@ def list_tasks(workspace: str) -> str:
     """List human-friendly tasks and their current phases."""
     m = _instance(workspace)
     try:
-        return json.dumps(m.list_tasks(), indent=2)
+        return json.dumps(m.list_tasks(project_filter=str(m.project_root)), indent=2)
+    finally:
+        m.close()
+
+
+@mcp.tool()
+def codex_followup(workspace: str, task_id: str, instruction: str) -> str:
+    """Delegate an implementation/debugging follow-up directly to Codex."""
+    m = _instance(workspace)
+    try:
+        return json.dumps(m.codex_followup(task_id, instruction), indent=2)
     finally:
         m.close()
 
@@ -75,5 +85,5 @@ def main() -> None:
     mcp.run()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     main()

@@ -1,12 +1,12 @@
 # Agent collaboration protocol
 
-The repository uses the local `.maestro/` filesystem as shared durable state.
+Codex owns implementation, tests, debugging, refactoring, and follow-up fixes. Claude owns requirements, architecture, final review, and user communication.
 
-Before implementing a delegated task:
-1. Retrieve the task/design from the active worktree `.maestro/` state using the task ID.
+When a task has an approved Maestro handoff, use that handoff as the canonical design and inspect only the active target repository. Do not inspect Maestro internals unless Maestro itself is being changed or is failing.
+
+Before implementation:
+1. Read the approved handoff from the active Maestro task.
 2. Inspect current git state.
 3. Implement the approved design.
-4. Record important deviations and evidence in the task artifacts and `.maestro/state.jsonl`.
-5. Run tests and report exact results.
-
-Do not treat a pasted prompt as the canonical design when the active `.maestro/` state contains the approved artifact.
+4. Run tests and record exact evidence.
+5. Record important deviations in task artifacts.

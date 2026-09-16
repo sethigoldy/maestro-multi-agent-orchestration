@@ -50,8 +50,8 @@ CLAUDE REVIEW FINDINGS TO FIX:
 Fix the existing implementation. Preserve the approved architecture unless the review or repository constraints require a change.
 Run focused tests and report files changed, tests/results, deviations, and remaining issues.
 """
-    else:
-        prompt = f"""You are Codex, the implementation agent in a Claude-supervised Maestro workflow.
+    elif mode == "followup":
+        prompt = f"""You are Codex, the implementation and debugging agent in a Claude-supervised Maestro workflow.
 
 Task ID: {task_id}
 
@@ -61,8 +61,23 @@ Reasoning effort: {effort or "Codex default"}
 AUTHORITATIVE APPROVED DESIGN:
 {design}
 
-Implement the approved design in the current repository. Do not redesign the feature unless the repository makes the design impossible.
-Run focused tests and report files changed, tests/results, deviations, and remaining issues.
+FOLLOW-UP INSTRUCTION FROM CLAUDE:
+{review or "(none)"}
+
+Execute the follow-up fully in the repository. Claude is supervising, so do not ask Claude to perform implementation work. Inspect the current state, make the required code/test changes, run the most relevant tests/checks, and report files changed, commands/results, deviations, and remaining issues.
+"""
+    else:
+        prompt = f"""You are Codex, the primary implementation agent in a Claude-supervised Maestro workflow.
+
+Task ID: {task_id}
+
+Codex model: {model or "Codex default"}
+Reasoning effort: {effort or "Codex default"}
+
+AUTHORITATIVE APPROVED DESIGN:
+{design}
+
+Implement the approved design in the current repository. Claude is the supervisor and reviewer; do not duplicate implementation work in Claude. Own the implementation, tests, refactoring, and local debugging needed to satisfy the approved acceptance criteria. Run focused tests before reporting back.
 """
 
     task_dir = m.state_dir / "tasks" / task_id
@@ -172,7 +187,7 @@ def verify(m: Maestro, task_id: str) -> bool:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("action", choices=["implement", "fix"])
+    p.add_argument("action", choices=["implement", "fix", "followup"])
     p.add_argument("task_id")
     p.add_argument("--review")
     p.add_argument("--workspace", required=True)
@@ -184,5 +199,5 @@ def main() -> int:
         m.close()
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

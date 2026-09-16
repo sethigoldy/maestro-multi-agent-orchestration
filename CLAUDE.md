@@ -1,35 +1,37 @@
-# Maestro orchestration
+# Maestro supervisor rules
 
-This repository is designed for a Claude-supervised multi-agent workflow.
+Maestro is the implementation backend for Claude Code. For normal coding work, Claude is the supervisor/reviewer and Codex is the implementation agent.
 
-Claude Code is the supervisor: it researches, designs, delegates, reviews, and communicates with the user.
-Codex is the implementation agent.
-`.maestro/` is the durable project state layer.
+## Default routing
 
-For non-trivial implementation requests, Claude should use the `maestro` MCP tool automatically. The user should not have to run the CLI.
+- Implementation, tests, debugging, refactoring, documentation changes, and mechanical code changes: delegate to Maestro/Codex.
+- Claude owns requirements, architecture decisions, compact handoff design, final diff review, and user communication.
+- Do not use Claude subagents for implementation when Maestro/Codex is available.
+- Do not duplicate Codex implementation or test work in Claude.
+- Use `codex_followup` for additional implementation/debugging/test/refactor work. Use `review_task` for the final Claude review decision.
 
-Lifecycle:
+## Zero-discovery rule
 
-1. inspect existing code + relevant `.maestro/` state
-2. design/specify
-3. delegate to Codex through Maestro
-4. verify tests/diff
-5. Claude reviews
-6. delegate fixes through Maestro when necessary
-7. close only after review
+Do not read Maestro source code, README, upgrade notes, or internal implementation docs during a normal project task. Do not search for how Maestro works before invoking it. The Maestro MCP tools and this file are the operational contract.
 
-The CLI is available for operators and automation, but it is not the normal user interface.
+Only inspect Maestro internals when: (1) a Maestro MCP/CLI operation fails, (2) the user explicitly asks to modify Maestro, or (3) diagnosing a Maestro bug.
 
+Do not ask the user to run the Maestro CLI for normal work. Claude should invoke the MCP tools directly.
 
-## Maestro workspace rule
+## Delegation
 
-When delegating through Maestro, first run `git rev-parse --show-toplevel` and pass the returned absolute path in every Maestro MCP call as `workspace`. Never rely on Maestro MCP's process cwd; Claude sessions and git worktrees can change while the MCP process remains alive.
+For non-trivial implementation work:
+1. Understand the request and inspect the target repository.
+2. Create a compact handoff/design.
+3. Call Maestro immediately.
+4. Poll task status.
+5. Review the resulting diff.
+6. Send fixes to Codex through Maestro when needed.
 
-Maestro/Codex must not commit or install dependencies. Claude owns final review and commits.
+Use the active worktree absolute path as the `workspace` argument on every Maestro MCP call. Resolve it from the target repository; never depend on the MCP server cwd.
 
+## Codex defaults
 
-## Codex selection
+Use the task/project Codex defaults unless the task clearly requires an override. Supported effort values: `low`, `medium`, `high`, `xhigh`, `max`.
 
-Maestro reads the default Codex model and reasoning effort from tracked `.maestro/config.toml`.
-Use the defaults for normal tasks. Override `model` or `effort` in `delegate_to_codex` only when the task clearly warrants it.
-Supported effort values: `low`, `medium`, `high`, `xhigh`, `max`.
+Maestro/Codex must not commit changes or install dependencies. Claude owns final review and commits.

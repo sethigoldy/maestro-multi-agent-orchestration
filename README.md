@@ -85,7 +85,7 @@ maestro run 1
 
 ## Codex model and reasoning effort
 
-Set task defaults in the tracked `.maestro/config.toml`:
+Set task defaults in the project root `.maestro/config.toml` (for example, in the main repository root; Claude worktree sessions inherit it):
 
 ```toml
 [codex]
@@ -95,33 +95,67 @@ effort = "max"
 
 Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. GPT-5.6 Luna supports `max`. The selected values are persisted in `.maestro/state.jsonl` with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
 
+Config precedence is: user-level `~/.maestro/config.toml`, then project-root `.maestro/config.toml`, then the active worktree `.maestro/config.toml`. More specific project/worktree values override user defaults.
+
 ## Task identity and recovery
 
 The filesystem state in `.maestro/state.jsonl` is authoritative for task state. `.maestro/tasks.json` is a rebuildable compatibility index. If the index is deleted or becomes stale, `maestro task list` (or the legacy `maestro list`) rebuilds it from the local state file, and numeric references such as `maestro status 6` continue to resolve.
 
 The MCP servers use repository-local launchers that prefer `.venv/bin/python`, so Claude Code and the CLI use the same Python environment when the project has a virtualenv.
 
-## Local state
+## User-level task state
 
-Every repository gets a project-local state store with no database service or external memory dependency:
+Maestro 0.7 stores task identity and lifecycle state at the user level instead of creating a task registry in every Claude worktree. This makes `maestro task list` independent of worktree-local registry files and keeps task history available even when worktrees are created or removed.
+
+Default locations:
 
 ```text
-.maestro/
+macOS / Linux: ~/.maestro/
+Windows:       %LOCALAPPDATA%\Maestro\
+```
+
+Set `MAESTRO_HOME` to override the location on any platform. The user-level directory contains the authoritative task registry/state, configuration, locks, and migration markers. Actual designs, Codex results, handoff files, and verification reports remain in each task's workspace under `.maestro/`.
+
+```text
+~/.maestro/
 ├── state.jsonl
-├── tasks.json
+├── registry.json
+├── registry.lock
 ├── config.toml
+├── tasks/
+└── migrations/
+
+project/.claude/worktrees/<worktree>/.maestro/
 ├── staged/
 ├── designs/
 └── tasks/
 ```
 
-`state.jsonl` is an append-only, human-inspectable record of lifecycle claims and events. `tasks.json` is a rebuildable index for compatibility and fast CLI listing. Designs, Codex output, verification reports, and handoff descriptors remain regular files under `.maestro/`.
+From the project root, this is now enough to list tasks across all Claude worktrees:
 
-Claude and Codex share the same explicit worktree, so the approved design, task state, implementation evidence, verification results, and reviews are all available from the same local filesystem.
+```bash
+MAESTRO_WORKSPACE=/path/to/project maestro task list
+```
+
+You can also list everything for the current user with no workspace selector:
+
+```bash
+maestro task list
+```
+
+## Migrating from 0.6.x
+
+Maestro 0.7 automatically imports the 0.6 project-level `project-state.jsonl` journal into the user-level registry the first time that project is opened. The migration is idempotent and preserves the original task number as `legacy_task_number` while assigning a globally unique user-level task number.
+
+If an older release left a worktree-local `~/.maestro/memory.db`, Maestro can also import its Maestro task claims into the selected filesystem backend. This does not switch the project back to Memvara.
+
+## Local task artifacts
+
+Task artifacts remain workspace-local so designs and implementation evidence stay alongside the code they describe. User-level state contains metadata and references, not a second copy of the full design/result files.
 
 ## Using Memvara with Maestro
 
-Filesystem storage is the default and requires no external memory service. Memvara is an optional storage backend for users who want Maestro task state persisted through Memvara instead of the local `.maestro/state.jsonl` store.
+Filesystem storage is the default and requires no external memory service. Memvara is an optional user-level storage backend for users who want Maestro task state persisted through Memvara instead of `~/.maestro/state.jsonl`.
 
 ### Install the optional Memvara dependency
 
@@ -246,6 +280,17 @@ command = ["make", "check"]
 
 Claude does not send the full design as an MCP argument. It writes the design once under `.maestro/staged/` and sends Maestro only a tiny JSON descriptor. The staged descriptor survives tool, validation, or subprocess failures, so the exact handoff can be retried without regenerating or re-sending the design. On successful launch Maestro archives the descriptor under the task directory.
 
+## Project-level task listing
+
+When `MAESTRO_WORKSPACE` points at the project root, `maestro task list` scans all Claude worktrees and merges task records from `.maestro/tasks`, `tasks.json`, and `state.jsonl`. This means a task can appear even while Claude is still writing its normal registry/index state.
+
+```bash
+MAESTRO_WORKSPACE=/path/to/project maestro task list
+MAESTRO_WORKSPACE=/path/to/project maestro task task-<id>
+```
+
+An explicit worktree path still limits inspection to that one workspace.
+
 ## CLI workspace selection
 
 The CLI operates on the target repository's `.maestro` state. When running Maestro from
@@ -284,3 +329,59 @@ maestro task status <task-id> --project /path/to/project
 ```
 
 Project discovery includes the project root and each immediate `.claude/worktrees/*` directory that already contains Maestro state (`.maestro/state.jsonl` or `.maestro/tasks.json`).
+
+## Project-root task discovery
+
+When `MAESTRO_WORKSPACE` points at the project root, Maestro automatically discovers tasks across the Git worktrees used by Claude. Discovery uses `git worktree list` and also checks `.claude/worktrees/*`, so newly-created or partially-initialized worktrees are visible without passing their individual path.
+
+```bash
+export MAESTRO_WORKSPACE=/path/to/project
+maestro task list
+```
+
+A specific worktree can still be queried directly with `--workspace`.
+
+
+## Storage backends
+
+Maestro 0.7 stores task identity and lifecycle state at **user scope**. This is the authoritative task registry, so listing tasks no longer requires scanning every Claude worktree.
+
+On macOS/Linux the default directory is `~/.maestro/`. On Windows it is `%LOCALAPPDATA%\Maestro`. Set `MAESTRO_HOME` to override it on any OS. The registry and task state live there; designs, logs, Codex results, and verification artifacts remain in each task workspace under `.maestro/`.
+
+### Filesystem (default)
+
+```toml
+[storage]
+backend = "filesystem"
+```
+
+### Memvara (optional)
+
+```bash
+pip install "maestro[memvara]"
+```
+
+```toml
+[storage]
+backend = "memvara"
+```
+
+Or set `MAESTRO_STORAGE=memvara`. The Memvara backend also uses user-level task state, so switching worktrees does not change task visibility.
+
+### Task listing
+
+From a project root:
+
+```bash
+MAESTRO_WORKSPACE=/path/to/project maestro task list
+```
+
+That shows tasks for the project, regardless of which `.claude/worktrees/*` created them. A direct worktree path scopes the list to that worktree. You can also use `--project /path/to/project` explicitly.
+
+### Migrating from 0.6.x
+
+The first 0.7 run for a project imports the 0.6 `.maestro/project-state.jsonl` task journal into `~/.maestro/`. Existing local task numbers are retained as `legacy_task_number`; 0.7 assigns unique user-level task numbers. The migration is one-time per project.
+## 0.8.1
+
+Fixes the `codex_followup` worker action mismatch. The worker CLI now accepts `followup` and executes the Codex follow-up path correctly. Maestro also detects an immediate worker exit and records the task as failed with the exit code and log path instead of reporting a successful dispatch.
+
