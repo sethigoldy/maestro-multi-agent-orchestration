@@ -1,6 +1,5 @@
 # Maestro runtime state
-.maestro/memory.db
-.maestro/memory.db-*
+.maestro/state.jsonl
 .maestro/tasks.json
 .maestro/tasks/
 .maestro/staged/

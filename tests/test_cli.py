@@ -8,7 +8,7 @@ from maestro import cli
 
 
 def test_version_constant():
-    assert cli.VERSION == "0.5.5"
+    assert cli.VERSION == "0.5.8"
 
 
 def test_workspace_and_project_helpers(monkeypatch, tmp_path: Path):
@@ -32,7 +32,7 @@ def test_normalize_argv_cases():
 
 def test_discovery_filters_and_deduplicates(tmp_path: Path):
     project = tmp_path / "project"; project.mkdir()
-    state = project / ".maestro"; state.mkdir(); (state / "memory.db").write_bytes(b"")
+    state = project / ".maestro"; state.mkdir(); (state / "state.jsonl").touch()
     wt_root = project / ".claude" / "worktrees"; wt_root.mkdir(parents=True)
     good = wt_root / "feature"; good.mkdir(); (good / ".maestro").mkdir(); (good / ".maestro" / "tasks.json").write_text("[]")
     empty = wt_root / "empty"; empty.mkdir()
@@ -40,7 +40,7 @@ def test_discovery_filters_and_deduplicates(tmp_path: Path):
 
 
 def test_project_tasks_closes_instances(monkeypatch, tmp_path: Path):
-    project = tmp_path / "project"; project.mkdir(); (project / ".maestro").mkdir(); (project / ".maestro" / "memory.db").write_bytes(b"")
+    project = tmp_path / "project"; project.mkdir(); (project / ".maestro").mkdir(); (project / ".maestro" / "state.jsonl").touch()
     closed = []
     class Fake:
         def __init__(self, workspace): self.workspace = Path(workspace)
@@ -151,7 +151,7 @@ def test_main_handoff_and_errors(monkeypatch, tmp_path: Path, capsys):
 
 def test_discovery_deduplicates_resolved_symlink(tmp_path: Path):
     project = tmp_path / "project"; project.mkdir()
-    state = project / ".maestro"; state.mkdir(); (state / "memory.db").write_bytes(b"")
+    state = project / ".maestro"; state.mkdir(); (state / "state.jsonl").touch()
     wt = project / ".claude" / "worktrees"; wt.mkdir(parents=True)
     link = wt / "alias"; link.symlink_to(project, target_is_directory=True)
     assert cli._discover_workspaces(project) == [project.resolve()]
@@ -237,3 +237,13 @@ def test_project_root_non_task_command_keeps_direct_maestro(monkeypatch, tmp_pat
     monkeypatch.setattr(cli.sys, "argv", ["maestro", "config", "--workspace", str(project)])
     assert cli.main() == 0
     assert '"model": "root-model"' in capsys.readouterr().out
+
+
+def test_project_root_discovery_uses_filesystem_state(tmp_path: Path):
+    project = tmp_path / "project"; project.mkdir()
+    wt = project / ".claude" / "worktrees" / "feature"; wt.mkdir(parents=True)
+    m = __import__("maestro.core", fromlist=["Maestro"]).Maestro(wt)
+    m.create_handoff("Feature", "request", "design")
+    m.close()
+    assert cli._discover_workspaces(project) == [wt.resolve()]
+    assert cli._project_tasks(project)[0]["title"] == "Feature"

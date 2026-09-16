@@ -9,22 +9,133 @@ import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Iterator
 
-from memvara import Memvara, NullLLM
-
 from .models import Phase
+
+
+@dataclass
+class _Claim:
+    subject: str
+    predicate: str
+    object: str
+    episode_ids: list[str] | None = None
+
+@dataclass
+class _Episode:
+    episode_ids: list[str]
+
+
+class _FileState:
+    """Append-only local filesystem state used by Maestro.
+
+    This deliberately mirrors the tiny state interface Maestro needs without requiring
+    a database or external memory service. The JSONL file is inspectable, portable, and
+    survives process restarts.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.path = state_dir / "state.jsonl"
+        self.path.touch(exist_ok=True)
+
+    def _read(self) -> list[_Claim]:
+        claims: list[_Claim] = []
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    continue
+                claims.append(_Claim(
+                    str(raw["subject"]), str(raw["predicate"]), str(raw["object"]),
+                    list(raw.get("episode_ids") or []),
+                ))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return claims
+
+    def _append(self, claim: _Claim) -> None:
+        record = {
+            "subject": claim.subject,
+            "predicate": claim.predicate,
+            "object": claim.object,
+            "episode_ids": claim.episode_ids or [],
+        }
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fh.flush()
+
+    def remember(self, subject: str, predicate: str, object: str, **kwargs: Any) -> None:
+        episode_id = uuid.uuid4().hex
+        self._append(_Claim(subject, predicate, str(object), [episode_id]))
+
+    def history(self, subject: str, predicate: str) -> list[_Claim]:
+        return [c for c in self._read() if c.subject == subject and c.predicate == predicate]
+
+    def get_all(self) -> list[_Claim]:
+        return self._read()
+
+    def add(self, content: str, role: str = "system", ts: datetime | None = None) -> _Episode:
+        episode_id = uuid.uuid4().hex
+        # Episodes are represented by a claim-like event so the complete audit trail
+        # remains on disk without introducing another storage format.
+        self._append(_Claim("maestro:event", role, content, [episode_id]))
+        return _Episode([episode_id])
+
+    def close(self) -> None:
+        return None
+
+
+class _MemvaraState:
+    """Optional Memvara-backed state adapter.
+
+    Memvara is intentionally imported lazily so the default filesystem backend has
+    zero Memvara dependency. The adapter mirrors the small state interface Maestro
+    needs, allowing the rest of the orchestration code to remain storage-agnostic.
+    """
+
+    def __init__(self, state_dir: Path) -> None:
+        try:
+            from memvara import Memvara, NullLLM
+        except ImportError as exc:
+            raise RuntimeError(
+                "Memvara backend requested but the 'memvara' package is not installed. "
+                "Install Maestro with the memvara extra or install memvara separately."
+            ) from exc
+        self.client = Memvara(
+            str(state_dir / "memory.db"),
+            user=os.environ.get("MEMVARA_USER", os.environ.get("USER", "local")),
+            tenant=os.environ.get("MEMVARA_TENANT", "default"),
+            llm=NullLLM(),
+        )
+
+    def remember(self, subject: str, predicate: str, object: str, **kwargs: Any) -> None:
+        self.client.remember(subject, predicate, object, **kwargs)
+
+    def history(self, subject: str, predicate: str) -> list[Any]:
+        return list(self.client.history(subject, predicate))
+
+    def get_all(self) -> list[Any]:
+        return list(self.client.get_all())
+
+    def add(self, content: str, role: str = "system", ts: datetime | None = None) -> Any:
+        return self.client.add(content, role=role, ts=ts)
+
+    def close(self) -> None:
+        self.client.close()
 
 
 class Maestro:
     """Claude-supervised orchestration with Codex as the implementation agent.
 
-    Claude is the supervisor. Maestro is the coordinator. Codex implements. Memvara is
-    the durable shared state layer. Long-running Codex work is delegated to a detached
-    worker process so MCP calls return immediately.
-
-    Memvara is the source of truth for task identity/state. tasks.json is only a local
-    compatibility cache and can be rebuilt after deletion or drift.
+    Claude is the supervisor. Maestro is the coordinator. Codex implements. Task state
+    and evidence live entirely in the project's ``.maestro/`` directory. Long-running
+    Codex work is delegated to a detached worker process so MCP calls return immediately.
     """
 
     _REGISTRY_SUBJECT = "maestro:registry"
@@ -42,12 +153,10 @@ class Maestro:
         self.index_path = self.state_dir / "tasks.json"
         self.lock_path = self.state_dir / "task-index.lock"
         self.config = self._load_config()
-        self.mem = Memvara(
-            str(self.state_dir / "memory.db"),
-            user=os.environ.get("MEMVARA_USER", os.environ.get("USER", "local")),
-            tenant=os.environ.get("MEMVARA_TENANT", "default"),
-            llm=NullLLM(),
-        )
+        if self.config["storage_backend"] == "memvara":
+            self.mem = _MemvaraState(self.state_dir)
+        else:
+            self.mem = _FileState(self.state_dir)
 
     @staticmethod
     def _resolve_workspace(root: str | Path) -> Path:
@@ -88,24 +197,45 @@ class Maestro:
 
     def _load_config(self) -> dict[str, Any]:
         path = self.state_dir / "config.toml"
-        config: dict[str, Any] = {}
+        raw_config: dict[str, Any] = {}
         if path.exists():
             try:
                 with path.open("rb") as fh:
                     raw = tomllib.load(fh)
-                config = raw.get("codex", {}) if isinstance(raw, dict) else {}
+                raw_config = raw if isinstance(raw, dict) else {}
             except (OSError, tomllib.TOMLDecodeError):
-                config = {}
+                raw_config = {}
+        config = raw_config.get("codex", {}) if isinstance(raw_config.get("codex", {}), dict) else {}
+        verification = raw_config.get("verification", {}) if isinstance(raw_config.get("verification", {}), dict) else {}
+        storage = raw_config.get("storage", {}) if isinstance(raw_config.get("storage", {}), dict) else {}
+        backend = str(storage.get("backend") or os.environ.get("MAESTRO_STORAGE", "filesystem")).lower()
+        if backend not in {"filesystem", "memvara"}:
+            raise ValueError(f"Unsupported storage backend: {backend}")
         model = config.get("model") or os.environ.get("MAESTRO_CODEX_MODEL")
         effort = config.get("effort") or os.environ.get("MAESTRO_CODEX_EFFORT")
         if effort is not None:
             effort = str(effort).lower()
             if effort not in {"low", "medium", "high", "xhigh", "max"}:
                 raise ValueError(f"Unsupported Codex reasoning effort: {effort}")
-        return {"model": str(model) if model else None, "effort": effort}
+        command = verification.get("command")
+        if command is not None:
+            if isinstance(command, str):
+                command = [part for part in command.split() if part]
+            elif isinstance(command, list) and all(isinstance(part, str) for part in command):
+                command = list(command)
+            else:
+                raise ValueError("Verification command must be a string or list of strings")
+            if not command:
+                command = None
+        return {
+            "model": str(model) if model else None,
+            "effort": effort,
+            "verification_command": command,
+            "storage_backend": backend,
+        }
 
     def codex_defaults(self) -> dict[str, Any]:
-        return dict(self.config)
+        return {key: self.config.get(key) for key in ("model", "effort")}
 
     def close(self) -> None:
         self.mem.close()
@@ -180,7 +310,7 @@ class Maestro:
         tmp.replace(self.index_path)
 
     def _migrate_legacy_index(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Import v0.4 tasks.json records into the durable Memvara registry once."""
+        """Import v0.4 tasks.json records into the durable filesystem state registry once."""
         registry = self._registry_records()
         known = {str(x["task_id"]) for x in registry}
         migrated = list(registry)
@@ -256,7 +386,7 @@ class Maestro:
         return recovered
 
     def _index_items(self) -> list[dict[str, Any]]:
-        """Return the task index, rebuilding it from Memvara when necessary."""
+        """Return the task index, rebuilding it from filesystem state when necessary."""
         registry = self._registry_records()
         if registry:
             self._save_index(registry)

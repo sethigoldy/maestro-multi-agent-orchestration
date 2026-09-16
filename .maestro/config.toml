@@ -1,3 +1,12 @@
 [codex]
 model = "gpt-5.6-luna"
 effort = "max"
+
+# Optional authoritative verification command. When omitted, Maestro auto-detects
+# Make, Node, Go, Cargo, or pytest based on repository structure.
+# [verification]
+# command = ["make", "check"]
+
+[storage]
+# filesystem is the default; use "memvara" for the optional Memvara backend.
+backend = "filesystem"

@@ -433,3 +433,198 @@ def test_recovery_ignores_unknown_predicate(tmp_path: Path):
         assert recovered and recovered[0]["task_id"] == "t1"
     finally:
         m.close()
+
+
+def test_filesystem_state_persists_without_external_service(tmp_path: Path):
+    first = Maestro(tmp_path)
+    task = first.create_handoff("Persist", "request", "design")
+    first.close()
+
+    state_path = tmp_path / ".maestro" / "state.jsonl"
+    assert state_path.is_file()
+    assert not (tmp_path / ".maestro" / "memory.db").exists()
+
+    second = Maestro(tmp_path)
+    assert second.status(str(task["task_id"]))["title"] == "Persist"
+    assert second.list_tasks()[0]["task_id"] == task["task_id"]
+    second.close()
+
+
+def test_filesystem_state_ignores_corrupt_lines(tmp_path: Path):
+    m = Maestro(tmp_path)
+    m.create_handoff("Valid", "request", "design")
+    state = tmp_path / ".maestro" / "state.jsonl"
+    with state.open("a", encoding="utf-8") as fh:
+        fh.write("not-json\\n")
+        fh.write(json.dumps({"subject": "broken"}) + "\\n")
+    assert len(m.list_tasks()) == 1
+    m.close()
+
+
+def test_filesystem_state_read_handles_oserror(tmp_path: Path, monkeypatch):
+    m = Maestro(tmp_path)
+    original = Path.read_text
+    def fail_read(self, *args, **kwargs):
+        if self == tmp_path / ".maestro" / "state.jsonl":
+            raise OSError("boom")
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "read_text", fail_read)
+    assert m.mem.get_all() == []
+    m.close()
+
+
+def test_filesystem_state_skips_json_scalars(tmp_path: Path):
+    m = Maestro(tmp_path)
+    state = tmp_path / ".maestro" / "state.jsonl"
+    with state.open("a", encoding="utf-8") as fh:
+        fh.write("null\n")
+        fh.write("[]\n")
+    assert m.mem.get_all() == []
+    m.close()
+
+
+def test_verification_config_roundtrip(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[verification]\ncommand = ["make", "check"]\n')
+    m = Maestro(tmp_path)
+    try:
+        assert m.config["verification_command"] == ["make", "check"]
+    finally:
+        m.close()
+
+
+def test_invalid_verification_config(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[verification]\ncommand = 123\n')
+    with pytest.raises(ValueError, match="Verification command"):
+        Maestro(tmp_path)
+
+
+def test_verification_command_string_and_empty(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[verification]\ncommand = "make check"\n')
+    m = Maestro(tmp_path)
+    try:
+        assert m.config["verification_command"] == ["make", "check"]
+    finally:
+        m.close()
+
+    empty = tmp_path / "empty"
+    empty.mkdir(); (empty / ".maestro").mkdir()
+    (empty / ".maestro" / "config.toml").write_text('[verification]\ncommand = ""\n')
+    m2 = Maestro(empty)
+    try:
+        assert m2.config["verification_command"] is None
+    finally:
+        m2.close()
+
+
+def test_filesystem_storage_is_default_and_persistent(tmp_path: Path):
+    m = Maestro(tmp_path)
+    try:
+        assert m.config["storage_backend"] == "filesystem"
+        task = m.create_handoff("Persist", "R", "D")
+        state_file = tmp_path / ".maestro" / "state.jsonl"
+        assert state_file.is_file()
+        assert "task_status" in state_file.read_text(encoding="utf-8")
+    finally:
+        m.close()
+
+
+def test_storage_backend_env_override(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MAESTRO_STORAGE", "FILESYSTEM")
+    m = Maestro(tmp_path)
+    try:
+        assert m.config["storage_backend"] == "filesystem"
+    finally:
+        m.close()
+
+
+def test_invalid_storage_backend(tmp_path: Path):
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[storage]\nbackend="sqlite"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="Unsupported storage backend: sqlite"):
+        Maestro(tmp_path)
+
+
+def test_memvara_backend_adapter_without_real_dependency(tmp_path: Path, monkeypatch):
+    import sys
+    import types
+    from datetime import datetime
+
+    class Claim:
+        def __init__(self, subject, predicate, obj):
+            self.subject, self.predicate, self.object = subject, predicate, obj
+
+    class Episode:
+        episode_ids = ["ep1"]
+
+    class FakeMemvara:
+        instances = []
+
+        def __init__(self, path, user, tenant, llm):
+            self.path = path
+            self.calls = []
+            self.claims = []
+            FakeMemvara.instances.append(self)
+
+        def remember(self, subject, predicate, obj, **kwargs):
+            self.calls.append(("remember", subject, predicate, obj, kwargs))
+            self.claims.append(Claim(subject, predicate, obj))
+
+        def history(self, subject, predicate):
+            self.calls.append(("history", subject, predicate))
+            return [c for c in self.claims if c.subject == subject and c.predicate == predicate]
+
+        def get_all(self):
+            self.calls.append(("get_all",))
+            return list(self.claims)
+
+        def add(self, content, role="system", ts=None):
+            self.calls.append(("add", content, role, ts))
+            return Episode()
+
+        def close(self):
+            self.calls.append(("close",))
+
+    memvara_mod = types.ModuleType("memvara")
+    memvara_mod.Memvara = FakeMemvara
+    memvara_mod.NullLLM = lambda: object()
+    monkeypatch.setitem(sys.modules, "memvara", memvara_mod)
+
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[storage]\nbackend="memvara"\n', encoding="utf-8")
+    m = Maestro(tmp_path)
+    try:
+        assert m.config["storage_backend"] == "memvara"
+        task = m.create_handoff("MV", "R", "D")
+        assert task["task_number"] == 1
+        assert m.status(task["task_id"])["phase"] == Phase.DESIGNED.value
+        assert FakeMemvara.instances[0].path.endswith("memory.db")
+        assert any(c[0] == "add" for c in FakeMemvara.instances[0].calls)
+    finally:
+        m.close()
+        assert any(c[0] == "close" for c in FakeMemvara.instances[0].calls)
+
+
+def test_memvara_backend_missing_dependency(tmp_path: Path, monkeypatch):
+    import builtins
+
+    state = tmp_path / ".maestro"
+    state.mkdir()
+    (state / "config.toml").write_text('[storage]\nbackend="memvara"\n', encoding="utf-8")
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name == "memvara":
+            raise ImportError("missing memvara")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    with pytest.raises(RuntimeError, match="Memvara backend requested"):
+        Maestro(tmp_path)

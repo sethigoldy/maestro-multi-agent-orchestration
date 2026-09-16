@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .core import Maestro
 
-VERSION = "0.5.5"
+VERSION = "0.5.8"
 
 
 def _workspace(value: str | None) -> Path:
@@ -68,7 +68,7 @@ def _discover_workspaces(project: Path) -> list[Path]:
             continue
         seen.add(resolved)
         state = resolved / ".maestro"
-        if (state / "memory.db").is_file() or (state / "tasks.json").is_file():
+        if (state / "state.jsonl").is_file() or (state / "tasks.json").is_file() or (state / "tasks").is_dir():
             result.append(resolved)
     return result
 
@@ -123,7 +123,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
 def main() -> int:
     p = argparse.ArgumentParser(
         prog="maestro",
-        description="Claude-supervised orchestration with Memvara",
+        description="Claude-supervised orchestration with local filesystem state",
     )
     p.add_argument("--version", action="version", version=VERSION)
     _add_target_args(p)

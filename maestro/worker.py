@@ -113,21 +113,51 @@ def _python_executable(root: Path) -> str:
     return sys.executable
 
 
-def _verification_command(root: Path) -> list[str]:
+def _verification_command(root: Path, configured: list[str] | None = None) -> tuple[list[str], str | None]:
+    if configured:
+        return list(configured), None
     if (root / "Makefile").exists():
-        return ["make", "check"]
-    if (root / "pyproject.toml").exists() or (root / "pytest.ini").exists() or (root / "tests").exists():
-        return [_python_executable(root), "-m", "pytest"]
-    return ["git", "diff", "--check"]
+        return ["make", "check"], None
+    package_json = root / "package.json"
+    if package_json.exists():
+        try:
+            package = json.loads(package_json.read_text(encoding="utf-8"))
+            scripts = package.get("scripts", {}) if isinstance(package, dict) else {}
+            if isinstance(scripts, dict) and scripts.get("test"):
+                if (root / "pnpm-lock.yaml").exists():
+                    return ["pnpm", "test"], None
+                if (root / "yarn.lock").exists():
+                    return ["yarn", "test"], None
+                return ["npm", "test"], None
+        except (OSError, json.JSONDecodeError):
+            pass
+    if (root / "go.mod").exists():
+        return ["go", "test", "./..."], None
+    if (root / "Cargo.toml").exists():
+        return ["cargo", "test"], None
+    python_root = root / "pyproject.toml"
+    pytest_configured = (root / "pytest.ini").exists() or (root / "tox.ini").exists() or (root / "setup.cfg").exists()
+    has_tests = (root / "tests").is_dir()
+    if python_root.exists() or pytest_configured or has_tests:
+        python = _python_executable(root)
+        probe = subprocess.run(
+            [python, "-c", "import pytest"], cwd=root, text=True, capture_output=True,
+        )
+        if probe.returncode == 0:
+            return [python, "-m", "pytest"], None
+        return ["git", "diff", "--check"], "pytest is not installed in the selected Python environment; skipped test runner"
+    return ["git", "diff", "--check"], "no project test runner detected; using git diff --check only"
 
 
 def verify(m: Maestro, task_id: str) -> bool:
     m._write_claim(task_id, "task_status", Phase.VERIFYING.value)
     diff = subprocess.run(["git", "diff", "--check"], cwd=m.root, text=True, capture_output=True)
-    test_cmd = _verification_command(m.root)
+    configured = m.config.get("verification_command")
+    test_cmd, note = _verification_command(m.root, configured)
     tests = subprocess.run(test_cmd, cwd=m.root, text=True, capture_output=True)
     ok = diff.returncode == 0 and tests.returncode == 0
-    report = f"workspace: {m.root}\nverification command: {' '.join(test_cmd)}\n\ngit diff --check:\n{diff.stdout}\n{diff.stderr}\n\nverification:\n{tests.stdout}\n{tests.stderr}"
+    note_text = f"verification note: {note}\n\n" if note else ""
+    report = f"workspace: {m.root}\nverification command: {' '.join(test_cmd)}\n\n{note_text}git diff --check:\n{diff.stdout}\n{diff.stderr}\n\nverification:\n{tests.stdout}\n{tests.stderr}"
     task_dir = m.state_dir / "tasks" / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
     report_path = task_dir / "verification.txt"

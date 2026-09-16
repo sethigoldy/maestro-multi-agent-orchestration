@@ -4,13 +4,13 @@ This repository is designed for a Claude-supervised multi-agent workflow.
 
 Claude Code is the supervisor: it researches, designs, delegates, reviews, and communicates with the user.
 Codex is the implementation agent.
-Memvara is the durable project memory/state layer.
+`.maestro/` is the durable project state layer.
 
 For non-trivial implementation requests, Claude should use the `maestro` MCP tool automatically. The user should not have to run the CLI.
 
 Lifecycle:
 
-1. inspect existing code + Memvara
+1. inspect existing code + relevant `.maestro/` state
 2. design/specify
 3. delegate to Codex through Maestro
 4. verify tests/diff

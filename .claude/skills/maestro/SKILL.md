@@ -6,14 +6,14 @@ Use Maestro automatically for implementation work.
 
 Claude Code is the supervisor and design/review agent.
 Codex is the implementation agent.
-Memvara is the durable shared memory layer.
+The local `.maestro/` filesystem is the durable shared state layer.
 Verification is a deterministic orchestration phase, not a second agent identity.
 
 ## Required behavior
 
 When the user asks to build/implement/change a non-trivial feature:
 
-1. Inspect the repository and relevant Memvara history.
+1. Inspect the repository and relevant `.maestro/` task/state history.
 2. Produce an internal design/specification with requirements, architecture, affected files, tests, constraints, and rejected alternatives.
 3. Use Maestro's configured Codex model and reasoning effort by default. Override them only when task complexity warrants it.
 4. Once the design is sufficiently complete, write the design to a local file under `.maestro/staged/` and write a tiny JSON handoff descriptor beside it containing `title`, `request`, `design_file`, and optional `model`/`effort`. Then call the `maestro` MCP tool `delegate_to_codex(workspace=<active-worktree>, handoff_file=<descriptor-path>)`. Do not send the full design in MCP arguments.
@@ -30,7 +30,7 @@ The user experience should be: **message Claude once, Claude coordinates everyth
 - Ask the user to run `maestro` for normal feature work.
 - Paste large Claude transcripts into Codex.
 - Treat Codex's exit code as proof that the work is correct.
-- Give Claude and Codex different Memvara scopes for the same project.
+- Do not use different worktree/state paths for the same task.
 - bypass the design → implementation → verification → review lifecycle.
 
 
@@ -43,4 +43,4 @@ The user experience should be: **message Claude once, Claude coordinates everyth
 4. Review the implementation and call review_task(workspace=<same path>, ...)
 ```
 
-Maestro owns task coordination only. It must not commit changes or install project dependencies. Codex works in the explicitly supplied workspace; verification uses the repository's existing `make check` when available, otherwise the project's existing pytest configuration. Environment/setup failures are evidence for Claude to interpret, not a reason to silently modify the environment.
+Maestro owns task coordination only. It must not commit changes or install project dependencies. Codex works in the explicitly supplied workspace. Verification prefers an explicit `.maestro/config.toml` `[verification]` command, then uses the repository's native checks (Make, Node, Go, Rust, or pytest when actually available). If no runnable test tool exists, Maestro records that as a note and falls back to `git diff --check`; only a real non-zero result from a selected test command is a test failure.

@@ -3,11 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "memvara-maestro"
-version = "0.5.5"
-description = "Claude-supervised multi-agent orchestration with Codex implementation and self-hosted Memvara memory"
+name = "maestro"
+version = "0.5.8"
+description = "Claude-supervised multi-agent orchestration with Codex implementation and local filesystem state"
 requires-python = ">=3.11"
-dependencies = ["memvara>=0.2.0", "mcp>=1.0.0"]
+dependencies = ["mcp>=1.0.0"]
+
+[project.optional-dependencies]
+memvara = ["memvara"]
 
 [project.scripts]
 maestro = "maestro.cli:main"

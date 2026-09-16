@@ -5,12 +5,6 @@
       "args": [
         "./scripts/maestro-mcp"
       ]
-    },
-    "memvara": {
-      "command": "bash",
-      "args": [
-        "./scripts/memvara-mcp"
-      ]
     }
   }
 }

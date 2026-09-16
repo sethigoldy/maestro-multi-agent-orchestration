@@ -1,6 +1,6 @@
 # Maestro
 
-**Claude supervises. Codex implements. Memvara remembers.**
+**Claude supervises. Codex implements. Maestro stores state locally.**
 
 Maestro is a local multi-agent orchestration layer designed to run **behind Claude Code**. The normal user experience is simply talking to Claude. Claude researches and designs, calls Maestro automatically, Maestro starts Codex in the background, verification runs, and Claude reviews the result. Rejected reviews automatically create a new Codex fix pass.
 
@@ -18,7 +18,7 @@ Claude Code
 Maestro
  │ persist task + design
  ▼
-Self-hosted Memvara
+Local filesystem state
  │ shared durable state
  ▼
 Codex (background)
@@ -65,7 +65,7 @@ create an implementation design first, then delegate the implementation,
 verify it, and review the result.
 ```
 
-Claude will call `delegate_to_codex` automatically. That call returns immediately with a task number. Codex runs in the background; the task state and artifacts are persisted in self-hosted Memvara plus `.maestro/tasks/`.
+Claude will call `delegate_to_codex` automatically. That call returns immediately with a task number. Codex runs in the background; the task state and artifacts are persisted directly under `.maestro/`.
 
 When Claude checks later, it calls `task_status`. If Claude rejects the implementation, it calls `review_task(..., approved=false, ...)`; Maestro starts Codex again with the review findings and re-runs verification automatically.
 
@@ -93,29 +93,107 @@ model = "gpt-5.6-luna"
 effort = "max"
 ```
 
-Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. GPT-5.6 Luna supports `max`. The selected values are persisted in Memvara with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
+Claude normally omits these fields; Maestro applies the defaults. A task can override them with the MCP parameters `model` and `effort`. Supported effort values are `low`, `medium`, `high`, `xhigh`, and `max`. GPT-5.6 Luna supports `max`. The selected values are persisted in `.maestro/state.jsonl` with the task and reported by `task_status`. Codex is invoked with `--model` and `--config model_reasoning_effort=...`. Current Codex CLI exposes both options for `exec`.
 
 ## Task identity and recovery
 
-Memvara is the authoritative task registry. `.maestro/tasks.json` is only a cache for fast CLI startup. If it is deleted or becomes stale, `maestro task list` (or the legacy `maestro list`) rebuilds it from Memvara, and numeric references such as `maestro status 6` continue to resolve.
+The filesystem state in `.maestro/state.jsonl` is authoritative for task state. `.maestro/tasks.json` is a rebuildable compatibility index. If the index is deleted or becomes stale, `maestro task list` (or the legacy `maestro list`) rebuilds it from the local state file, and numeric references such as `maestro status 6` continue to resolve.
 
 The MCP servers use repository-local launchers that prefer `.venv/bin/python`, so Claude Code and the CLI use the same Python environment when the project has a virtualenv.
 
-## Shared memory
+## Local state
 
-Every repository gets a project-local store:
+Every repository gets a project-local state store with no database service or external memory dependency:
 
 ```text
 .maestro/
-├── memory.db
+├── state.jsonl
 ├── tasks.json
+├── config.toml
+├── staged/
 ├── designs/
 └── tasks/
 ```
 
-Maestro explicitly uses `NullLLM()` for its internal state store because orchestration state is written as structured Memvara claims. It does not need Memvara to extract arbitrary prose just to persist lifecycle state.
+`state.jsonl` is an append-only, human-inspectable record of lifecycle claims and events. `tasks.json` is a rebuildable index for compatibility and fast CLI listing. Designs, Codex output, verification reports, and handoff descriptors remain regular files under `.maestro/`.
 
-Claude Code and Codex use the same project Memvara store when connected through the repository's MCP configuration, so the approved design, decisions, implementation evidence, verification results, and review history are shared.
+Claude and Codex share the same explicit worktree, so the approved design, task state, implementation evidence, verification results, and reviews are all available from the same local filesystem.
+
+## Using Memvara with Maestro
+
+Filesystem storage is the default and requires no external memory service. Memvara is an optional storage backend for users who want Maestro task state persisted through Memvara instead of the local `.maestro/state.jsonl` store.
+
+### Install the optional Memvara dependency
+
+Install Maestro with the `memvara` extra:
+
+```bash
+python -m pip install -e ".[memvara]"
+```
+
+Or, for a normal package installation:
+
+```bash
+python -m pip install "maestro[memvara]"
+```
+
+### Select the Memvara backend
+
+Set the backend in `.maestro/config.toml`:
+
+```toml
+[storage]
+backend = "memvara"
+```
+
+You can also select it for the current shell with:
+
+```bash
+export MAESTRO_STORAGE=memvara
+```
+
+The configuration file is the persistent choice; `MAESTRO_STORAGE` is useful for temporary overrides and CI/testing. The supported values are `filesystem` and `memvara`. Filesystem remains the default when neither is configured.
+
+### Memvara MCP configuration
+
+When Claude also needs direct access to Memvara for broader semantic/project memory, expose Memvara as a separate MCP server in the project `.mcp.json`. A typical setup is:
+
+```json
+{
+  "mcpServers": {
+    "maestro": {
+      "command": "python3",
+      "args": ["-m", "maestro.mcp_server"]
+    },
+    "memvara": {
+      "command": "python3",
+      "args": ["-m", "memvara.server"],
+      "env": {
+        "MEMVARA_DB": ".maestro/memory.db",
+        "MEMVARA_USER": "developer",
+        "MEMVARA_TENANT": "default"
+      }
+    }
+  }
+}
+```
+
+The exact Memvara server options can depend on the Memvara version you install. Maestro's `memvara` storage backend and the Memvara MCP server are separate concerns: the backend stores Maestro's task state, while the MCP server can give Claude direct semantic-memory tools.
+
+### When to use each backend
+
+Use **filesystem** for the simplest, fully local setup, easy inspection/debugging, offline use, and CI. Use **Memvara** when you specifically want Maestro's task state to participate in a shared Memvara-backed memory layer. You can switch back at any time with:
+
+```bash
+export MAESTRO_STORAGE=filesystem
+```
+
+or:
+
+```toml
+[storage]
+backend = "filesystem"
+```
 
 ## Architecture
 
@@ -130,7 +208,7 @@ Claude Code and Codex use the same project Memvara store when connected through 
 
 ### Conceptual model
 
-There is one supervisor (Claude), one primary implementation agent (Codex), deterministic verification, and a durable memory/state layer (Memvara). A future version can add specialist agents without changing the user-facing workflow.
+There is one supervisor (Claude), one primary implementation agent (Codex), deterministic verification, and a durable local filesystem state layer. A future version can add specialist agents without changing the user-facing workflow.
 
 
 ## Git worktrees (important)
@@ -147,7 +225,22 @@ Codex is always launched with the task's explicit `workspace`, and task artifact
 
 ## Verification behavior
 
-Maestro does not repair or provision environments. It runs `make check` when the repository has a Makefile; otherwise it uses pytest when the repository has Python test configuration. A setup/dependency/network failure is recorded as verification evidence and returned to Claude for interpretation.
+Maestro does not repair or provision environments. Verification is deterministic and environment-aware:
+
+1. An explicit `[verification]` command in `.maestro/config.toml` wins.
+2. Otherwise Maestro uses `make check` when a Makefile exists.
+3. Node projects with a `test` script use npm/pnpm/yarn according to the lockfile. Go uses `go test ./...`; Rust uses `cargo test`.
+4. Python projects use the workspace `.venv` (or `MAESTRO_PYTHON`, then the Maestro interpreter) and run pytest only when pytest is actually installed.
+5. When no runnable test command is available, Maestro records a verification note and falls back to `git diff --check` rather than falsely reporting a test failure.
+
+A real non-zero result from the selected test command is still recorded as a verification failure. Maestro never installs dependencies or changes the environment.
+
+For repositories with a precise check, configure it explicitly:
+
+```toml
+[verification]
+command = ["make", "check"]
+```
 
 ## Low-token handoff staging
 
@@ -190,4 +283,4 @@ maestro task list --project /path/to/project
 maestro task status <task-id> --project /path/to/project
 ```
 
-Project discovery includes the project root and each immediate `.claude/worktrees/*` directory that already contains Maestro state (`.maestro/memory.db` or `.maestro/tasks.json`).
+Project discovery includes the project root and each immediate `.claude/worktrees/*` directory that already contains Maestro state (`.maestro/state.jsonl` or `.maestro/tasks.json`).

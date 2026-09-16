@@ -23,12 +23,35 @@ def test_now_and_python_executable(tmp_path: Path, monkeypatch):
     assert worker._python_executable(tmp_path) == str(py)
 
 
-def test_verification_command_selection(tmp_path: Path):
-    assert worker._verification_command(tmp_path) == ["git", "diff", "--check"]
+def test_verification_command_selection(tmp_path: Path, monkeypatch):
+    cmd, note = worker._verification_command(tmp_path)
+    assert cmd == ["git", "diff", "--check"] and note is not None
     (tmp_path / "tests").mkdir()
-    assert worker._verification_command(tmp_path)[1:3] == ["-m", "pytest"]
+    monkeypatch.setattr(worker.subprocess, "run", lambda *args, **kwargs: type("R", (), {"returncode": 0})())
+    cmd, note = worker._verification_command(tmp_path)
+    assert cmd[1:3] == ["-m", "pytest"] and note is None
     make_root = tmp_path / "make"; make_root.mkdir(); (make_root / "Makefile").write_text("check:\n\ttrue\n")
-    assert worker._verification_command(make_root) == ["make", "check"]
+    cmd, note = worker._verification_command(make_root)
+    assert cmd == ["make", "check"] and note is None
+
+
+def test_verification_command_config_and_common_runners(tmp_path: Path):
+    assert worker._verification_command(tmp_path, ["./check.sh"])[0] == ["./check.sh"]
+    node = tmp_path / "node"; node.mkdir()
+    (node / "package.json").write_text('{"scripts":{"test":"jest"}}')
+    assert worker._verification_command(node)[0] == ["npm", "test"]
+    (node / "pnpm-lock.yaml").write_text("")
+    assert worker._verification_command(node)[0] == ["pnpm", "test"]
+    yarn = tmp_path / "yarn"; yarn.mkdir()
+    (yarn / "package.json").write_text('{"scripts":{"test":"jest"}}')
+    (yarn / "yarn.lock").write_text("")
+    assert worker._verification_command(yarn)[0] == ["yarn", "test"]
+    go = tmp_path / "go"; go.mkdir(); (go / "go.mod").write_text("module x")
+    assert worker._verification_command(go)[0] == ["go", "test", "./..."]
+    cargo = tmp_path / "cargo"; cargo.mkdir(); (cargo / "Cargo.toml").write_text("[package]")
+    assert worker._verification_command(cargo)[0] == ["cargo", "test"]
+    bad_node = tmp_path / "badnode"; bad_node.mkdir(); (bad_node / "package.json").write_text('{')
+    assert worker._verification_command(bad_node)[0] == ["git", "diff", "--check"]
 
 
 def test_design_for_and_claim_value(tmp_path: Path):
@@ -118,3 +141,18 @@ def test_run_codex_without_model_or_effort(monkeypatch, tmp_path: Path):
         assert "--model" not in calls[0] and "--config" not in calls[0]
     finally:
         m.close()
+
+
+def test_verification_selection_without_pytest(tmp_path: Path, monkeypatch):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    monkeypatch.setattr(worker.subprocess, "run", lambda *args, **kwargs: type("R", (), {"returncode": 1})())
+    cmd, note = worker._verification_command(tmp_path)
+    assert cmd == ["git", "diff", "--check"]
+    assert note and "pytest is not installed" in note
+
+
+def test_verification_selection_package_without_test_script(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"scripts":{"build":"x"}}')
+    cmd, note = worker._verification_command(tmp_path)
+    assert cmd == ["git", "diff", "--check"]
+    assert note and "no project test runner" in note
