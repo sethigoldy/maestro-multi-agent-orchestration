@@ -48,7 +48,7 @@ DEFAULT_BINARIES: dict[str, str | None] = {
     "cline": "cline",
     "openhands": "openhands",
     "cursor": "cursor-agent",
-    "copilot": "gh",
+    "copilot": "copilot",
     "a2a_remote": None,
 }
 
@@ -60,7 +60,7 @@ KNOWN_CLIS: tuple[tuple[str, str, str], ...] = (
     ("pi", "pi", "Pi"),
     ("cline", "cline", "Cline"),
     ("cursor-agent", "cursor", "Cursor"),
-    ("gh", "copilot", "GitHub Copilot (gh extension)"),
+    ("copilot", "copilot", "GitHub Copilot CLI"),
     ("openhands", "openhands", "OpenHands"),
 )
 

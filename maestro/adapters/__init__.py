@@ -8,6 +8,7 @@ from .base import AdapterNotAvailable, BaseAdapter
 from .claude_code import ClaudeCodeAdapter
 from .cline import ClineAdapter
 from .codex import CodexAdapter
+from .copilot import CopilotAdapter
 from .cursor import CursorAdapter
 from .generic import GenericAdapter
 from .hermes import HermesAdapter
@@ -21,6 +22,7 @@ __all__ = [
     "ClaudeCodeAdapter",
     "ClineAdapter",
     "CodexAdapter",
+    "CopilotAdapter",
     "CursorAdapter",
     "GenericAdapter",
     "HermesAdapter",
@@ -29,9 +31,9 @@ __all__ = [
     "make_adapter",
 ]
 
-#: Kinds implemented in this release (M2+M4+M5+v2). copilot lands in v2-M5.
+#: Kinds implemented in this release (M2+M4+M5+v2).
 IMPLEMENTED_KINDS: frozenset[str] = frozenset(
-    {"codex", "claude_code", "generic", "pi", "cline", "hermes", "cursor", "openhands", "a2a_remote"}
+    {"codex", "claude_code", "generic", "pi", "cline", "hermes", "cursor", "openhands", "a2a_remote", "copilot"}
 )
 
 
@@ -52,5 +54,6 @@ def make_adapter(spec: AgentSpec) -> BaseAdapter:
         "cursor": CursorAdapter,
         "openhands": OpenHandsAdapter,
         "a2a_remote": A2ARemoteAdapter,
+        "copilot": CopilotAdapter,
     }
     return adapters[spec.kind](spec)

@@ -137,15 +137,15 @@ def test_all_agents_fail_escalates(daemon, tmp_path, binpath):
 
 
 def test_unimplemented_kind_falls_over(daemon, tmp_path, binpath):
-    # "copilot" is not implemented yet -> adapter unavailable -> chain continues
+    # an unknown kind has no adapter -> chain continues to the fallback
     _fake_bin(binpath, "claude", 'cat > /dev/null\nexit 0')
     daemon.registry.save(AgentSpec(name="cc", kind="claude_code"))
     ws = _git_repo(tmp_path)
-    started = daemon.delegate(_doc(target_agent="copilot", fallback=["cc"]), ws)
+    started = daemon.delegate(_doc(target_agent="carrier-pigeon", fallback=["cc"]), ws)
     final = daemon.wait(started["task_id"], timeout=60)
     assert final["status"]["state"] == "completed"
     record = daemon._tasks[started["task_id"]]
-    assert record["attempts"][0]["agent"] == "copilot" and "not implemented" in record["attempts"][0].get("error", "")
+    assert record["attempts"][0]["agent"] == "carrier-pigeon" and "not implemented" in record["attempts"][0].get("error", "")
 
 
 def test_preflight_failure_skips_agent(daemon, tmp_path, binpath):

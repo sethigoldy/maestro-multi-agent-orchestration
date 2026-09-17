@@ -275,7 +275,20 @@ direct model API call if ever needed.
     shared port cannot be bound, the node falls back to an ephemeral port.
   - CLI: `maestro peers list|add|remove` — manual registration covers
     networks without multicast; manual peers never go stale.
-- Remaining v2 candidates: Copilot adapter, budget caps enforcement.
+- **v2-M5 — DONE**: Copilot adapter (GitHub Copilot CLI).
+  - Spawn mode on `copilot -p <prompt> --output-format json --yolo -C <ws>
+    --usage-output-file <tmpfile>`; prompt via argv (`input_mode="arg"`),
+    optional `--model` from spec/settings. Verified live: a real daemon
+    delegation made the CLI edit a file and returned merged usage.
+  - Usage is two-channel: the final JSONL `result` line carries light
+    counters (premiumRequests/durations) parsed per-line, and the
+    `--usage-output-file` JSON (written after completion) carries token
+    counts (`tokenDetails`, with `modelMetrics` fallback) plus premium cost
+    — read back and merged into the result, then deleted. The CLI exposes no
+    USD field, so raw counters are recorded as-is.
+  - `DEFAULT_BINARIES["copilot"]` corrected from the old `gh` placeholder to
+    the real `copilot` binary; KNOWN_CLIS discovery updated to match.
+- Remaining v2 candidates: budget caps enforcement.
 
 | # | Deliverable | Proves |
 |---|---|---|

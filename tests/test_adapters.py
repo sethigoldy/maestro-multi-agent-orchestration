@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, CursorAdapter, GenericAdapter, HermesAdapter, OpenHandsAdapter, PiAdapter, make_adapter
+from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, GenericAdapter, HermesAdapter, OpenHandsAdapter, PiAdapter, make_adapter
 from maestro.agents import AgentSpec
 
 
@@ -183,8 +183,9 @@ def test_factory_kinds():
     assert isinstance(make_adapter(_spec("hm", kind="hermes")), HermesAdapter)
     assert isinstance(make_adapter(_spec("cu", kind="cursor")), CursorAdapter)
     assert isinstance(make_adapter(_spec("oh", kind="openhands")), OpenHandsAdapter)
+    assert isinstance(make_adapter(_spec("cp", kind="copilot")), CopilotAdapter)
     with pytest.raises(AdapterNotAvailable):
-        make_adapter(_spec("cp", kind="copilot"))
+        make_adapter(_spec("xx", kind="carrier-pigeon"))
 
 
 # ---------------------------------------------------------------- generic
