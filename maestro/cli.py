@@ -351,6 +351,8 @@ def main(argv: list[str] | None = None) -> int:
     gc.add_argument("--days", type=int, default=90, help="TTL in days (default 90)")
     gc.add_argument("--dry-run", action="store_true", help="List what would be deleted")
 
+    dash = sub.add_parser("dashboard", help="Terminal dashboard for the local daemon (SSE-driven, no polling)")
+
     h = sub.add_parser("handoff", help="Manually create and launch a Codex handoff")
     h.add_argument("--title", required=True)
     h.add_argument("--request", required=True)
@@ -404,6 +406,15 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_delegate(args)
         if args.cmd == "gc":
             return _cmd_gc(args)
+        if args.cmd == "dashboard":
+            from . import tui
+
+            try:
+                url = _daemon_url()
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            return tui.run(url)
         if args.cmd == "task" and args.task_cmd == "tail":
             url = _daemon_url()
             target_id = None if args.all else args.task_id

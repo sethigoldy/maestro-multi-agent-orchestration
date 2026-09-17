@@ -244,7 +244,14 @@ direct model API call if ever needed.
   `GET /events`. `/tasks` metadata now carries usage/attempts/error (live from
   the in-memory record; durable parsed from the `task_runtime` claim), and cost
   accumulates across attempts — failed work still costs money.
-- **v2-M2 — NEXT**: terminal TUI (`maestro dashboard`).
+- **v2-M2 — DONE**: terminal TUI — `maestro dashboard` (stdlib-only, ANSI).
+  Same reactive contract as the web console: one `GET /tasks`, then a single
+  SSE stream; an SSE reader thread pushes each event through a pipe and the
+  main loop blocks on `select(stdin, pipe)` — no redraw timer, no polling.
+  Puts the terminal in raw mode (restored on exit), renders task list +
+  detail pane with state colors/costs/attempts/transcript tail; q/ESC/^C quit,
+  j/k/↑-keys navigate. Stream end (daemon stop) exits 1; unreachable daemon
+  exits 1; non-tty exits 2.
 - Remaining v2 candidates: `api` run mode (remote Agent Servers) + `a2a_remote`
   adapter, P2P agent discovery, Copilot adapter, budget caps enforcement.
 
