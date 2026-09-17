@@ -233,9 +233,20 @@ direct model API call if ever needed.
   set the installed CLI accepts, so old and new installs both work unmodified.
   344 tests, 100% branch coverage.
 
-**All milestones M1–M6 are complete.** Remaining v2 candidates: terminal TUI,
-`api` run mode (remote Agent Servers), Copilot/`a2a_remote` adapters, P2P agent
-discovery, budget caps enforcement.
+**All milestones M1–M6 are complete.**
+
+### v2 (in progress)
+
+- **v2-M1 — DONE**: React web console — source in `web/src` (React 18 + esbuild,
+  built by `node web/build.mjs` into the committed `maestro/web_dist/`, so no
+  Node toolchain is needed at runtime). Served at `GET /` and `GET /console.js`;
+  strictly reactive: one `GET /tasks` fetch, then a single EventSource over
+  `GET /events`. `/tasks` metadata now carries usage/attempts/error (live from
+  the in-memory record; durable parsed from the `task_runtime` claim), and cost
+  accumulates across attempts — failed work still costs money.
+- **v2-M2 — NEXT**: terminal TUI (`maestro dashboard`).
+- Remaining v2 candidates: `api` run mode (remote Agent Servers) + `a2a_remote`
+  adapter, P2P agent discovery, Copilot adapter, budget caps enforcement.
 
 | # | Deliverable | Proves |
 |---|---|---|

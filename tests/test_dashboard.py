@@ -69,10 +69,29 @@ def test_dashboard_html_served(live_daemon):
     status, body, ctype = _get(f"http://127.0.0.1:{live_daemon.port}/")
     assert status == 200 and "text/html" in ctype
     html = body.decode("utf-8")
-    assert "MAESTRO" in html
-    assert 'new EventSource("/events")' in html  # reactive: no polling loop
-    assert ".tasks" in html  # initial list comes from GET /tasks {"tasks": [...]}
-    assert "setInterval" not in html
+    assert '<div id="root">' in html
+    assert "/console.js" in html
+
+
+def test_console_js_served_reactive(live_daemon):
+    status, body, ctype = _get(f"http://127.0.0.1:{live_daemon.port}/console.js")
+    assert status == 200 and "javascript" in ctype
+    js = body.decode("utf-8")
+    assert "EventSource" in js  # reactive: events stream, no polling loop
+    assert "setInterval" not in js
+    assert '"/tasks"' in js or "/tasks" in js  # initial list comes from GET /tasks
+
+
+def test_console_asset_module():
+    from maestro.dashboard import console_asset, console_manifest
+
+    asset = console_asset("/")
+    assert asset is not None and "text/html" in asset[0]
+    js = console_asset("/console.js")
+    assert js is not None and "javascript" in js[0]
+    assert console_asset("/nope.js") is None
+    manifest = console_manifest()
+    assert "/" in manifest and "/console.js" in manifest
 
 
 def test_tasks_endpoint_lists_live_and_durable(live_daemon, tmp_path):
@@ -92,6 +111,75 @@ def test_tasks_endpoint_lists_live_and_durable(live_daemon, tmp_path):
     payload = json.loads(body.decode("utf-8"))
     ids = [t.get("id") for t in payload["tasks"]]
     assert started["task_id"] in ids
+
+
+def test_tasks_metadata_carries_usage_and_attempts(live_daemon, tmp_path):
+    bp = tmp_path / "bin"
+    bp.mkdir()
+    body = "cat > /dev/null\n" + 'echo \'{"total_cost_usd": 0.77}\'\n' + "exit 1"
+    _fake_bin(bp, "codex", body)
+    old_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{bp}{os.pathsep}{old_path}"
+    try:
+        ws = _git_repo(tmp_path)
+        started = live_daemon.delegate(_doc(), ws)
+        final = live_daemon.wait(started["task_id"], timeout=60)
+        assert final["status"]["state"] == "failed"  # the fake exits non-zero
+    finally:
+        os.environ["PATH"] = old_path
+    status, body, _ = _get(f"http://127.0.0.1:{live_daemon.port}/tasks")
+    payload = json.loads(body.decode("utf-8"))
+    record = next(t for t in payload["tasks"] if t["id"] == started["task_id"])
+    meta = record["metadata"]
+    assert meta["usage"]["cost_usd"] == 0.77
+    assert len(meta["attempts"]) == 1 and meta["attempts"][0]["error"]
+    assert meta["error"]
+
+
+def test_tasks_metadata_durable_fallback_parses_runtime(live_daemon, tmp_path):
+    # A task known only from durable state (no live record): usage/attempts come
+    # from the task_runtime claim snapshot.
+    tid = "task-20991231-235959-durable1"
+    m = live_daemon.maestro
+    with m._task_lock():
+        m._register_task(tid, "durable only", 900)
+    m._write_claim(tid, "task_status", "COMPLETE")
+    m._write_claim(tid, "task_title", "durable only")
+    m._write_claim(
+        tid, "task_runtime",
+        json.dumps({"usage": {"cost_usd": 1.25}, "attempts": [{"agent": "codex", "error": None}], "error": None}),
+    )
+    status, body, _ = _get(f"http://127.0.0.1:{live_daemon.port}/tasks")
+    payload = json.loads(body.decode("utf-8"))
+    record = next(t for t in payload["tasks"] if t["id"] == tid)
+    assert record["metadata"]["usage"]["cost_usd"] == 1.25
+    assert record["metadata"]["attempts"][0]["agent"] == "codex"
+
+
+def test_tasks_metadata_durable_runtime_not_dict(live_daemon, tmp_path):
+    tid = "task-20991231-235959-durable2"
+    m = live_daemon.maestro
+    with m._task_lock():
+        m._register_task(tid, "bad runtime", 901)
+    m._write_claim(tid, "task_status", "COMPLETE")
+    m._write_claim(tid, "task_runtime", "[1, 2]")  # JSON but not a dict
+    status, body, _ = _get(f"http://127.0.0.1:{live_daemon.port}/tasks")
+    payload = json.loads(body.decode("utf-8"))
+    record = next(t for t in payload["tasks"] if t["id"] == tid)
+    assert record["metadata"]["usage"] is None and record["metadata"]["attempts"] == []
+
+
+def test_tasks_metadata_durable_runtime_malformed(live_daemon, tmp_path):
+    tid = "task-20991231-235959-durable3"
+    m = live_daemon.maestro
+    with m._task_lock():
+        m._register_task(tid, "malformed runtime", 902)
+    m._write_claim(tid, "task_status", "COMPLETE")
+    m._write_claim(tid, "task_runtime", "{not json")
+    status, body, _ = _get(f"http://127.0.0.1:{live_daemon.port}/tasks")
+    payload = json.loads(body.decode("utf-8"))
+    record = next(t for t in payload["tasks"] if t["id"] == tid)
+    assert record["metadata"]["usage"] is None
 
 
 def test_global_events_stream_carries_every_task(live_daemon):
@@ -475,7 +563,8 @@ def test_cli_gc_uses_created_at_and_skips_bad_records(live_daemon, tmp_path, mon
 
 def test_index_html_route_serves_dashboard(live_daemon):
     status, body, ctype = _get(f"http://127.0.0.1:{live_daemon.port}/index.html")
-    assert status == 200 and "text/html" in ctype and "MAESTRO" in body.decode("utf-8")
+    assert status == 200 and "text/html" in ctype
+    assert "Maestro" in body.decode("utf-8")
 
 
 # ---------------------------------------------------------------- final branch gaps
@@ -733,3 +822,22 @@ def test_cli_gc_record_without_created_at(live_daemon, tmp_path, monkeypatch):
     code = clic.main(["gc", "--days", "90"])
     payload = json.loads(str(captured.get("out") or "{}"))
     assert code == 0 and all(item["task_id"] != no_date for item in payload["removed"])  # undatable -> kept
+
+
+def test_console_asset_missing_dist(monkeypatch):
+    import maestro.dashboard as dash
+    from pathlib import Path
+
+    monkeypatch.setattr(dash, "WEB_DIST", Path("/nonexistent/maestro-web-dist"))
+    assert dash.console_asset("/") is None
+    manifest = dash.console_manifest()
+    assert all("(0 bytes)" in v for v in manifest.values())
+
+
+def test_console_route_404_when_dist_missing(live_daemon, monkeypatch):
+    import maestro.dashboard as dash
+    from pathlib import Path
+
+    monkeypatch.setattr(dash, "WEB_DIST", Path("/nonexistent/maestro-web-dist"))
+    status, body, ctype = _get(f"http://127.0.0.1:{live_daemon.port}/console.js")
+    assert status == 404 and "application/json" in ctype

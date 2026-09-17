@@ -327,7 +327,10 @@ class MaestroDaemon:
                     on_line=_on_line,
                     should_cancel=(lambda: cancel_flag.is_set()) if cancel_flag is not None else None,
                 )
-                self._record_attempt(task_id, agent_name, result)
+                self._record_attempt(
+                    task_id, agent_name, result,
+                    None if result.ok else (result.error or f"agent {agent_name} failed"),
+                )
                 (self.state_dir / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
                 (self.state_dir / "tasks" / task_id / f"result-{agent_name}-t{turn}-{attempt}.json").write_text(
                     json.dumps(result.to_dict(), indent=2), encoding="utf-8"
@@ -335,6 +338,11 @@ class MaestroDaemon:
                 if result.usage:
                     self.bus.publish(TaskEvent(task_id=task_id, type="usage", data={"agent": agent_name, **result.usage}))
                 record = self._tasks.get(task_id) or {}
+                if result.usage:
+                    # Accumulate cost across attempts: failed work still costs money.
+                    merged = dict(record.get("usage") or {})
+                    merged.update(result.usage)
+                    record["usage"] = merged
                 if record.get("state") == STATE_CANCELED:
                     return
                 if result.question:
@@ -399,7 +407,7 @@ class MaestroDaemon:
         if record is not None:
             record["result"] = result.to_dict()
             record["agent"] = agent_name
-            record["usage"] = result.usage
+            # usage was already accumulated per attempt in _run_task
         self.maestro._write_claim(task_id, "task_result", str(result.output_path or ""))
         self._set_state(task_id, STATE_COMPLETED, verification="PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped"))
         self._release(task_id)
@@ -590,6 +598,9 @@ class MaestroDaemon:
             origin = record.get("origin_agent")
             target = record.get("target_agent")
             title = record.get("title")
+            usage = record.get("usage")
+            attempts = record.get("attempts") or []
+            error = record.get("error")
         else:  # durable fallback for tasks from earlier daemon runs
             claims = self.maestro._claims(task_id)
             state = _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING)
@@ -598,6 +609,18 @@ class MaestroDaemon:
             origin = claims.get("task_origin_agent")
             target = claims.get("task_target_agent")
             title = claims.get("task_title")
+            runtime: dict[str, Any] = {}
+            raw_runtime = claims.get("task_runtime")
+            if isinstance(raw_runtime, str):
+                try:
+                    parsed = json.loads(raw_runtime)
+                    if isinstance(parsed, dict):
+                        runtime = parsed
+                except (ValueError, TypeError):
+                    runtime = {}
+            usage = runtime.get("usage")
+            attempts = runtime.get("attempts") or []
+            error = runtime.get("error")
         artifacts: list[dict[str, Any]] = []
         task_dir = self.state_dir / "tasks" / task_id
         if task_dir.is_dir():
@@ -615,6 +638,9 @@ class MaestroDaemon:
                 "origin_agent": origin,
                 "target_agent": target,
                 "title": title,
+                "usage": usage,
+                "attempts": attempts,
+                "error": error,
             },
         }
 
@@ -688,12 +714,16 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                 task_id = self.path[len("/tasks/") : -len("/events")]
                 self._sse(task_id)
                 return
-            if self.path in ("/", "/index.html"):
-                from .dashboard import DASHBOARD_HTML
+            if self.path in ("/", "/index.html", "/console.js"):
+                from .dashboard import console_asset
 
-                body = DASHBOARD_HTML.encode("utf-8")
+                asset = console_asset(self.path)
+                if asset is None:
+                    self._send_json(404, {"error": "not found"})
+                    return
+                content_type, body = asset
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
