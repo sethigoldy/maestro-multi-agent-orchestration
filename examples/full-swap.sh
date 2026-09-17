@@ -23,6 +23,15 @@ STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/maestro-swap-state.XXXXXX")"
 export MAESTRO_HOME="$STATE_DIR"
 export MAESTRO_WORKSPACE="$WORKSPACE"
 
+# Real projects are git repos; codex requires a trusted (git) directory and the
+# per-task branch policy needs one too.
+( cd "$WORKSPACE" && git init -q . \
+  && git config user.email "maestro-demo@local" \
+  && git config user.name "Maestro Demo" \
+  && printf '# full-swap demo workspace\n' > README.md \
+  && git add README.md \
+  && git commit -qm "demo baseline" ) || fail "could not initialize the demo git workspace"
+
 DAEMON_PID=""
 cleanup() {
   if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -49,9 +58,6 @@ start_daemon() {
 }
 
 # ---------------------------------------------------------------- Leg A
-LEG_A_VIA_MCP=1
-command -v claude >/dev/null && command -v codex >/dev/null || LEG_A_VIA_MCP=0
-
 HANDOFF_A="$STATE_DIR/handoff-legA.toml"
 cat > "$HANDOFF_A" <<EOF
 [handoff]
@@ -70,17 +76,24 @@ commit_policy = "branch"
 budget_hint = "one small file, no dependencies"
 EOF
 
-if [[ "$LEG_A_VIA_MCP" == 1 ]]; then
+LEG_A_OK=0
+if command -v claude >/dev/null && command -v codex >/dev/null; then
   echo "== leg A: Claude Code delegates to Codex via Maestro MCP (embedded broker) =="
   MCP_CONFIG="$STATE_DIR/mcp-config.json"
   cat > "$MCP_CONFIG" <<EOF
 {"mcpServers":{"maestro":{"command":"$PYTHON","args":["-m","maestro.mcp_server"],"cwd":"$REPO_ROOT","env":{"MAESTRO_HOME":"$STATE_DIR"}}}}
 EOF
-  ( cd "$WORKSPACE" && timeout 900 claude -p \
-      --mcp-config "$MCP_CONFIG" \
-      "You are operating as a host agent for the Maestro broker. Use the 'maestro' MCP tools: call delegate with workspace='$WORKSPACE' and handoff_file='$HANDOFF_A'. It blocks until the work is done. Then report the final task state in one line." ) \
-    || fail "leg A (claude -> codex) failed"
-else
+  if ( cd "$WORKSPACE" && timeout 900 claude -p \
+      "You are operating as a host agent for the Maestro broker. Use the 'maestro' MCP tools: call delegate with workspace='$WORKSPACE' and handoff_file='$HANDOFF_A'. It blocks until the work is done. Then report the final task state in one line." \
+      --mcp-config "$MCP_CONFIG" ); then
+    LEG_A_OK=1
+  else
+    echo "   claude host leg unavailable here (auth/plan) — falling back to CLI delegation"
+  fi
+fi
+
+if [[ "$LEG_A_OK" != 1 ]]; then
+  command -v codex >/dev/null || fail "leg A needs either claude+codex (MCP path) or codex (CLI path)"
   echo "== leg A: CLI delegates to Codex via standalone broker =="
   start_daemon
   ( cd "$REPO_ROOT" && timeout 900 "$PYTHON" -m maestro.cli delegate --file "$HANDOFF_A" --workspace "$WORKSPACE" ) \

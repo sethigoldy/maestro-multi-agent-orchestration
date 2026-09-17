@@ -46,6 +46,29 @@ You normally **do not need to run Maestro manually**.
 
 ---
 
+## Multi-agent platform (0.9)
+
+Maestro now delegates to **any registered agent** — Codex, Claude Code, pi, Cline,
+Hermes Agent, Cursor, OpenHands, or any CLI via the generic spec — with every host
+agent (Claude, Kilo, Cline, ...) able to call any other through the same MCP tools.
+
+- **Local broker daemon** (`maestro-daemon`): A2A-aligned task API
+  (agent card at `GET /.well-known/agent.json`, JSON-RPC `message/send` /
+  `tasks/get` / `tasks/cancel`, SSE event streams), FIFO routing with one active
+  task per workspace, retry → fallback chain → escalation, per-task branches.
+- **Reactive by design — no polling**: everything completes over the event bus;
+  MCP `delegate`/`task_wait` block on it, dashboards stream SSE.
+- **Observability**: web dashboard at `http://127.0.0.1:<port>/`,
+  `maestro task tail <id>` (live), `maestro task audit <id>` (durable),
+  `maestro gc` (TTL 90 days, manual only).
+- **Flagship demo**: `examples/full-swap.sh` — the full role swap, one command.
+
+See [docs/architecture-proposal.md](docs/architecture-proposal.md) for the design
+and [docs/agent-onboarding.md](docs/agent-onboarding.md) for onboarding agents
+without a first-class adapter.
+
+---
+
 ## 1. What you need
 
 Before installing Maestro, make sure you have:
@@ -409,6 +432,35 @@ maestro handoff \
   --request "Implement semantic search for the document API" \
   --design-file path/to/design.md
 ```
+
+### Multi-agent commands (0.9)
+
+```bash
+# Start the local broker daemon (prints its port; writes daemon.json)
+maestro-daemon
+
+# Delegate a handoff to any registered agent (blocks, live-streaming output)
+maestro delegate --title "Add semantic search" \
+  --request "Implement semantic search for the document API" \
+  --target codex --fallback hermes --workspace /path/to/repo
+
+# Or from a handoff document file (TOML or JSON)
+maestro delegate --file handoff.toml --workspace /path/to/repo
+
+# Live-tail one task (or the global stream with --all)
+maestro task tail task-20260917-120000-ab12cd
+maestro task tail --all
+
+# Durable audit record: attempts, usage/cost, errors, result files
+maestro task audit task-20260917-120000-ab12cd
+
+# Garbage collection: terminal tasks older than the TTL (manual only)
+maestro gc --days 90 --dry-run
+maestro gc --days 90
+```
+
+Register agents with `maestro agents add` / `maestro agents discover` (see
+[docs/agent-onboarding.md](docs/agent-onboarding.md)).
 
 The CLI is optional. Claude normally handles this through MCP.
 

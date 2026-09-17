@@ -55,8 +55,8 @@ class BaseAdapter:
 
     Modes: ``spawn`` (one-shot process, implemented here) and ``rpc`` (long-lived
     stdin/stdout JSON protocol, implemented here for pi-style agents). ``api``
-    (HTTP service with its own lifecycle) lands in M5 with the OpenHands adapter
-    and raises :class:`AdapterNotAvailable` until then.
+    (HTTP service with its own lifecycle) remains a v2 seam and raises
+    :class:`AdapterNotAvailable` until then.
     """
 
     kind: str = "base"

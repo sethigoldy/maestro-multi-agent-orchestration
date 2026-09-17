@@ -25,6 +25,11 @@ def _spec(name: str, kind: str = "codex", **kw) -> AgentSpec:
     return AgentSpec(name=name, kind=kind, **kw)
 
 
+# Real CLIs answer `exec --help` instantly; fakes must too, because the codex
+# adapter probes its flag surface before building the run command.
+_HELP_GUARD = 'if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then echo usage; exit 0\nfi\n'
+
+
 # ---------------------------------------------------------------- preflight
 def test_preflight_ok(tmp_path):
     binpath = tmp_path / "bin"
@@ -86,7 +91,36 @@ def test_preflight_auth_probe_ok(monkeypatch, tmp_path):
 
 
 # ------------------------------------------------------- command construction
-def test_codex_command_with_settings(tmp_path):
+_CODEX_FAKE_OLD_HELP = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "Usage: codex exec [OPTIONS]"
+    echo "  --full-auto   autonomous execution (old surface)"
+    exit 0
+fi
+cat > /dev/null
+exit 0
+"""
+
+_CODEX_FAKE_NEW_HELP = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "Usage: codex exec [OPTIONS]"
+    echo "  -s, --sandbox <MODE>   sandbox policy (new surface)"
+    exit 0
+fi
+cat > /dev/null
+exit 0
+"""
+
+
+def _codex_adapter_with_help(tmp_path, monkeypatch, help_body):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    _fake_bin(binpath, "codex", help_body)
+    monkeypatch.setenv("PATH", f"{binpath}{os.pathsep}{os.environ['PATH']}")
+
+
+def test_codex_command_old_flag_surface(tmp_path, monkeypatch):
+    _codex_adapter_with_help(tmp_path, monkeypatch, _CODEX_FAKE_OLD_HELP)
     adapter = CodexAdapter(_spec("codex", model="gpt-x", effort="max"))
     cmd = adapter.build_command("prompt", tmp_path, "task-1", {})
     assert cmd[:3] == ["codex", "exec", "--full-auto"]
@@ -95,7 +129,25 @@ def test_codex_command_with_settings(tmp_path):
     assert cmd[-1] == "-"
 
 
-def test_codex_command_task_settings_override_spec(tmp_path):
+def test_codex_command_new_flag_surface(tmp_path, monkeypatch):
+    _codex_adapter_with_help(tmp_path, monkeypatch, _CODEX_FAKE_NEW_HELP)
+    adapter = CodexAdapter(_spec("codex"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd[:3] == ["codex", "exec", "--approve-for-me"]
+    # probe result is cached per instance: a second build does not re-probe
+    assert adapter._autonomy_flags == ["--approve-for-me"]
+
+
+def test_codex_command_no_cli_visible(tmp_path, monkeypatch):
+    # No codex on PATH at all: the current flag surface is assumed.
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    adapter = CodexAdapter(_spec("codex"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd[:3] == ["codex", "exec", "--approve-for-me"]
+
+
+def test_codex_command_task_settings_override_spec(tmp_path, monkeypatch):
+    _codex_adapter_with_help(tmp_path, monkeypatch, _CODEX_FAKE_NEW_HELP)
     adapter = CodexAdapter(_spec("codex", model="spec-model"))
     cmd = adapter.build_command("p", tmp_path, "t", {"model": "task-model", "effort": "low"})
     assert "task-model" in cmd and "spec-model" not in cmd
@@ -205,7 +257,7 @@ def test_spawn_failure_captures_tail(tmp_path):
 def test_spawn_timeout_kills_process(tmp_path):
     binpath = tmp_path / "bin"
     binpath.mkdir()
-    _fake_bin(binpath, "codex", 'cat > /dev/null\nsleep 30')
+    _fake_bin(binpath, "codex", _HELP_GUARD + 'cat > /dev/null\nsleep 30')
     import os
 
     old = os.environ.get("PATH", "")
@@ -222,7 +274,7 @@ def test_spawn_timeout_kills_process(tmp_path):
 def test_spawn_cancel_flag_kills_process(tmp_path):
     binpath = tmp_path / "bin"
     binpath.mkdir()
-    _fake_bin(binpath, "codex", 'cat > /dev/null\ni=0\nwhile [ $i -lt 100 ]; do echo tick; sleep 0.1; i=$((i+1)); done')
+    _fake_bin(binpath, "codex", _HELP_GUARD + 'cat > /dev/null\ni=0\nwhile [ $i -lt 100 ]; do echo tick; sleep 0.1; i=$((i+1)); done')
     import os
 
     old = os.environ.get("PATH", "")
@@ -314,6 +366,9 @@ def test_spawn_stdout_closes_but_process_lingers(tmp_path):
     script.write_text(
         "#!/usr/bin/env python3\n"
         "import os, sys, time\n"
+        'if len(sys.argv) >= 3 and sys.argv[1] == "exec" and sys.argv[2] == "--help":\n'
+        '    print("usage")\n'
+        "    sys.exit(0)\n"
         "sys.stdin.read()\n"
         'print("done")\n'
         "sys.stdout.flush()\n"
@@ -338,7 +393,7 @@ def test_kill_group_escalates_to_sigkill(tmp_path):
     # A process that traps SIGTERM must be reaped with SIGKILL.
     binpath = tmp_path / "bin"
     binpath.mkdir()
-    _fake_bin(binpath, "codex", 'cat > /dev/null\ntrap "" TERM\necho alive\nsleep 30')
+    _fake_bin(binpath, "codex", _HELP_GUARD + 'cat > /dev/null\ntrap "" TERM\necho alive\nsleep 30')
     old = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
     try:
@@ -435,7 +490,7 @@ def test_kill_group_sigkill_lookup_error_swallowed(monkeypatch, tmp_path):
 
     binpath = tmp_path / "bin"
     binpath.mkdir()
-    _fake_bin(binpath, "codex", 'cat > /dev/null\ntrap "" TERM\necho alive\nsleep 30')
+    _fake_bin(binpath, "codex", _HELP_GUARD + 'cat > /dev/null\ntrap "" TERM\necho alive\nsleep 30')
     old = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
 
@@ -1153,3 +1208,20 @@ def test_generic_onboarding_openclaw_recipe(tmp_path):
         os.environ["PATH"] = old
     assert result.ok is True
     assert (result.usage or {}).get("cost_usd") == 0.19  # jsonl cost hint picked up
+
+
+def test_probe_codex_no_cli_visible(tmp_path, monkeypatch):
+    from maestro.adapters.codex import probe_codex_autonomy_flags
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    assert probe_codex_autonomy_flags() == ["--approve-for-me"]
+
+
+def test_probe_codex_probe_failure_falls_back(tmp_path, monkeypatch):
+    import maestro.adapters.codex as cx
+
+    def boom(*a, **k):
+        raise OSError("probe exploded")
+
+    monkeypatch.setattr(cx.subprocess, "run", boom)
+    assert cx.probe_codex_autonomy_flags("/bin/true") == ["--approve-for-me"]

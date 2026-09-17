@@ -225,8 +225,13 @@ direct model API call if ever needed.
   audit` (durable attempts/usage/errors without a running daemon), `maestro gc`
   (TTL 90 days, manual only, dry-run first; deletes task dirs + registry entry +
   claims), and the flagship demo `examples/full-swap.sh` — Claude Code as a host
-  agent delegating to Codex through Maestro MCP, then a CLI delegation to Hermes
-  building on the same workspace. 340 tests, 100% branch coverage.
+  agent delegating to Codex through Maestro MCP (degrading gracefully to CLI
+  delegation when the claude CLI is plan-locked), then a CLI delegation to Hermes
+  building on the same workspace. Live verification also exposed codex's flag
+  rename (`--full-auto` → `-s workspace-write --approve-for-me` in 0.15x): the
+  adapter and legacy worker now probe `codex exec --help` once and pick the flag
+  set the installed CLI accepts, so old and new installs both work unmodified.
+  344 tests, 100% branch coverage.
 
 **All milestones M1–M6 are complete.** Remaining v2 candidates: terminal TUI,
 `api` run mode (remote Agent Servers), Copilot/`a2a_remote` adapters, P2P agent

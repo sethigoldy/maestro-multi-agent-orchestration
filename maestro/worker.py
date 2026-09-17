@@ -82,7 +82,9 @@ Implement the approved design in the current repository. Claude is the superviso
 
     task_dir = m.state_dir / "tasks" / task_id
     task_dir.mkdir(parents=True, exist_ok=True)
-    codex_cmd = ["codex", "exec", "--full-auto"]
+    from .adapters.codex import probe_codex_autonomy_flags
+
+    codex_cmd = ["codex", "exec", *probe_codex_autonomy_flags()]
     if model:
         codex_cmd.extend(["--model", model])
     if effort:

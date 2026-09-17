@@ -279,13 +279,11 @@ def test_no_commit_policy_skips_branch(daemon, tmp_path, binpath):
     assert final["metadata"]["branch"] is None
 
 
-def test_non_git_workspace_skips_branch(daemon, tmp_path, binpath):
-    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+def test_non_git_workspace_rejects_branch_policy(daemon, tmp_path):
     ws = tmp_path / "plain"
     ws.mkdir()
-    started = daemon.delegate(_doc(commit_policy="branch"), ws)
-    final = daemon.wait(started["task_id"], timeout=60)
-    assert final["status"]["state"] == "completed" and final["metadata"]["branch"] is None
+    with pytest.raises(ValueError, match="not a git repository"):
+        daemon.delegate(_doc(commit_policy="branch"), ws)
 
 
 # ------------------------------------------------------------------ views
@@ -1080,6 +1078,34 @@ def test_delegate_rejects_self_delegation(daemon, tmp_path):
     doc = _doc(title="selfish", target_agent="codex", origin_agent="codex")
     with pytest.raises(ValueError, match="itself"):
         daemon.delegate(doc, ws)
+
+
+def test_delegate_branch_policy_requires_git_workspace(daemon, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    with pytest.raises(ValueError, match="not a git repository"):
+        daemon.delegate(_doc(target_agent="codex", commit_policy="branch"), plain)
+    # pr policy has the same requirement
+    with pytest.raises(ValueError, match="git repository"):
+        daemon.delegate(_doc(target_agent="codex", commit_policy="pr"), plain)
+
+
+def test_prepare_branch_returns_none_for_plain_dir(daemon, tmp_path):
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert daemon._prepare_branch(plain, "task-1", "branch") is None
+
+
+def test_delegate_no_commit_policy_allows_plain_workspace(daemon, tmp_path, binpath):
+    (binpath / "codex").write_text("#!/bin/sh\ncat > /dev/null\necho done\nexit 0\n", encoding="utf-8")
+    import stat as _stat
+
+    (binpath / "codex").chmod(0o755)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    started = daemon.delegate(_doc(target_agent="codex", commit_policy="no-commit"), plain)
+    final = daemon.wait(started["task_id"], timeout=30)
+    assert final["status"]["state"] == "completed" and final["metadata"]["branch"] is None
 
 
 def test_mcp_followup_and_self_delegation_errors(tmp_path, monkeypatch):

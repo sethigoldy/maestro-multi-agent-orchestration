@@ -174,6 +174,13 @@ class MaestroDaemon:
         ws = Path(workspace).expanduser().resolve()
         if not ws.is_dir():
             raise ValueError(f"Workspace does not exist or is not a directory: {ws}")
+        if doc.commit_policy != "no-commit":
+            probe = subprocess.run(["git", "-C", str(ws), "rev-parse", "--show-toplevel"], text=True, capture_output=True)
+            if probe.returncode != 0:
+                raise ValueError(
+                    f"Workspace {ws} is not a git repository but commit_policy={doc.commit_policy!r} requires one; "
+                    "run 'git init' there or set commit_policy='no-commit'"
+                )
         key = str(ws)
         task_id, record = self._make_record(doc, key)
         queued = False
