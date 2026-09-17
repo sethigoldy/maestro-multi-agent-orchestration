@@ -7,8 +7,10 @@ from .base import AdapterNotAvailable, BaseAdapter
 from .claude_code import ClaudeCodeAdapter
 from .cline import ClineAdapter
 from .codex import CodexAdapter
+from .cursor import CursorAdapter
 from .generic import GenericAdapter
 from .hermes import HermesAdapter
+from .openhands import OpenHandsAdapter
 from .pi import PiAdapter
 
 __all__ = [
@@ -17,14 +19,16 @@ __all__ = [
     "ClaudeCodeAdapter",
     "ClineAdapter",
     "CodexAdapter",
+    "CursorAdapter",
     "GenericAdapter",
     "HermesAdapter",
+    "OpenHandsAdapter",
     "PiAdapter",
     "make_adapter",
 ]
 
-#: Kinds implemented in this release (M2+M4). The rest land in M5.
-IMPLEMENTED_KINDS: frozenset[str] = frozenset({"codex", "claude_code", "generic", "pi", "cline", "hermes"})
+#: Kinds implemented in this release (M2+M4+M5). a2a_remote and copilot remain planned.
+IMPLEMENTED_KINDS: frozenset[str] = frozenset({"codex", "claude_code", "generic", "pi", "cline", "hermes", "cursor", "openhands"})
 
 
 def make_adapter(spec: AgentSpec) -> BaseAdapter:
@@ -32,7 +36,7 @@ def make_adapter(spec: AgentSpec) -> BaseAdapter:
         return GenericAdapter(spec)
     if spec.kind not in IMPLEMENTED_KINDS:
         raise AdapterNotAvailable(
-            f"Adapter kind {spec.kind!r} is not implemented in this release yet (planned for M5); "
+            f"Adapter kind {spec.kind!r} is not implemented in this release yet; "
             "register it as a generic agent or upgrade Maestro"
         )
     adapters = {
@@ -41,5 +45,7 @@ def make_adapter(spec: AgentSpec) -> BaseAdapter:
         "pi": PiAdapter,
         "cline": ClineAdapter,
         "hermes": HermesAdapter,
+        "cursor": CursorAdapter,
+        "openhands": OpenHandsAdapter,
     }
     return adapters[spec.kind](spec)

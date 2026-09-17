@@ -191,7 +191,7 @@ direct model API call if ever needed.
   A2A server (agent card, `message/send`, `tasks/get`, `tasks/cancel`, SSE event
   streams with keepalive), reactive event bus (`maestro/events.py`), FIFO router
   (one active task per workspace, queue promotion on release), adapter contract
-  (spawn implemented; rpc/api planned for M4/M5) + codex / claude_code / generic
+  (spawn + rpc implemented; api remains a v2 seam) + codex / claude_code / generic
   adapters, handoff document schema (`maestro/handoff.py`, TOML + legacy JSON),
   per-task branches `maestro/<task_id>`, preflight (binary/version/auth fail-fast),
   retry-with-backoff → fallback chain → escalation event, cancellation with partials
@@ -209,8 +209,16 @@ direct model API call if ever needed.
   **Cline** (`--json` headless spawn, auto-approve act mode), **Hermes Agent**
   (one-shot `-z` + `--usage-file` cost report, verified live against the
   installed v0.20.x CLI). 298 tests, 100% branch coverage.
-- **M5 — NEXT**: OpenHands (Agent Server REST/SDK), Cursor (`cursor-agent`),
-  generic-spec onboarding of Kilo Code/omp/OpenClaw; `api` run mode.
+- **M5 — DONE**: API/editor-class adapters — **Cursor** (`cursor-agent -p
+  --output-format json`, live-verified against the installed CLI, including its
+  undocumented `usage` token fields) and **OpenHands** (V1 headless CLI
+  `--headless --json` with task-file input and explicit exit codes — the
+  documented headless mode made the Agent Server REST path unnecessary for v1),
+  plus generic-spec onboarding recipes in `docs/agent-onboarding.md`: OpenClaw
+  (verified `openclaw agent exec --json`), Kilo Code (IDE-resident → MCP host
+  path), omp (entry point unverified — verify-at-install checklist). 305 tests,
+  100% branch coverage.
+- **M6 — NEXT**: TUI + web dashboards, `maestro task tail`, `maestro gc`
 
 | # | Deliverable | Proves |
 |---|---|---|
@@ -218,20 +226,21 @@ direct model API call if ever needed.
 | M2 | Daemon: A2A server (card, send, get, SSE) + router + **adapter contract** + codex & claude_code adapters | Any registered agent can be delegated to; Codex can call back to Claude; existing loop unchanged |
 | M3 | MCP surface extension (`agents_list`, `delegate`, `followup`) + backward-compat tests | Every host agent (Claude, Kilo, Cline, Cursor, ...) gets "call any agent" via MCP |
 | M4 | Popular CLI trio: **pi** (RPC mode), **Cline** (`--json` headless), **Hermes Agent** (Nous) | The most-used local CLIs all work end-to-end |
-| M5 | API/editor-class adapters: **OpenHands** (Agent Server REST/SDK), **Cursor** (`cursor-agent`) + generic-spec onboarding of Kilo Code, omp, OpenClaw | Full coverage matrix complete except IDE-only agents |
+| M5 | Editor-class adapters: **Cursor** (`cursor-agent` print mode) + **OpenHands** (V1 headless CLI) + generic-spec onboarding of OpenClaw/Kilo/omp | Full coverage matrix complete except IDE-only agents |
 | M6 | Dashboard + audit view + flagship demo script (`examples/full-swap.sh`) | The interview's success criteria, runnable in one command |
 
 ## 8. Risks & mitigations
 
 - **CLI/API formats change** (codex/claude/pi/cline update their output streams):
   adapters isolate parsing; conformance fixtures per adapter version; generic spec
-  lets users patch TOML without code. OpenHands is API-based (no CLI) so it's the
-  most stable integration in the matrix.
+  lets users patch TOML without code. OpenHands' V1 headless CLI keeps its
+  integration on the same spawn contract as everything else (the Agent Server
+  REST/SDK path stays available for remote sandboxes).
 - **Hermes Agent entry point differs from a plain model loop**: it's a persistent
   agent product with its own tools/memory — M4 verifies its headless/gateway entry
   point first and adapts to it rather than building our own loop around raw models.
 - **Scope creep toward "every agent"**: the generic TOML spec is the escape valve —
-  we ship 7 first-class adapters and one open spec; community/users onboard the rest.
+  we ship 8 first-class adapters and one open spec; community/users onboard the rest.
 - **100% coverage gate vs daemon complexity**: thin A2A subset + fake-agent test
   harness (scripted stub CLIs) keep behavioral tests hermetic and fast.
 

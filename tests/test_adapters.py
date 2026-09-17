@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, GenericAdapter, HermesAdapter, PiAdapter, make_adapter
+from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, CursorAdapter, GenericAdapter, HermesAdapter, OpenHandsAdapter, PiAdapter, make_adapter
 from maestro.agents import AgentSpec
 
 
@@ -129,8 +129,10 @@ def test_factory_kinds():
     assert isinstance(make_adapter(_spec("pi", kind="pi")), PiAdapter)
     assert isinstance(make_adapter(_spec("cl", kind="cline")), ClineAdapter)
     assert isinstance(make_adapter(_spec("hm", kind="hermes")), HermesAdapter)
+    assert isinstance(make_adapter(_spec("cu", kind="cursor")), CursorAdapter)
+    assert isinstance(make_adapter(_spec("oh", kind="openhands")), OpenHandsAdapter)
     with pytest.raises(AdapterNotAvailable):
-        make_adapter(_spec("oh", kind="openhands"))
+        make_adapter(_spec("cp", kind="copilot"))
 
 
 # ---------------------------------------------------------------- generic
@@ -976,3 +978,178 @@ def test_pi_streaming_oserror(monkeypatch, tmp_path):
     finally:
         os.environ["PATH"] = old
     assert result.ok is False and "failed while streaming output" in (result.error or "")
+
+
+# ---------------------------------------------------------------- cursor
+_CURSOR_FAKE = r"""
+if [ "$1" = "status" ]; then
+    if [ "${CURSOR_AUTH:-ok}" = "ok" ]; then echo "logged in as tester"; exit 0; fi
+    echo "not logged in" >&2
+    exit 1
+fi
+cat > /dev/null
+echo ""
+echo 'garbage non-json line'
+echo '{"type":"system","subtype":"init","model":"gpt-5"}'
+if [ "${CURSOR_USAGE:-yes}" = "yes" ]; then
+    echo '{"type":"result","subtype":"success","is_error":false,"duration_ms":10,"result":"done: file created","session_id":"s1","usage":{"inputTokens":100,"outputTokens":25,"cacheReadTokens":7,"cacheWriteTokens":2}}'
+elif [ "${CURSOR_USAGE}" = "empty" ]; then
+    echo '{"type":"result","subtype":"success","is_error":false,"duration_ms":10,"result":"done: file created","session_id":"s1","usage":{}}'
+else
+    echo '{"type":"result","subtype":"success","is_error":false,"duration_ms":10,"result":"done: file created","session_id":"s1"}'
+fi
+exit ${CURSOR_RC:-0}
+"""
+
+
+def _cursor_adapter(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    _fake_bin(binpath, "cursor-agent", _CURSOR_FAKE)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    return old
+
+
+def test_cursor_happy_path(tmp_path):
+    old = _cursor_adapter(tmp_path)
+    try:
+        result = CursorAdapter(_spec("cu", kind="cursor")).run(
+            "make a file", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs"
+        )
+
+        # Result without the usage object parses to no usage (older builds).
+        os.environ["CURSOR_USAGE"] = "no"
+        plain = CursorAdapter(_spec("cu", kind="cursor")).run("p", tmp_path, "t2", timeout=30)
+        del os.environ["CURSOR_USAGE"]
+
+        # Present-but-empty usage object also parses to no usage.
+        os.environ["CURSOR_USAGE"] = "empty"
+        empty = CursorAdapter(_spec("cu", kind="cursor")).run("p", tmp_path, "t3", timeout=30)
+        del os.environ["CURSOR_USAGE"]
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert result.usage == {
+        "input_tokens": 100, "output_tokens": 25,
+        "cache_read_tokens": 7, "cache_write_tokens": 2,
+    }
+    log = (tmp_path / "logs" / "cursor-task-1.log").read_text(encoding="utf-8")
+    assert '"type": "result"' in log or '"type":"result"' in log
+    assert "done: file created" in log
+    assert plain.ok is True and plain.usage is None
+    assert empty.ok is True and empty.usage is None
+
+
+def test_cursor_failure(tmp_path):
+    old = _cursor_adapter(tmp_path)
+    os.environ["CURSOR_RC"] = "1"
+    try:
+        result = CursorAdapter(_spec("cu", kind="cursor")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+        del os.environ["CURSOR_RC"]
+    assert result.ok is False and "exited with code 1" in (result.error or "")
+
+
+def test_cursor_build_command_and_auth_probe(tmp_path):
+    adapter = CursorAdapter(_spec("cu", kind="cursor", model="gpt-5"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd == ["cursor-agent", "-p", "--output-format", "json", "--yolo", "--trust", "--model", "gpt-5"]
+    assert CursorAdapter(_spec("cu", kind="cursor")).auth_probe() == ["cursor-agent", "status"]
+
+    old = _cursor_adapter(tmp_path)
+    try:
+        ok = CursorAdapter(_spec("cu", kind="cursor")).preflight()
+        assert ok.ok is True and ok.version  # binary + version + status probe all pass
+        os.environ["CURSOR_AUTH"] = "bad"
+        bad = CursorAdapter(_spec("cu", kind="cursor")).preflight()
+        del os.environ["CURSOR_AUTH"]
+        assert bad.ok is False and "not authenticated" in (bad.error or "")
+    finally:
+        os.environ["PATH"] = old
+
+
+# ---------------------------------------------------------------- openhands
+_OPENHANDS_FAKE = r"""
+file=""
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-f" ]; then file="$a"; fi
+    prev="$a"
+done
+if [ -n "$file" ] && [ -f "$file" ]; then cat "$file" > /dev/null; fi
+echo '{"type":"action","action":"write","path":"app.py"}'
+echo '{"type":"observation","content":"File created successfully"}'
+exit ${OPENHANDS_RC:-0}
+"""
+
+
+def _openhands_adapter(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    _fake_bin(binpath, "openhands", _OPENHANDS_FAKE)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    return old
+
+
+def test_openhands_happy_path_with_task_file(tmp_path):
+    old = _openhands_adapter(tmp_path)
+    try:
+        result = OpenHandsAdapter(_spec("oh", kind="openhands")).run(
+            "write a flask app", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    task_file = tmp_path / "logs" / "prompt-task-1.txt"
+    assert task_file.read_text(encoding="utf-8") == "write a flask app"  # -f path carried the prompt
+    log = (tmp_path / "logs" / "openhands-task-1.log").read_text(encoding="utf-8")
+    assert '"type":"action"' in log and "File created successfully" in log
+
+
+def test_openhands_failure(tmp_path):
+    old = _openhands_adapter(tmp_path)
+    os.environ["OPENHANDS_RC"] = "1"
+    try:
+        result = OpenHandsAdapter(_spec("oh", kind="openhands")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+        del os.environ["OPENHANDS_RC"]
+    assert result.ok is False and "exited with code 1" in (result.error or "")
+
+
+def test_openhands_build_command_argv_fallback(tmp_path):
+    adapter = OpenHandsAdapter(_spec("oh", kind="openhands"))
+    cmd = adapter.build_command("the prompt", tmp_path, "t9", {})
+    assert cmd == ["openhands", "--headless", "--json", "--exit-without-confirmation", "-t", "the prompt"]
+
+
+# ---------------------------------------------------------------- generic onboarding (M5 recipes)
+def test_generic_onboarding_openclaw_recipe(tmp_path):
+    # The OpenClaw recipe from docs/agent-onboarding.md, run through the real
+    # generic path with a fake CLI speaking its documented contract.
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(
+        binpath,
+        "openclaw",
+        'cat > /dev/null\necho \'{"type":"result","cost_usd":0.19}\'\nexit 0',
+    )
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        spec = AgentSpec(
+            name="openclaw", kind="generic", display_name="OpenClaw",
+            command="openclaw agent exec --json --message-file -",
+            input_mode="stdin", output_format="jsonl", workspace_policy="cwd",
+        )
+        from maestro.agents import validate_agent_spec
+
+        validate_agent_spec(spec)
+        result = make_adapter(spec).run("fix the failing test", tmp_path, "task-1", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True
+    assert (result.usage or {}).get("cost_usd") == 0.19  # jsonl cost hint picked up
