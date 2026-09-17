@@ -121,6 +121,7 @@ class MaestroDaemon:
         self._lock = threading.RLock()
         self.port: int | None = None
         self._httpd: ThreadingHTTPServer | None = None
+        self._presence: Any | None = None
         self._stopped = False
         self.sse_heartbeat_s = 15.0  # keepalive interval for /tasks/<id>/events streams
         if start_http:
@@ -138,12 +139,28 @@ class MaestroDaemon:
         )
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         thread.start()
+        # P2P presence: announce over UDP so other Maestro nodes find us.
+        from .discovery import PeerTable, PresenceServer, discovery_enabled, discovery_interface_from_env, discovery_ttl_from_env
+
+        if discovery_enabled():
+            presence = PresenceServer(
+                self.port,
+                PeerTable(self.state_dir / "peers.json"),
+                name=os.environ.get("MAESTRO_NODE_NAME", "maestro-node"),
+                multicast_if=discovery_interface_from_env(),
+                ttl=discovery_ttl_from_env(),
+            )
+            if presence.start():
+                self._presence = presence
         return self.port
 
     def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
+        if self._presence is not None:
+            self._presence.stop()
+            self._presence = None
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()

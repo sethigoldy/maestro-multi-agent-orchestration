@@ -235,6 +235,41 @@ def _cmd_task_audit(args: argparse.Namespace) -> int:
         m.close()
 
 
+def _cmd_peers(args: argparse.Namespace) -> int:
+    from .discovery import PeerTable, STALE_AFTER_S
+
+    table = PeerTable(Path(maestro_user_dir()) / "peers.json")
+    if args.peers_cmd == "add":
+        url = args.url.rstrip("/")
+        if not url.startswith(("http://", "https://")):
+            print(f"peer URL must be http(s): {args.url}", file=sys.stderr)
+            return 2
+        table.add_static(args.name, url)
+        print(f"added peer {args.name!r} -> {url}")
+        return 0
+    if args.peers_cmd == "remove":
+        if table.remove(args.peer):
+            print(f"removed peer {args.peer!r}")
+            return 0
+        print(f"no such peer: {args.peer}", file=sys.stderr)
+        return 1
+    # list
+    import time as _time
+
+    now = _time.time()
+    peers = table.load()
+    if not peers:
+        print("no peers discovered yet (peers.json is empty)")
+        return 0
+    for key in sorted(peers):
+        peer = peers[key]
+        age = now - float(peer.get("last_seen") or 0)
+        status = "manual" if peer.get("manual") else ("live" if age <= STALE_AFTER_S else f"stale {int(age)}s")
+        url = peer.get("url") or f"http://{peer.get('address')}:{peer.get('port')}"
+        print(f"{key}\t{status}\t{peer.get('name') or '?'}\t{url}")
+    return 0
+
+
 def _cmd_gc(args: argparse.Namespace) -> int:
     state_dir = maestro_user_dir()
     m = Maestro(state_dir)
@@ -319,6 +354,15 @@ def main(argv: list[str] | None = None) -> int:
 
     dash = sub.add_parser("dashboard", help="Terminal dashboard for the local daemon (SSE-driven, no polling)")
 
+    peers = sub.add_parser("peers", help="Manage discovered/registered Maestro peers")
+    peers_sub = peers.add_subparsers(dest="peers_cmd", required=True)
+    peers_list = peers_sub.add_parser("list", help="List live and stale peers (peers.json)")
+    peers_add = peers_sub.add_parser("add", help="Manually register a peer (for networks without broadcast)")
+    peers_add.add_argument("--name", required=True)
+    peers_add.add_argument("--url", required=True, help="Peer base URL, e.g. http://10.0.0.5:8790")
+    peers_remove = peers_sub.add_parser("remove", help="Remove a peer by key or name")
+    peers_remove.add_argument("peer")
+
     h = sub.add_parser("handoff", help="Manually create and launch a Codex handoff")
     h.add_argument("--title", required=True)
     h.add_argument("--request", required=True)
@@ -381,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(str(exc), file=sys.stderr)
                 return 1
             return tui.run(url)
+        if args.cmd == "peers":
+            return _cmd_peers(args)
         if args.cmd == "task" and args.task_cmd == "tail":
             url = _daemon_url()
             target_id = None if args.all else args.task_id

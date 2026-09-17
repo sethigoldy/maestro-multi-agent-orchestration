@@ -264,8 +264,18 @@ direct model API call if ever needed.
     output/usage until terminal state; queued remotes fail fast with a clear
     error; cancel via `tasks/cancel`. Shared client helpers moved to
     `maestro/a2a_client.py` (CLI now reuses them).
-- Remaining v2 candidates: P2P agent discovery, Copilot adapter, budget caps
-  enforcement.
+- **v2-M4 — DONE**: P2P peer discovery.
+  - `maestro/discovery.py`: each daemon joins a shared UDP multicast group
+    (group 234.5.6.7, port 9786; SO_REUSEPORT lets several nodes share one
+    host) and announces presence every 5s with name/HTTP port/pid/nonce.
+    Peers land in `peers.json` under the state dir; entries go stale after
+    three missed heartbeats. Env knobs: `MAESTRO_DISCOVERY` (default on),
+    `MAESTRO_DISCOVERY_PORT`, `MAESTRO_DISCOVERY_IF`, `MAESTRO_DISCOVERY_TTL`
+    (TTL 1 = LAN; tests pin TTL 0 + loopback via an autouse fixture). If the
+    shared port cannot be bound, the node falls back to an ephemeral port.
+  - CLI: `maestro peers list|add|remove` — manual registration covers
+    networks without multicast; manual peers never go stale.
+- Remaining v2 candidates: Copilot adapter, budget caps enforcement.
 
 | # | Deliverable | Proves |
 |---|---|---|
