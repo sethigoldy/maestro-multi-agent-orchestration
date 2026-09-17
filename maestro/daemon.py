@@ -174,6 +174,26 @@ class MaestroDaemon:
         self.maestro.close()
 
     # ------------------------------------------------------------- delegation
+    def _budget_records(self) -> list[dict[str, Any]]:
+        """Task records for budget accounting: durable claims, live ones win."""
+        from .budgets import _records_from_claims
+
+        records = _records_from_claims(self.maestro.mem.get_all())
+        for task_id, record in self._tasks.items():
+            snapshot = {k: v for k, v in record.items() if k != "transcript"}
+            records[task_id] = snapshot
+        return list(records.values())
+
+    def _enforce_budgets(self, target_agent: str) -> None:
+        from .budgets import BudgetCaps, check
+
+        caps = BudgetCaps.from_env()
+        if not caps.any():
+            return
+        violation = check(caps, target_agent, self._budget_records())
+        if violation is not None:
+            raise ValueError(f"Budget cap exceeded — launch blocked ({violation}); running tasks still finish")
+
     def default_target(self) -> str:
         return "codex"
 
@@ -199,6 +219,7 @@ class MaestroDaemon:
                     "run 'git init' there or set commit_policy='no-commit'"
                 )
         key = str(ws)
+        self._enforce_budgets(doc.target_agent)
         task_id, record = self._make_record(doc, key)
         queued = False
         with self._lock:
@@ -417,6 +438,9 @@ class MaestroDaemon:
         if result is not None:
             entry["exit_code"] = result.exit_code
             entry["duration_s"] = round(result.duration_s, 3)
+            # per-attempt usage keeps budget attribution exact (failed work still costs)
+            if isinstance(result.usage, dict):
+                entry["usage"] = result.usage
         if error:
             entry["error"] = error
         record.setdefault("attempts", []).append(entry)

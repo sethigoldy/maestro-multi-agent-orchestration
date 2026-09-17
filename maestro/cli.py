@@ -235,6 +235,39 @@ def _cmd_task_audit(args: argparse.Namespace) -> int:
         m.close()
 
 
+def _cmd_budgets() -> int:
+    from .budgets import BudgetCaps, daily_spend, spent_by_agent
+    from .core import Maestro
+
+    caps = BudgetCaps.from_env()
+    if not caps.any():
+        print("no budget caps configured (set MAESTRO_BUDGET_PER_AGENT_USD and/or MAESTRO_BUDGET_DAILY_USD)")
+        return 0
+    records = _budget_records_from_state()
+    per_agent = spent_by_agent(records)
+    daily = daily_spend(records)
+    if caps.per_agent_usd is not None:
+        print(f"per-agent cap: ${caps.per_agent_usd:.4f}")
+        for agent in sorted(per_agent):
+            spent = per_agent[agent]
+            flag = "  (EXHAUSTED)" if spent >= caps.per_agent_usd else ""
+            print(f"  {agent}: ${spent:.4f}{flag}")
+    if caps.daily_usd is not None:
+        flag = "  (EXHAUSTED)" if daily >= caps.daily_usd else ""
+        print(f"daily cap: ${caps.daily_usd:.4f} — spent today (UTC): ${daily:.4f}{flag}")
+    return 0
+
+
+def _budget_records_from_state() -> list[dict[str, Any]]:
+    from .budgets import _records_from_claims
+
+    m = Maestro(maestro_user_dir())
+    try:
+        return list(_records_from_claims(m.mem.get_all()).values())
+    finally:
+        m.close()
+
+
 def _cmd_peers(args: argparse.Namespace) -> int:
     from .discovery import PeerTable, STALE_AFTER_S
 
@@ -363,6 +396,8 @@ def main(argv: list[str] | None = None) -> int:
     peers_remove = peers_sub.add_parser("remove", help="Remove a peer by key or name")
     peers_remove.add_argument("peer")
 
+    sub.add_parser("budgets", help="Show budget caps and current spend (MAESTRO_BUDGET_*_USD)")
+
     h = sub.add_parser("handoff", help="Manually create and launch a Codex handoff")
     h.add_argument("--title", required=True)
     h.add_argument("--request", required=True)
@@ -427,6 +462,8 @@ def main(argv: list[str] | None = None) -> int:
             return tui.run(url)
         if args.cmd == "peers":
             return _cmd_peers(args)
+        if args.cmd == "budgets":
+            return _cmd_budgets()
         if args.cmd == "task" and args.task_cmd == "tail":
             url = _daemon_url()
             target_id = None if args.all else args.task_id

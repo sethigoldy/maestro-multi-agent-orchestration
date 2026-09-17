@@ -288,7 +288,20 @@ direct model API call if ever needed.
     USD field, so raw counters are recorded as-is.
   - `DEFAULT_BINARIES["copilot"]` corrected from the old `gh` placeholder to
     the real `copilot` binary; KNOWN_CLIS discovery updated to match.
-- Remaining v2 candidates: budget caps enforcement.
+- **v2-M6 — DONE**: budget caps.
+  - `maestro/budgets.py`: caps from `MAESTRO_BUDGET_PER_AGENT_USD` (cumulative
+    USD per agent) and `MAESTRO_BUDGET_DAILY_USD` (all agents, UTC-day reset).
+    Misconfigured values are ignored rather than blocking launches.
+  - Spend is computed from usage claims: attempts now record their own
+    `usage`, so per-agent attribution is exact and failed work still counts.
+    Accounting merges the durable claim journal (`task_runtime`) with live
+    records (live wins); naive timestamps are assumed UTC.
+  - Enforcement is launch-time only, in `delegate()`: a blocked launch raises
+    `ValueError` like any other precondition; running tasks always finish.
+  - CLI: `maestro budgets` prints configured caps and current spend with
+    EXHAUSTED markers.
+
+**All six v2 candidates are now implemented (M1–M6).**
 
 | # | Deliverable | Proves |
 |---|---|---|
