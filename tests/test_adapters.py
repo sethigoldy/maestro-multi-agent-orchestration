@@ -306,8 +306,18 @@ def test_unimplemented_mode_raises(tmp_path):
     class _Api(CodexAdapter):
         mode = "api"
 
+    # api mode is implemented (v2-M3); without a base URL it fails cleanly
+    # instead of raising AdapterNotAvailable.
+    result = _Api(_spec("x")).run("p", tmp_path, "t")
+    assert result.ok is False and "base URL" in (result.error or "")
+
+
+def test_unknown_mode_still_raises(tmp_path):
+    class _Weird(CodexAdapter):
+        mode = "telepathy"
+
     with pytest.raises(AdapterNotAvailable):
-        _Api(_spec("x")).run("p", tmp_path, "t")
+        _Weird(_spec("x")).run("p", tmp_path, "t")
 
 
 def test_generic_run_end_to_end(tmp_path):

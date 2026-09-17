@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..agents import AgentSpec
+from .a2a_remote import A2ARemoteAdapter
 from .base import AdapterNotAvailable, BaseAdapter
 from .claude_code import ClaudeCodeAdapter
 from .cline import ClineAdapter
@@ -14,6 +15,7 @@ from .openhands import OpenHandsAdapter
 from .pi import PiAdapter
 
 __all__ = [
+    "A2ARemoteAdapter",
     "AdapterNotAvailable",
     "BaseAdapter",
     "ClaudeCodeAdapter",
@@ -27,8 +29,10 @@ __all__ = [
     "make_adapter",
 ]
 
-#: Kinds implemented in this release (M2+M4+M5). a2a_remote and copilot remain planned.
-IMPLEMENTED_KINDS: frozenset[str] = frozenset({"codex", "claude_code", "generic", "pi", "cline", "hermes", "cursor", "openhands"})
+#: Kinds implemented in this release (M2+M4+M5+v2). copilot lands in v2-M5.
+IMPLEMENTED_KINDS: frozenset[str] = frozenset(
+    {"codex", "claude_code", "generic", "pi", "cline", "hermes", "cursor", "openhands", "a2a_remote"}
+)
 
 
 def make_adapter(spec: AgentSpec) -> BaseAdapter:
@@ -47,5 +51,6 @@ def make_adapter(spec: AgentSpec) -> BaseAdapter:
         "hermes": HermesAdapter,
         "cursor": CursorAdapter,
         "openhands": OpenHandsAdapter,
+        "a2a_remote": A2ARemoteAdapter,
     }
     return adapters[spec.kind](spec)

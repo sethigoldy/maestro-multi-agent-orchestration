@@ -321,7 +321,13 @@ class MaestroDaemon:
                     prompt,
                     workspace,
                     task_id,
-                    settings={**{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort"}}, **doc.agent_settings},
+                    settings={
+                        **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort"}},
+                        **doc.agent_settings,
+                        # Reserved key for api-mode adapters (e.g. a2a_remote) so
+                        # the full handoff survives daemon-to-daemon hops.
+                        "maestro_handoff": doc.to_dict(),
+                    },
                     timeout=spec.timeout_s,
                     log_dir=self.state_dir / "tasks" / task_id,
                     on_line=_on_line,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -53,10 +54,10 @@ class AdapterResult:
 class BaseAdapter:
     """One registered agent's execution contract.
 
-    Modes: ``spawn`` (one-shot process, implemented here) and ``rpc`` (long-lived
-    stdin/stdout JSON protocol, implemented here for pi-style agents). ``api``
-    (HTTP service with its own lifecycle) remains a v2 seam and raises
-    :class:`AdapterNotAvailable` until then.
+    Modes: ``spawn`` (one-shot process), ``rpc`` (long-lived stdin/stdout JSON
+    protocol, pi-style agents) and ``api`` (remote HTTP service with its own
+    lifecycle — generic REST task contract in :meth:`_run_api`, A2A wire in the
+    ``a2a_remote`` adapter). All three are implemented.
     """
 
     kind: str = "base"
@@ -132,6 +133,8 @@ class BaseAdapter:
             return self._run_spawn(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
         if self.mode == "rpc":
             return self._run_rpc(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
+        if self.mode == "api":
+            return self._run_api(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
         raise AdapterNotAvailable(f"Adapter {self.kind!r} uses mode {self.mode!r}; it is not implemented in this release yet")
 
     def _run_spawn(
@@ -243,6 +246,112 @@ class BaseAdapter:
             ok=ok, exit_code=exit_code, output_path=str(log_path) if log_path else None,
             usage=usage, question=question, error=error, duration_s=time.monotonic() - started,
         )
+
+    # -- api execution ------------------------------------------------------
+    def api_base_url(self, settings: dict[str, Any] | None) -> str | None:
+        """Base URL of the remote service; subclasses may override."""
+        settings = settings or {}
+        url = settings.get("api_base_url")
+        if isinstance(url, str) and url:
+            return url.rstrip("/")
+        if self.spec is not None and isinstance(self.spec.command, str) and self.spec.command.startswith(("http://", "https://")):
+            return self.spec.command.rstrip("/")
+        return None
+
+    def api_endpoints(self) -> dict[str, str]:
+        """Pluggable REST task contract (relative paths; ``{id}`` is substituted)."""
+        return {
+            "submit": "/tasks",
+            "status": "/tasks/{id}",
+            "cancel": "/tasks/{id}/cancel",
+        }
+
+    def api_poll_interval_s(self) -> float:
+        """Status poll cadence (REST servers without a push channel need polling)."""
+        return 1.0
+
+    def _run_api(
+        self,
+        prompt: str,
+        workspace: Path,
+        task_id: str,
+        *,
+        settings: dict[str, Any] | None,
+        timeout: float | None,
+        log_dir: str | Path | None,
+        on_line: Callable[[str], None] | None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AdapterResult:
+        import time
+
+        import urllib.error
+        import urllib.request
+
+        settings = dict(settings or {})
+        base_url = self.api_base_url(settings)
+        if not base_url:
+            return AdapterResult(ok=False, error=f"Adapter {self.kind!r} needs an api base URL (settings['api_base_url'] or a spec command that is an http(s) URL)")
+        endpoints = self.api_endpoints()
+        started = time.monotonic()
+
+        def _http(method: str, path: str, payload: dict[str, Any] | None = None):
+            body = json.dumps(payload).encode("utf-8") if payload is not None else None
+            request = urllib.request.Request(base_url + path, data=body, method=method, headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+                return json.loads(raw) if raw.strip() else {}
+
+        try:
+            submitted = _http("POST", endpoints["submit"], {"task_id": task_id, "prompt": prompt, "workspace": str(workspace)})
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            return AdapterResult(ok=False, error=f"Failed to submit task to {self.kind!r} at {base_url}: {exc}", duration_s=time.monotonic() - started)
+        if not isinstance(submitted, dict):
+            return AdapterResult(ok=False, error=f"Remote {self.kind!r} answered with a non-object payload on submit", duration_s=time.monotonic() - started)
+        remote_id = str(submitted.get("id") or task_id)
+
+        deadline = started + timeout if timeout else None
+        usage: dict[str, Any] | None = None
+        seen_output = ""
+        canceled_remote = False
+        try:
+            while True:
+                remaining = (deadline - time.monotonic()) if deadline is not None else None
+                if should_cancel is not None and should_cancel():
+                    if not canceled_remote:
+                        try:
+                            _http("POST", endpoints["cancel"].replace("{id}", remote_id))
+                            canceled_remote = True
+                        except (urllib.error.URLError, OSError, ValueError):
+                            pass  # best effort; keep polling for the terminal state
+                try:
+                    status = _http("GET", endpoints["status"].replace("{id}", remote_id))
+                except (urllib.error.URLError, OSError, ValueError) as exc:
+                    return AdapterResult(ok=False, error=f"Remote {self.kind!r} status lookup failed: {exc}", usage=usage, duration_s=time.monotonic() - started)
+                if not isinstance(status, dict):
+                    return AdapterResult(ok=False, error=f"Remote {self.kind!r} answered with a non-object payload on status", usage=usage, duration_s=time.monotonic() - started)
+                output = status.get("output")
+                if isinstance(output, str) and len(output) > len(seen_output):
+                    new_part = output[len(seen_output):]
+                    seen_output = output
+                    for line in new_part.splitlines():
+                        if on_line is not None:
+                            on_line(line)
+                state = str(status.get("state") or "working")
+                if state == "completed":
+                    if isinstance(status.get("usage"), dict):
+                        usage = {**(usage or {}), **status["usage"]}
+                    return AdapterResult(ok=True, exit_code=0, usage=usage, duration_s=time.monotonic() - started)
+                if state in ("failed", "canceled"):
+                    error = status.get("error") or f"Remote task ended {state}"
+                    if isinstance(status.get("usage"), dict):
+                        usage = {**(usage or {}), **status["usage"]}
+                    return AdapterResult(ok=False, exit_code=None, error=str(error), usage=usage, duration_s=time.monotonic() - started)
+                if remaining is not None and time.monotonic() >= deadline:
+                    break
+                time.sleep(self.api_poll_interval_s())
+        except (OSError, ValueError) as exc:
+            return AdapterResult(ok=False, error=f"Remote {self.kind!r} failed while polling status: {exc}", usage=usage, duration_s=time.monotonic() - started)
+        return AdapterResult(ok=False, error=f"Remote {self.kind!r} timed out after {timeout}s", usage=usage, duration_s=time.monotonic() - started)
 
     # -- rpc execution ------------------------------------------------------
     def rpc_start_command(self, prompt: str, task_id: str) -> dict[str, Any]:

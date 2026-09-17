@@ -118,50 +118,16 @@ def _daemon_url() -> str:
 
 
 def _post_jsonrpc(url: str, method: str, params: dict[str, Any]) -> Any:
-    import urllib.error
-    import urllib.request
+    from .a2a_client import post_jsonrpc
 
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
-    request = urllib.request.Request(f"{url}/", data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:  # the daemon answers JSON-RPC errors with HTTP 400
-        try:
-            err = json.loads(exc.read().decode("utf-8"))
-        except ValueError:
-            raise ValueError(f"daemon answered HTTP {exc.code}") from None
-        raise ValueError(str((err.get("error") or {}).get("message", f"daemon answered HTTP {exc.code}"))) from None
-    return (payload or {}).get("result")
+    return post_jsonrpc(url, method, params)
 
 
 def _sse_events(url: str, path: str):
-    """Yield ``(event_name, data_dict)`` from an SSE endpoint.
+    """Yield ``(event_name, data_dict)`` from an SSE endpoint (see a2a_client)."""
+    from .a2a_client import sse_events
 
-    Blocks on the socket between events — this is a push stream, not polling.
-    The per-task stream closes after a terminal state; the global one runs
-    until the caller stops it (Ctrl-C).
-    """
-    import urllib.request
-
-    with urllib.request.urlopen(f"{url}{path}", timeout=None) as resp:
-        event = "message"
-        data_lines: list[str] = []
-        for raw in resp:  # blocking line iteration
-            line = raw.decode("utf-8", "replace").rstrip("\n")
-            if not line:
-                if data_lines:
-                    yield event, json.loads("\n".join(data_lines))
-                event, data_lines = "message", []
-                continue
-            if line.startswith(":"):
-                continue  # keepalive comment
-            if line.startswith("event: "):
-                event = line[7:].strip()
-            elif line.startswith("data: "):
-                data_lines.append(line[6:])
-        if data_lines:
-            yield event, json.loads("\n".join(data_lines))
+    yield from sse_events(url, path)
 
 
 def _stream_task(url: str, task_id: str | None) -> int:

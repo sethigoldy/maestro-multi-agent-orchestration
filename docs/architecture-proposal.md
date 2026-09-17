@@ -252,8 +252,20 @@ direct model API call if ever needed.
   detail pane with state colors/costs/attempts/transcript tail; q/ESC/^C quit,
   j/k/↑-keys navigate. Stream end (daemon stop) exits 1; unreachable daemon
   exits 1; non-tty exits 2.
-- Remaining v2 candidates: `api` run mode (remote Agent Servers) + `a2a_remote`
-  adapter, P2P agent discovery, Copilot adapter, budget caps enforcement.
+- **v2-M3 — DONE**: `api` adapter mode + `a2a_remote` adapter.
+  - `api` mode: generic REST task contract on BaseAdapter (`POST /tasks`,
+    `GET /tasks/{id}`, `POST /tasks/{id}/cancel`; usage/output deltas, cancel,
+    timeout). A `generic` agent whose command is an http(s) URL becomes an
+    api-mode agent; preflight = reachability probe. REST servers without a
+    push channel are polled (1s default, overridable).
+  - `a2a_remote`: daemon-to-daemon delegation over the A2A wire — Agent Card
+    preflight, `message/send` (full handoff data part when the daemon injected
+    `maestro_handoff`, else text), then the per-task SSE stream for live
+    output/usage until terminal state; queued remotes fail fast with a clear
+    error; cancel via `tasks/cancel`. Shared client helpers moved to
+    `maestro/a2a_client.py` (CLI now reuses them).
+- Remaining v2 candidates: P2P agent discovery, Copilot adapter, budget caps
+  enforcement.
 
 | # | Deliverable | Proves |
 |---|---|---|
