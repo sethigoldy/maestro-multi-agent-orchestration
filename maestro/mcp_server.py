@@ -100,8 +100,11 @@ def delegate(workspace: str, handoff_file: str) -> str:
     legacy 0.8.x staged handoff. Returns the final A2A task object (state,
     artifacts, workspace/branch metadata)."""
     d = get_daemon()
-    doc = load_handoff_file(handoff_file)
-    started = d.delegate(doc, workspace)
+    try:
+        doc = load_handoff_file(handoff_file)
+        started = d.delegate(doc, workspace)
+    except (ValueError, OSError) as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
     if started.get("queued"):
         return json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line", "ts": started["ts"]}, indent=2)
     final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
@@ -159,6 +162,24 @@ def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
     except ValueError as exc:
         return json.dumps({"error": str(exc)}, indent=2)
     return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def followup(workspace: str, task_id: str, instruction: str) -> str:
+    """Send a follow-up instruction to a finished task (completed/failed/canceled).
+    The same agent resumes on the same task branch with the new instruction and
+    its previous Q&A in context. Blocks until the follow-up turn finishes or
+    needs input — no polling."""
+    d = get_daemon()
+    try:
+        started = d.followup(d.resolve(task_id), instruction)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    timed_out = final["status"]["state"] not in {"completed", "failed", "canceled"} and final["status"]["state"] != "input-required"
+    return json.dumps({"timed_out": bool(timed_out), **final}, indent=2)
 
 
 def main() -> None:

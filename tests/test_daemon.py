@@ -16,7 +16,7 @@ import pytest
 
 from maestro.agents import AgentSpec
 from maestro.daemon import MaestroDaemon
-from maestro.handoff import HandoffDoc
+from maestro.handoff import HandoffDoc, load_handoff_file
 
 
 def _fake_bin(dirpath: Path, name: str, body: str) -> None:
@@ -1030,3 +1030,115 @@ def test_release_skips_busy_workspace_then_continues(daemon, tmp_path):
     with daemon._lock:
         assert daemon._queue == [d_id, e_id]  # c promoted; d,e still queued (ws2 busy)
         assert str(ws1) not in daemon._active  # _start_queued was stubbed: slot stays free
+
+
+# ------------------------------------------------------------------ M3: followup + guards
+def test_followup_resumes_finished_task(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="original"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    attempts_before = len(daemon._tasks[started["task_id"]]["attempts"])
+
+    result = daemon.followup(started["task_id"], "now also update the README")
+    assert result["state"] == "submitted"
+    final2 = daemon.wait(started["task_id"], timeout=60)
+    assert final2["status"]["state"] == "completed"
+    record = daemon._tasks[started["task_id"]]
+    assert len(record["attempts"]) > attempts_before  # the follow-up turn ran
+    task_dir = daemon.state_dir / "tasks" / started["task_id"]
+    results = sorted(p.name for p in task_dir.iterdir() if p.name.startswith("result-"))
+    assert len(results) >= 2
+
+
+def test_followup_rejects_active_and_bad_input(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nsleep 5')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="busy"), ws)
+    time.sleep(0.3)
+    with pytest.raises(ValueError, match="still active"):
+        daemon.followup(started["task_id"], "extra work")
+    with pytest.raises(ValueError, match="empty"):
+        daemon.followup(started["task_id"], "   ")
+    with pytest.raises(KeyError):
+        daemon.followup("task-19700101-000000-deadbe", "x")
+    daemon.cancel(started["task_id"])
+
+
+def test_followup_depth_guard(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="shallow", max_depth_remaining=1), ws)
+    daemon.wait(started["task_id"], timeout=60)
+    with pytest.raises(ValueError, match="depth"):
+        daemon.followup(started["task_id"], "one more")
+
+
+def test_delegate_rejects_self_delegation(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    doc = _doc(title="selfish", target_agent="codex", origin_agent="codex")
+    with pytest.raises(ValueError, match="itself"):
+        daemon.delegate(doc, ws)
+
+
+def test_mcp_followup_and_self_delegation_errors(tmp_path, monkeypatch):
+    import maestro.daemon as dm
+    from maestro.mcp_server import delegate, followup
+
+    home, old = _reset_singleton(monkeypatch, tmp_path)
+    bp = tmp_path / "bin"
+    bp.mkdir()
+    _fake_bin(bp, "codex", 'cat > /dev/null\nexit 0')
+    monkeypatch.setenv("PATH", f"{bp}:{os.environ['PATH']}")
+    d = dm.get_daemon()
+    ws = _git_repo(tmp_path)
+    handoff = tmp_path / "h.json"
+    doc = _doc(title="m3 flow")
+    handoff.write_text(json.dumps(doc.to_dict()), encoding="utf-8")
+    try:
+        first = json.loads(delegate(str(ws), str(handoff)))
+        assert first["status"]["state"] == "completed"
+        out = json.loads(followup(str(ws), first["id"], "add a changelog entry"))
+        assert out["status"]["state"] == "completed" and out.get("timed_out") is False
+
+        # Unknown task and self-delegation surface as JSON errors, not exceptions.
+        unknown = json.loads(followup(str(ws), "task-19700101-000000-deadbe", "x"))
+        assert "error" in unknown
+
+        # Following up an active task surfaces the ValueError as JSON too.
+        _fake_bin(bp, "sleepy", 'cat > /dev/null\nsleep 8')
+        d.registry.save(AgentSpec(name="sleepy", kind="generic", command="sleepy --go", output_format="jsonl"))
+        busy_ws = _git_repo(tmp_path, "busy")
+        busy_handoff = tmp_path / "busy.json"
+        busy_handoff.write_text(json.dumps(_doc(title="busy m3", target_agent="sleepy").to_dict()), encoding="utf-8")
+        started_busy = d.delegate(load_handoff_file(str(busy_handoff)), str(busy_ws))
+        time.sleep(0.3)
+        active_err = json.loads(followup(str(busy_ws), started_busy["task_id"], "extra"))
+        assert "still active" in active_err["error"]
+        d.cancel(started_busy["task_id"])
+        selfish = tmp_path / "self.json"
+        selfish.write_text(json.dumps(_doc(title="selfish", target_agent="codex", origin_agent="codex").to_dict()), encoding="utf-8")
+        rejected = json.loads(delegate(str(ws), str(selfish)))
+        assert "error" in rejected and "itself" in rejected["error"]
+    finally:
+        if dm._instance is not None:
+            dm._instance.stop()
+        dm._instance = old
+
+
+def test_legacy_mcp_tools_keep_stable_signatures():
+    import inspect
+
+    from maestro import mcp_server
+
+    expected = {
+        "delegate_to_codex": ["workspace", "handoff_file"],
+        "task_status": ["workspace", "task_id"],
+        "list_tasks": ["workspace"],
+        "codex_followup": ["workspace", "task_id", "instruction"],
+        "review_task": ["workspace", "task_id", "review", "approved"],
+    }
+    for name, params in expected.items():
+        sig = list(inspect.signature(getattr(mcp_server, name)).parameters)
+        assert sig == params, f"{name} signature drifted: {sig}"

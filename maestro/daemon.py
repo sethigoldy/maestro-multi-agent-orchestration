@@ -164,6 +164,11 @@ class MaestroDaemon:
         from .handoff import validate_handoff
 
         doc = validate_handoff(doc)
+        if doc.target_agent == doc.origin_agent:
+            raise ValueError(
+                f"Agent {doc.target_agent!r} cannot delegate to itself (no self-review/self-delegation); "
+                "pick a different target or add a fallback agent"
+            )
         if doc.max_depth_remaining <= 0:
             raise ValueError("Max delegation depth exceeded; refusing to nest further")
         ws = Path(workspace).expanduser().resolve()
@@ -272,6 +277,10 @@ class MaestroDaemon:
 
     def _run_task(self, task_id: str, doc: HandoffDoc, workspace: Path) -> None:
         self._set_state(task_id, STATE_WORKING)
+        record = self._tasks.get(task_id)
+        turn = (record.get("turn") or 0) + 1 if record is not None else 1
+        if record is not None:
+            record["turn"] = turn  # follow-ups/answers are new turns; result files must not collide
         branch = self._prepare_branch(workspace, task_id, doc.commit_policy)
         if branch:
             record = self._tasks.get(task_id)
@@ -313,7 +322,7 @@ class MaestroDaemon:
                 )
                 self._record_attempt(task_id, agent_name, result)
                 (self.state_dir / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
-                (self.state_dir / "tasks" / task_id / f"result-{agent_name}-{attempt}.json").write_text(
+                (self.state_dir / "tasks" / task_id / f"result-{agent_name}-t{turn}-{attempt}.json").write_text(
                     json.dumps(result.to_dict(), indent=2), encoding="utf-8"
                 )
                 if result.usage:
@@ -448,6 +457,53 @@ class MaestroDaemon:
         thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace), daemon=True)
         thread.start()
         return {"task_id": task_id, "state": STATE_WORKING}
+
+    def followup(self, task_id: str, instruction: str) -> dict[str, Any]:
+        """Resume a finished task (completed/failed/canceled) with a new instruction.
+
+        The same target agent continues on the same task branch with the previous
+        Q&A transcript in context. Depth is decremented so follow-up chains cannot
+        nest forever."""
+        record = self._tasks.get(task_id)
+        if record is None:
+            raise KeyError(f"Unknown task reference {task_id!r}")
+        instruction = str(instruction).strip()
+        if not instruction:
+            raise ValueError("Follow-up instruction cannot be empty")
+        state = record["state"]
+        if state not in TERMINAL_STATES:
+            raise ValueError(
+                f"Task {task_id} is still active (state={state}); cancel it or answer its question before following up"
+            )
+        doc = self._doc_from_record(record)
+        followup_doc = HandoffDoc(
+            title=f"{record.get('title') or task_id} — follow-up",
+            request=instruction,
+            design=doc.design,
+            context_files=list(doc.context_files),
+            context_notes=(
+                (doc.context_notes + "\n" if doc.context_notes else "")
+                + "Follow-up turn: the previous work for this task is already on the task branch/working tree; build on it rather than redoing it."
+            ),
+            target_agent=record.get("target_agent") or doc.target_agent,
+            fallback=list(doc.fallback),
+            origin_agent=record.get("origin_agent") or doc.origin_agent,
+            parent_task_id=task_id,
+            artifacts=list(doc.artifacts),
+            verification=doc.verification,
+            commit_policy=doc.commit_policy,
+            budget_hint=doc.budget_hint,
+            sensitive=doc.sensitive,
+            max_depth_remaining=max(0, doc.max_depth_remaining - 1),
+        )
+        if followup_doc.max_depth_remaining <= 0:
+            raise ValueError("Max delegation depth exceeded; refusing to nest further")
+        record["doc"] = followup_doc.to_dict()  # the chain accumulates: later follow-ups see reduced depth
+        workspace = Path(record["workspace"])
+        self._set_state(task_id, STATE_SUBMITTED)
+        thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
+        thread.start()
+        return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
 
     def _doc_from_record(self, record: dict[str, Any]) -> HandoffDoc:
         from .handoff import from_dict

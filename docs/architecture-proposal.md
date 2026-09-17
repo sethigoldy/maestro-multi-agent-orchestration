@@ -199,8 +199,12 @@ direct model API call if ever needed.
   (`delegate`, `task_wait`, `cancel_task`, `answer_task_question`, `agents_list`).
   271 tests, 100% branch coverage. No polling anywhere: everything is event-driven
   (bus + SSE + blocking waits).
-- **M3 — NEXT**: MCP surface parity (`followup` tool), no-self-review enforcement,
-  backward-compat proof for the existing loop.
+- **M3 — DONE**: MCP surface parity — `followup` tool (any agent resumes a
+  finished task on its branch with reduced depth), no-self-review/self-delegation
+  guard in the router, error paths surfaced as JSON on every new tool, legacy
+  0.8.x tool signatures frozen by contract tests. 277 tests, 100% branch coverage.
+- **M4 — NEXT**: popular CLI trio — **pi** (RPC mode), **Cline** (`--json`
+  headless), **Hermes Agent** (Nous) adapters on the M2 adapter contract.
 
 | # | Deliverable | Proves |
 |---|---|---|
