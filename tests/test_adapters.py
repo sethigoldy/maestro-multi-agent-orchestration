@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maestro.adapters import AdapterNotAvailable, ClaudeCodeAdapter, CodexAdapter, GenericAdapter, make_adapter
+from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, GenericAdapter, HermesAdapter, PiAdapter, make_adapter
 from maestro.agents import AgentSpec
 
 
@@ -126,8 +126,11 @@ def test_factory_kinds():
     assert isinstance(make_adapter(_spec("codex")), CodexAdapter)
     assert isinstance(make_adapter(_spec("cc", kind="claude_code")), ClaudeCodeAdapter)
     assert isinstance(make_adapter(_spec("g", kind="generic", command="x")), GenericAdapter)
+    assert isinstance(make_adapter(_spec("pi", kind="pi")), PiAdapter)
+    assert isinstance(make_adapter(_spec("cl", kind="cline")), ClineAdapter)
+    assert isinstance(make_adapter(_spec("hm", kind="hermes")), HermesAdapter)
     with pytest.raises(AdapterNotAvailable):
-        make_adapter(_spec("pi", kind="pi"))
+        make_adapter(_spec("oh", kind="openhands"))
 
 
 # ---------------------------------------------------------------- generic
@@ -246,11 +249,11 @@ def test_spawn_launch_failure(tmp_path):
 
 
 def test_unimplemented_mode_raises(tmp_path):
-    class _Rpc(CodexAdapter):
-        mode = "rpc"
+    class _Api(CodexAdapter):
+        mode = "api"
 
     with pytest.raises(AdapterNotAvailable):
-        _Rpc(_spec("x")).run("p", tmp_path, "t")
+        _Api(_spec("x")).run("p", tmp_path, "t")
 
 
 def test_generic_run_end_to_end(tmp_path):
@@ -476,6 +479,500 @@ def test_spawn_streaming_oserror(monkeypatch, tmp_path):
     monkeypatch.setattr(base_mod.subprocess, "Popen", _BadWait)
     try:
         result = CodexAdapter(_spec("codex")).run("prompt", tmp_path, "task-1")
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "failed while streaming output" in (result.error or "")
+
+
+# ---------------------------------------------------------------- pi (rpc)
+_PI_FAKE_PY = """
+import json, os, sys
+
+behavior = BEHAVIOR  # injected by _pi_adapter
+
+def send(obj):
+    print(json.dumps(obj), flush=True)
+
+if behavior == "settle":
+    import time
+    time.sleep(0.3)
+    send({"type": "response", "command": "prompt", "success": True})
+    send({"type": "agent_settled"})
+    sys.exit(0)
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    try:
+        cmd = json.loads(raw)
+    except Exception:
+        continue
+    t = cmd.get("type")
+    if t == "prompt":
+        if behavior == "reject":
+            send({"type": "response", "command": "prompt", "success": False, "error": "nope"})
+            sys.exit(0)
+        if behavior == "retryfail":
+            send({"type": "response", "command": "prompt", "success": True})
+            send({"type": "auto_retry_end", "finalError": "529 overloaded_error: Overloaded"})
+            sys.exit(1)
+        send({"type": "response", "command": "prompt", "success": True, "id": cmd.get("id")})
+        if behavior == "eof":
+            sys.exit(0)  # stream closes before the agent settles
+        if behavior == "hang":
+            continue  # stay alive and silent; base must time out or cancel us
+        send({"type": "agent_start"})
+        send({"type": "message_update", "usage": {"input": 10, "output": 5, "cacheRead": 2, "cacheWrite": 1, "totalTokens": 18, "cost": {"input": 0.001, "output": 0.002, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.003}}})
+        send({"type": "message_update", "usage": {}})
+        send({"type": "message_update", "usage": "weird"})
+        send({"type": "auto_retry_end"})
+        print("garbage non-json line", flush=True)
+        send("[1, 2]")
+        send({"type": "agent_end", "messages": []})
+        send({"type": "agent_settled"})
+    elif t == "abort":
+        with open(os.environ["PI_ABORT_MARKER"], "w") as fh:
+            fh.write("aborted")
+        if os.environ.get("PI_ABORT_SETTLES", "exit") == "settle":
+            send({"type": "agent_settled"})
+        elif os.environ.get("PI_ABORT_SETTLES", "exit") == "silence":
+            continue  # stay alive and silent; grace must expire
+        sys.exit(0)
+# stdin EOF -> exit 0
+"""
+
+
+def _pi_adapter(tmp_path, behavior="ok"):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    (binpath / "_pi_fake.py").write_text(f"BEHAVIOR = {behavior!r}\n" + _PI_FAKE_PY, encoding="utf-8")
+    _fake_bin(binpath, "pi", 'exec python3 "$(dirname "$0")/_pi_fake.py" "$@"')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    return old
+
+
+def test_pi_happy_path(tmp_path):
+    import maestro.adapters.base as base_mod
+
+    old = _pi_adapter(tmp_path)
+    try:
+        seen: list[str] = []
+        result = PiAdapter(_spec("pi", kind="pi")).run(
+            "do the thing", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs",
+            on_line=seen.append,
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert result.usage == {
+        "input_tokens": 10, "output_tokens": 5, "cache_read_tokens": 2,
+        "cache_write_tokens": 1, "total_tokens": 18, "cost_usd": 0.003,
+    }
+    log = (tmp_path / "logs" / "pi-task-1.log").read_text(encoding="utf-8")
+    assert '"agent_settled"' in log and "garbage non-json line" in log
+    assert any("agent_settled" in line for line in seen)  # on_line saw the stream
+
+
+def test_pi_build_command_model(tmp_path):
+    adapter = PiAdapter(_spec("pi", kind="pi", model="anthropic/claude-sonnet-4"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd == ["pi", "--mode", "rpc", "--model", "anthropic/claude-sonnet-4"]
+    plain = PiAdapter(_spec("pi", kind="pi")).build_command("p", tmp_path, "t", {})
+    assert plain == ["pi", "--mode", "rpc"]
+
+
+def test_pi_prompt_rejected(tmp_path):
+    old = _pi_adapter(tmp_path, behavior="reject")
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "rejected the prompt" in (result.error or "") and "nope" in result.error
+
+
+def test_pi_retry_final_error(tmp_path):
+    old = _pi_adapter(tmp_path, behavior="retryfail")
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "gave up after automatic retries" in (result.error or "")
+
+
+def test_pi_timeout(tmp_path):
+    old = _pi_adapter(tmp_path, behavior="hang")
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=2)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "timed out" in (result.error or "")
+
+
+def test_pi_stream_closes_before_settle(tmp_path):
+    old = _pi_adapter(tmp_path, behavior="eof")
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "closed its stream before settling" in (result.error or "")
+
+
+def test_pi_cancel_settles_during_grace(tmp_path):
+    marker = tmp_path / "abort-marker"
+    old = _pi_adapter(tmp_path, behavior="hang")
+    monkeypatch_env = {"PI_ABORT_MARKER": str(marker), "PI_ABORT_SETTLES": "settle"}
+    for k, v in monkeypatch_env.items():
+        os.environ[k] = v
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run(
+            "p", tmp_path, "t", timeout=30, should_cancel=lambda: True
+        )
+    finally:
+        os.environ["PATH"] = old
+        for k in monkeypatch_env:
+            del os.environ[k]
+    assert result.ok is False and "was canceled" in (result.error or "")
+    assert marker.read_text(encoding="utf-8") == "aborted"
+
+
+def test_pi_cancel_grace_expires(tmp_path):
+    old = _pi_adapter(tmp_path, behavior="hang")
+    os.environ["PI_ABORT_MARKER"] = str(tmp_path / "abort-marker")
+    os.environ["PI_ABORT_SETTLES"] = "silence"
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run(
+            "p", tmp_path, "t", timeout=30, should_cancel=lambda: True
+        )
+    finally:
+        os.environ["PATH"] = old
+        del os.environ["PI_ABORT_MARKER"]
+        del os.environ["PI_ABORT_SETTLES"]
+    assert result.ok is False and "was canceled" in (result.error or "")
+
+
+def test_pi_launch_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=5)
+    assert result.ok is False and "Failed to launch" in (result.error or "")
+
+
+def test_pi_broken_stdin_and_wait(monkeypatch, tmp_path):
+    import subprocess
+
+    import maestro.adapters.base as base_mod
+
+    old = _pi_adapter(tmp_path, behavior="settle")
+    real_popen = base_mod.subprocess.Popen
+
+    class _BrokenRpcStdin:
+        def __init__(self, real):
+            self._real = real
+
+        def write(self, data):
+            raise OSError("pipe broken")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            raise ValueError("already closed")
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    class _Popen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if self.stdin is not None:
+                self.stdin = _BrokenRpcStdin(self.stdin)
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired(cmd="pi", timeout=timeout)
+
+    monkeypatch.setattr(base_mod.subprocess, "Popen", _Popen)
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True  # broken writes and wait are swallowed; settled wins
+
+
+# ---------------------------------------------------------------- cline
+_CLINE_FAKE = r"""
+cat > /dev/null
+echo '{"type":"say","text":"working on it","ts":1,"say":"text"}'
+echo '{"type":"ask","text":"proceed?","ts":2,"ask":"followup"}'
+echo '{"type":"say","text":"done: file created","ts":3,"say":"text"}'
+exit ${CLINE_RC:-0}
+"""
+
+
+def test_cline_happy_path(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "cline", _CLINE_FAKE)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = ClineAdapter(_spec("cl", kind="cline")).run(
+            "make a file", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert result.question is None  # headless auto-approve: asks never block
+    log = (tmp_path / "logs" / "cline-task-1.log").read_text(encoding="utf-8")
+    assert '"say":"text"' in log and '"ask":"followup"' in log
+
+
+def test_cline_failure_tail(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "cline", _CLINE_FAKE)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    os.environ["CLINE_RC"] = "3"
+    try:
+        result = ClineAdapter(_spec("cl", kind="cline")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+        del os.environ["CLINE_RC"]
+    assert result.ok is False and "exited with code 3" in (result.error or "")
+    assert "done: file created" in result.error
+
+
+def test_cline_build_command_flags(tmp_path):
+    adapter = ClineAdapter(_spec("cl", kind="cline", model="gpt-5", effort="high"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd == ["cline", "--json", "--model", "gpt-5", "--thinking", "high"]
+    plain = ClineAdapter(_spec("cl", kind="cline")).build_command("p", tmp_path, "t", {"effort": "max"})
+    assert plain == ["cline", "--json"]  # "max" is not a cline thinking level
+
+
+# ---------------------------------------------------------------- hermes
+_HERMES_FAKE_PY = """
+import json, os, sys
+
+args = sys.argv[1:]
+prompt = None
+usage_file = None
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-z":
+        prompt = args[i + 1]
+        i += 2
+        continue
+    if a == "--usage-file":
+        usage_file = args[i + 1]
+        i += 2
+        continue
+    i += 1
+
+print(f"final answer to: {prompt}")
+mode = os.environ.get("HERMES_USAGE_MODE", "full")
+if usage_file and mode != "nowrite":
+    if mode == "garbage":
+        with open(usage_file, "w") as fh:
+            fh.write("not json")
+    elif mode == "partial":
+        with open(usage_file, "w") as fh:
+            fh.write(json.dumps({"estimated_cost_usd": 0.42}))
+    elif mode == "tokens_only":
+        with open(usage_file, "w") as fh:
+            fh.write(json.dumps({"input_tokens": 5}))
+    elif mode == "empty":
+        with open(usage_file, "w") as fh:
+            fh.write(json.dumps({}))
+    else:
+        report = {
+            "estimated_cost_usd": 0.42, "input_tokens": 100, "output_tokens": 50,
+            "cache_read_tokens": 7, "cache_write_tokens": 3, "reasoning_tokens": 9,
+            "total_tokens": 150, "model": "test-model", "provider": "test",
+            "completed": True, "failed": False,
+        }
+        with open(usage_file, "w") as fh:
+            fh.write(json.dumps(report))
+sys.exit(int(os.environ.get("HERMES_RC", "0")))
+"""
+
+
+def _hermes_adapter(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    (binpath / "_hermes_fake.py").write_text(_HERMES_FAKE_PY, encoding="utf-8")
+    _fake_bin(binpath, "hermes", 'exec python3 "$(dirname "$0")/_hermes_fake.py" "$@"')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    return old
+
+
+def test_hermes_happy_path_with_usage(tmp_path):
+    old = _hermes_adapter(tmp_path)
+    try:
+        result = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "write the report", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert result.usage == {
+        "cost_usd": 0.42, "input_tokens": 100, "output_tokens": 50,
+        "cache_read_tokens": 7, "cache_write_tokens": 3, "reasoning_tokens": 9,
+        "total_tokens": 150, "model": "test-model",
+    }
+    log = (tmp_path / "logs" / "hermes-task-1.log").read_text(encoding="utf-8")
+    assert "final answer to: write the report" in log
+
+
+def test_hermes_partial_and_garbage_usage(tmp_path):
+    old = _hermes_adapter(tmp_path)
+    try:
+        os.environ["HERMES_USAGE_MODE"] = "partial"
+        partial = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t1", timeout=30, log_dir=tmp_path / "logs"
+        )
+        del os.environ["HERMES_USAGE_MODE"]
+
+        os.environ["HERMES_USAGE_MODE"] = "garbage"
+        garbage = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t2", timeout=30, log_dir=tmp_path / "logs"
+        )
+        del os.environ["HERMES_USAGE_MODE"]
+    finally:
+        os.environ["PATH"] = old
+    assert partial.ok is True and partial.usage == {"cost_usd": 0.42}
+    assert garbage.ok is True and garbage.usage is None  # unreadable report is ignored
+
+    old2 = _hermes_adapter(tmp_path)
+    try:
+        os.environ["HERMES_USAGE_MODE"] = "tokens_only"
+        tokens = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t3", timeout=30, log_dir=tmp_path / "logs2"
+        )
+        del os.environ["HERMES_USAGE_MODE"]
+
+        os.environ["HERMES_USAGE_MODE"] = "nowrite"
+        nowrite = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t4", timeout=30, log_dir=tmp_path / "logs2"
+        )
+        del os.environ["HERMES_USAGE_MODE"]
+
+        os.environ["HERMES_USAGE_MODE"] = "empty"
+        empty = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t5", timeout=30, log_dir=tmp_path / "logs2"
+        )
+        del os.environ["HERMES_USAGE_MODE"]
+    finally:
+        os.environ["PATH"] = old2
+    assert tokens.ok is True and tokens.usage == {"input_tokens": 5}  # no cost field in report
+    assert nowrite.ok is True and nowrite.usage is None  # agent never wrote a usage file
+    assert empty.ok is True and empty.usage is None  # report maps to nothing
+
+
+def test_hermes_build_command(tmp_path):
+    adapter = HermesAdapter(_spec("hm", kind="hermes", model="anthropic/claude-sonnet-4", effort="high"))
+    cmd = adapter.build_command("the prompt", tmp_path, "task-9", {"maestro_log_dir": "/tmp/logs"})
+    assert cmd[0] == "hermes" and cmd[1] == "-z" and cmd[2] == "the prompt"
+    assert ["--usage-file", "/tmp/logs/usage-task-9.json"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+    assert ["-m", "anthropic/claude-sonnet-4"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+    assert ["--reasoning", "high"] in [cmd[i:i + 2] for i in range(len(cmd) - 1)]
+    assert cmd[-1] == "--yolo"
+    bare = HermesAdapter(_spec("hm", kind="hermes")).build_command("p", tmp_path, "t", {})
+    assert "--usage-file" not in bare and "-m" not in bare and "--reasoning" not in bare
+
+
+def test_hermes_no_usage_file(tmp_path):
+    old = _hermes_adapter(tmp_path)
+    try:
+        result = HermesAdapter(_spec("hm", kind="hermes")).run("p", tmp_path, "t", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.usage is None  # no log_dir -> no --usage-file
+
+
+def test_pi_start_command_not_implemented(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "pi", "exit 0")
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+
+    class _Rpc(CodexAdapter):
+        mode = "rpc"
+
+        def build_command(self, prompt, workspace, task_id, settings):
+            return ["pi"]
+
+    try:
+        with pytest.raises(NotImplementedError, match="does not speak an rpc protocol"):
+            _Rpc(_spec("x")).run("p", tmp_path, "t")
+    finally:
+        os.environ["PATH"] = old
+
+
+def test_pi_event_not_implemented(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "pi", 'echo \'{"type": "x"}\'\nexit 0')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+
+    class _PartialRpc(CodexAdapter):
+        mode = "rpc"
+
+        def build_command(self, prompt, workspace, task_id, settings):
+            return ["pi"]
+
+        def rpc_start_command(self, prompt, task_id):
+            return {}
+
+    try:
+        with pytest.raises(NotImplementedError, match="does not speak an rpc protocol"):
+            _PartialRpc(_spec("x")).run("p", tmp_path, "t")
+    finally:
+        os.environ["PATH"] = old
+
+
+def test_pi_cancel_without_abort_support(tmp_path):
+    class _NoAbort(PiAdapter):
+        def rpc_abort_command(self):
+            return BaseAdapter.rpc_abort_command(self)
+
+    old = _pi_adapter(tmp_path, behavior="settle")
+    try:
+        result = _NoAbort(_spec("pi", kind="pi")).run(
+            "p", tmp_path, "t", timeout=30, should_cancel=lambda: True
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "was canceled" in (result.error or "")
+
+
+def test_pi_streaming_oserror(monkeypatch, tmp_path):
+    import subprocess
+
+    import maestro.adapters.base as base_mod
+
+    old = _pi_adapter(tmp_path, behavior="settle")
+    real_popen = base_mod.subprocess.Popen
+
+    class _Popen(real_popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._once = True
+
+        def wait(self, timeout=None):
+            if self._once:  # first wait (post-settle grace window) breaks
+                self._once = False
+                raise OSError("stream broke")
+            return real_popen.wait(self, timeout)
+
+    monkeypatch.setattr(base_mod.subprocess, "Popen", _Popen)
+    try:
+        result = PiAdapter(_spec("pi", kind="pi")).run("p", tmp_path, "t", timeout=30)
     finally:
         os.environ["PATH"] = old
     assert result.ok is False and "failed while streaming output" in (result.error or "")

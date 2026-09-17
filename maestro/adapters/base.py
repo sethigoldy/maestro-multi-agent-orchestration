@@ -53,9 +53,10 @@ class AdapterResult:
 class BaseAdapter:
     """One registered agent's execution contract.
 
-    Modes: ``spawn`` (one-shot process, implemented here), ``rpc`` (stdin/stdout
-    JSON protocol) and ``api`` (HTTP service) — the latter two land with their
-    adapters in M4/M5 and raise :class:`AdapterNotAvailable` until then.
+    Modes: ``spawn`` (one-shot process, implemented here) and ``rpc`` (long-lived
+    stdin/stdout JSON protocol, implemented here for pi-style agents). ``api``
+    (HTTP service with its own lifecycle) lands in M5 with the OpenHands adapter
+    and raises :class:`AdapterNotAvailable` until then.
     """
 
     kind: str = "base"
@@ -127,9 +128,11 @@ class BaseAdapter:
         on_line: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AdapterResult:
-        if self.mode != "spawn":
-            raise AdapterNotAvailable(f"Adapter {self.kind!r} uses mode {self.mode!r}; it is not implemented in this release yet")
-        return self._run_spawn(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
+        if self.mode == "spawn":
+            return self._run_spawn(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
+        if self.mode == "rpc":
+            return self._run_rpc(prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir, on_line=on_line, should_cancel=should_cancel)
+        raise AdapterNotAvailable(f"Adapter {self.kind!r} uses mode {self.mode!r}; it is not implemented in this release yet")
 
     def _run_spawn(
         self,
@@ -147,7 +150,9 @@ class BaseAdapter:
         import threading as _threading
         import time
 
-        settings = settings or {}
+        settings = dict(settings or {})
+        if log_dir is not None:
+            settings["maestro_log_dir"] = str(log_dir)
         command = self.build_command(prompt, workspace, task_id, settings)
         if log_dir is not None:
             log_path = Path(log_dir) / f"{self.kind}-{task_id}.log"
@@ -237,6 +242,179 @@ class BaseAdapter:
         return AdapterResult(
             ok=ok, exit_code=exit_code, output_path=str(log_path) if log_path else None,
             usage=usage, question=question, error=error, duration_s=time.monotonic() - started,
+        )
+
+    # -- rpc execution ------------------------------------------------------
+    def rpc_start_command(self, prompt: str, task_id: str) -> dict[str, Any]:
+        """First command sent once the agent process is up."""
+        raise NotImplementedError(f"Adapter {self.kind!r} does not speak an rpc protocol")
+
+    def rpc_event(self, event: dict[str, Any]) -> dict[str, Any] | None:
+        """Classify one protocol event.
+
+        Return a subset of ``{"fail": str}`` (run failed definitively),
+        ``{"done": True}`` (run finished successfully) and/or
+        ``{"usage": dict}`` (merged into the cumulative usage)."""
+        raise NotImplementedError(f"Adapter {self.kind!r} does not speak an rpc protocol")
+
+    def rpc_abort_command(self) -> dict[str, Any] | None:
+        """Polite abort command sent before a forced kill; None kills directly."""
+        return None
+
+    def _run_rpc(
+        self,
+        prompt: str,
+        workspace: Path,
+        task_id: str,
+        *,
+        settings: dict[str, Any] | None,
+        timeout: float | None,
+        log_dir: str | Path | None,
+        on_line: Callable[[str], None] | None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> AdapterResult:
+        import json as _json
+        import queue as _queue
+        import threading as _threading
+        import time
+
+        settings = dict(settings or {})
+        if log_dir is not None:
+            settings["maestro_log_dir"] = str(log_dir)
+        command = self.build_command(prompt, workspace, task_id, settings)
+        if log_dir is not None:
+            log_path = Path(log_dir) / f"{self.kind}-{task_id}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            log_path = None
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(workspace),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+                env=os.environ.copy(),
+            )
+        except (OSError, ValueError) as exc:
+            return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")
+
+        def _send(obj: dict[str, Any]) -> None:
+            # stdin is always a PIPE in rpc mode; writes can still fail once the
+            # process dies, and those are swallowed on purpose.
+            try:
+                process.stdin.write(_json.dumps(obj) + "\n")  # type: ignore[union-attr]
+                process.stdin.flush()  # type: ignore[union-attr]
+            except (OSError, ValueError):
+                pass
+
+        usage: dict[str, Any] | None = None
+        failed: str | None = None
+
+        def _handle(line_text: str) -> str:
+            """Classify one line; returns 'fail', 'done' or '' after state updates."""
+            nonlocal usage, failed
+            try:
+                event = _json.loads(line_text)
+            except ValueError:
+                return ""  # stderr noise or non-JSON chatter
+            if not isinstance(event, dict):
+                return ""
+            classified = self.rpc_event(event)
+            if not classified:
+                return ""
+            if isinstance(classified.get("usage"), dict):
+                usage = {**(usage or {}), **classified["usage"]}
+            if isinstance(classified.get("fail"), str):
+                failed = classified["fail"]
+                return "fail"
+            if classified.get("done"):
+                return "done"
+            return ""
+
+        _send(self.rpc_start_command(prompt, task_id))
+        line_q: "_queue.Queue[str | None]" = _queue.Queue()
+
+        def _reader() -> None:
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    line_q.put(line)
+            finally:
+                line_q.put(None)  # sentinel: stream closed
+
+        reader = _threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        deadline = started + timeout if timeout else None
+        done = False
+        cancel_grace_until: float | None = None
+        try:
+            lines: list[str] = []
+            while True:
+                remaining = (deadline - time.monotonic()) if deadline is not None else None
+                if cancel_grace_until is not None:
+                    grace_left = cancel_grace_until - time.monotonic()
+                    remaining = grace_left if remaining is None else min(remaining, grace_left)
+                try:
+                    line = line_q.get(timeout=remaining)
+                except _queue.Empty:
+                    if cancel_grace_until is not None:
+                        break  # abort grace expired; fall through to the kill path
+                    _kill_group(process)
+                    return AdapterResult(ok=False, error=f"Agent {self.kind!r} timed out after {timeout}s", duration_s=time.monotonic() - started)
+                if line is None:
+                    break  # stream closed before the agent settled
+                if should_cancel is not None and should_cancel() and cancel_grace_until is None:
+                    abort = self.rpc_abort_command()
+                    if abort is not None:
+                        _send(abort)
+                    cancel_grace_until = time.monotonic() + 5
+                    continue
+                lines.append(line.rstrip("\n"))
+                if log_path is not None:
+                    with log_path.open("a", encoding="utf-8") as fh:
+                        fh.write(line)
+                if on_line is not None:
+                    on_line(line.rstrip("\n"))
+                action = _handle(line.rstrip("\n"))
+                if action == "fail":
+                    _kill_group(process)
+                    reader.join(timeout=5)
+                    return AdapterResult(ok=False, error=failed or f"Agent {self.kind!r} failed", output_path=str(log_path) if log_path else None, usage=usage, duration_s=time.monotonic() - started)
+                if action == "done":
+                    done = True
+                    break
+            try:
+                process.stdin.close()  # polite EOF; long-lived agents may exit on their own
+            except (OSError, ValueError):
+                pass
+            try:
+                exit_code = process.wait(timeout=5)
+            except subprocess.SubprocessError:
+                _kill_group(process)
+                exit_code = None
+        except (OSError, ValueError) as exc:
+            _kill_group(process)
+            return AdapterResult(ok=False, error=f"Agent {self.kind!r} failed while streaming output: {exc}", duration_s=time.monotonic() - started)
+        reader.join(timeout=5)
+        if cancel_grace_until is not None:
+            return AdapterResult(
+                ok=False, exit_code=exit_code, output_path=str(log_path) if log_path else None,
+                usage=usage, error=f"Agent {self.kind!r} was canceled", duration_s=time.monotonic() - started,
+            )
+        if done:
+            return AdapterResult(
+                ok=True, exit_code=exit_code, output_path=str(log_path) if log_path else None,
+                usage=usage, duration_s=time.monotonic() - started,
+            )
+        tail = "\n".join(lines[-10:])
+        error = f"Agent {self.kind!r} closed its stream before settling (exit code {exit_code})" + (f"; last output:\n{tail}" if tail else "")
+        return AdapterResult(
+            ok=False, exit_code=exit_code, output_path=str(log_path) if log_path else None,
+            usage=usage, error=error, duration_s=time.monotonic() - started,
         )
 
 

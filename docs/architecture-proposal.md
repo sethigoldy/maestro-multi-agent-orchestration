@@ -203,8 +203,14 @@ direct model API call if ever needed.
   finished task on its branch with reduced depth), no-self-review/self-delegation
   guard in the router, error paths surfaced as JSON on every new tool, legacy
   0.8.x tool signatures frozen by contract tests. 277 tests, 100% branch coverage.
-- **M4 — NEXT**: popular CLI trio — **pi** (RPC mode), **Cline** (`--json`
-  headless), **Hermes Agent** (Nous) adapters on the M2 adapter contract.
+- **M4 — DONE**: popular CLI trio — **pi** (Earendil) first-class adapter in the
+  new **rpc run mode** (JSONL protocol over stdin/stdout: prompt command,
+  `agent_settled` completion, usage from `message_update`, polite `abort`),
+  **Cline** (`--json` headless spawn, auto-approve act mode), **Hermes Agent**
+  (one-shot `-z` + `--usage-file` cost report, verified live against the
+  installed v0.20.x CLI). 298 tests, 100% branch coverage.
+- **M5 — NEXT**: OpenHands (Agent Server REST/SDK), Cursor (`cursor-agent`),
+  generic-spec onboarding of Kilo Code/omp/OpenClaw; `api` run mode.
 
 | # | Deliverable | Proves |
 |---|---|---|
