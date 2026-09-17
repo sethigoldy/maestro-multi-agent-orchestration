@@ -16,6 +16,7 @@ memvara = ["memvara"]
 [project.scripts]
 maestro = "maestro.cli:main"
 maestro-mcp = "maestro.mcp_server:main"
+maestro-daemon = "maestro.daemon_main:main"
 
 [tool.setuptools.packages.find]
 include = ["maestro*"]

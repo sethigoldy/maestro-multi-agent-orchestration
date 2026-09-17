@@ -301,7 +301,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)
@@ -407,7 +407,7 @@ class Maestro:
         index=next((x for x in self._registry_records() if str(x["task_id"])==task_id),None)
         claims=self._claims(task_id)
         result={"task_id":task_id,"task_number":index.get("number") if index else None,"title":index.get("title") if index else None}
-        result.update({"phase":claims.get("task_status"),"supervisor":claims.get("task_owner"),"implementer":claims.get("task_implementer"),"design":claims.get("task_design"),"result":claims.get("task_result"),"verification":claims.get("task_verification"),"workspace":claims.get("task_workspace") or (index or {}).get("workspace"),"model":claims.get("task_model"),"effort":claims.get("task_effort")})
+        result.update({"phase":claims.get("task_status"),"supervisor":claims.get("task_owner"),"implementer":claims.get("task_implementer"),"design":claims.get("task_design"),"result":claims.get("task_result"),"verification":claims.get("task_verification"),"workspace":claims.get("task_workspace") or (index or {}).get("workspace"),"model":claims.get("task_model"),"effort":claims.get("task_effort"),"origin_agent":claims.get("task_origin_agent"),"target_agent":claims.get("task_target_agent"),"branch":claims.get("task_branch")})
         if claims.get("task_number"):  # pragma: no branch
             try: result["task_number"]=int(claims["task_number"])
             except ValueError: pass

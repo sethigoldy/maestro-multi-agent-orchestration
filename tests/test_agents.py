@@ -247,3 +247,11 @@ def test_registry_get_invalid_toml_returns_none(tmp_path):
     reg = AgentRegistry(tmp_path)
     (reg.dir / "x.toml").write_text("not toml ===", encoding="utf-8")
     assert reg.get("x") is None
+
+
+def test_to_dict_includes_optional_settings():
+    from maestro.agents import AgentSpec
+
+    spec = AgentSpec(name="x", kind="codex", model="gpt-x", effort="high", timeout_s=120.0)
+    data = spec.to_dict()
+    assert data["model"] == "gpt-x" and data["effort"] == "high" and data["timeout_s"] == 120.0

@@ -187,9 +187,20 @@ direct model API call if ever needed.
   `maestro agents list|add|remove|discover|status` CLI. 130 tests, 100% branch
   coverage. Live smoke test on the developer machine discovered 5 of 8 known CLIs
   (codex, claude_code, hermes, cursor-agent, gh).
-- **M2 — NEXT**: daemon with A2A server + router + adapter contract (spawn/rpc/api)
-  + codex & claude_code adapters + handoff document schema + per-task branches +
-  preflight + cancellation + `input-required` routing.
+- **M2 — DONE**: daemon (`maestro/daemon.py` + `maestro-daemon` console script) with
+  A2A server (agent card, `message/send`, `tasks/get`, `tasks/cancel`, SSE event
+  streams with keepalive), reactive event bus (`maestro/events.py`), FIFO router
+  (one active task per workspace, queue promotion on release), adapter contract
+  (spawn implemented; rpc/api planned for M4/M5) + codex / claude_code / generic
+  adapters, handoff document schema (`maestro/handoff.py`, TOML + legacy JSON),
+  per-task branches `maestro/<task_id>`, preflight (binary/version/auth fail-fast),
+  retry-with-backoff → fallback chain → escalation event, cancellation with partials
+  kept, `input-required` mid-task question routing, blocking MCP tools
+  (`delegate`, `task_wait`, `cancel_task`, `answer_task_question`, `agents_list`).
+  271 tests, 100% branch coverage. No polling anywhere: everything is event-driven
+  (bus + SSE + blocking waits).
+- **M3 — NEXT**: MCP surface parity (`followup` tool), no-self-review enforcement,
+  backward-compat proof for the existing loop.
 
 | # | Deliverable | Proves |
 |---|---|---|

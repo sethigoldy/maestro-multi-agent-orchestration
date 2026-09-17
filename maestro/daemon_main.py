@@ -1,0 +1,60 @@
+"""Console entry point for the Maestro daemon (``maestro-daemon``)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import threading
+from typing import Any
+
+
+def run_daemon(state_dir: str | None = None, port: int = 0) -> dict[str, Any]:
+    """Start the daemon (HTTP on 127.0.0.1) and return its connection info."""
+    from .daemon import MaestroDaemon
+
+    daemon = MaestroDaemon(state_dir=state_dir, start_http=True, port=port)
+    return {"pid": os.getpid(), "port": daemon.port, "state_dir": str(daemon.state_dir), "daemon": daemon}
+
+
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="maestro-daemon", description="Run the Maestro local broker daemon")
+    parser.add_argument("--port", type=int, default=0, help="Port to bind on 127.0.0.1 (0 = pick a free port)")
+    parser.add_argument("--state-dir", default=None, help="State directory (default: ~/.maestro or $MAESTRO_HOME)")
+    return parser.parse_args(argv)
+
+
+def run_forever(install_handlers: bool = True) -> None:
+    """Block until SIGINT/SIGTERM. Handlers are only installed on the main thread
+    and are restored on exit so callers (and tests) keep their signal state."""
+    stop = threading.Event()
+
+    def _handle(signum: int, frame: Any) -> None:
+        stop.set()
+
+    previous: dict[int, Any] = {}
+    if install_handlers and threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, _handle)
+    try:
+        stop.wait()
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    info = run_daemon(state_dir=args.state_dir, port=args.port)
+    daemon = info.pop("daemon")
+    print(json.dumps(info, indent=2), flush=True)  # flushed: consumers wait for this line
+    try:
+        run_forever()
+    finally:
+        daemon.stop()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from .core import Maestro
+from .daemon import get_daemon
+from .handoff import load_handoff_file
 
 mcp = FastMCP("maestro")
 
@@ -14,6 +17,13 @@ def _instance(workspace: str) -> Maestro:
     # The MCP server process may outlive the Claude session/worktree that launched it.
     # Never use its cwd as the project identity; Claude passes the active workspace.
     return Maestro(Maestro.git_root(workspace))
+
+
+def _delegate_timeout() -> float:
+    try:
+        return float(os.environ.get("MAESTRO_DELEGATE_TIMEOUT", "3600"))
+    except ValueError:
+        return 3600.0
 
 
 @mcp.tool()
@@ -79,6 +89,76 @@ def review_task(workspace: str, task_id: str, review: str, approved: bool) -> st
         return json.dumps({"review": state}, indent=2)
     finally:
         m.close()
+
+
+@mcp.tool()
+def delegate(workspace: str, handoff_file: str) -> str:
+    """Delegate a staged handoff to ANY registered agent and block until the work
+    completes, fails, or needs input. No polling: this call resolves when done.
+
+    The handoff file may be the 4-section Maestro document (JSON or TOML) or a
+    legacy 0.8.x staged handoff. Returns the final A2A task object (state,
+    artifacts, workspace/branch metadata)."""
+    d = get_daemon()
+    doc = load_handoff_file(handoff_file)
+    started = d.delegate(doc, workspace)
+    if started.get("queued"):
+        return json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line", "ts": started["ts"]}, indent=2)
+    final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    timed_out = final["status"]["state"] not in {"completed", "failed", "canceled"} and final["status"]["state"] != "input-required"
+    return json.dumps({"timed_out": bool(timed_out), **final}, indent=2)
+
+
+@mcp.tool()
+def task_wait(workspace: str, task_id: str, timeout: float = 120.0) -> str:
+    """Block until a task reaches a new terminal state or needs input (or the
+    timeout expires). Use this to follow up on earlier delegations — never poll."""
+    d = get_daemon()
+    try:
+        final = d.wait(d.resolve(task_id), timeout=timeout)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    return json.dumps(final, indent=2)
+
+
+@mcp.tool()
+def agents_list() -> str:
+    """List every registered agent with its adapter kind, skills, defaults, and
+    live availability (binary found? version?)."""
+    d = get_daemon()
+    out = []
+    for spec in d.registry.list():
+        status = d.registry.status(spec.name)
+        out.append({**spec.to_dict(), "status": status})
+    return json.dumps(out, indent=2)
+
+
+@mcp.tool()
+def cancel_task(workspace: str, task_id: str, reason: str = "") -> str:
+    """Cancel a running (or queued-waiting) task. Partial work on the task branch
+    is kept; the task is marked canceled with the reason."""
+    d = get_daemon()
+    try:
+        result = d.cancel(d.resolve(task_id), reason=reason)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
+    """Answer a question the agent asked mid-task (state 'input-required'). The
+    agent resumes on its branch with the Q&A appended to its context."""
+    d = get_daemon()
+    try:
+        result = d.answer_question(d.resolve(task_id), answer)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    return json.dumps(result, indent=2)
 
 
 def main() -> None:

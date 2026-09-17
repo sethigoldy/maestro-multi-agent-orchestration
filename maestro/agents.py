@@ -77,6 +77,11 @@ class AgentSpec:
     skills: list[str] = field(default_factory=list)
     enabled: bool = True
     source: str = "user"  # "user" | "discovered"
+    # Per-agent execution defaults (round-3 decision: registry carries them; any
+    # delegation may override per task).
+    model: str | None = None
+    effort: str | None = None
+    timeout_s: float | None = None
     # Generic-kind fields (ignored for builtin kinds):
     command: str | None = None
     input_mode: str = "arg"
@@ -92,6 +97,12 @@ class AgentSpec:
             "enabled": self.enabled,
             "source": self.source,
         }
+        if self.model is not None:
+            data["model"] = self.model
+        if self.effort is not None:
+            data["effort"] = self.effort
+        if self.timeout_s is not None:
+            data["timeout_s"] = self.timeout_s
         if self.kind == GENERIC_KIND:
             data.update(
                 {
@@ -164,7 +175,7 @@ def _dump_toml(data: dict[str, Any]) -> str:
 
 
 def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
-    known = {"name", "kind", "display_name", "skills", "enabled", "source", "command", "input_mode", "output_format", "workspace_policy"}
+    known = {"name", "kind", "display_name", "skills", "enabled", "source", "command", "input_mode", "output_format", "workspace_policy", "model", "effort", "timeout_s"}
     unknown = set(data) - known
     if unknown:
         raise ValueError(f"Unknown agent spec fields: {', '.join(sorted(unknown))}")
@@ -175,6 +186,9 @@ def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
         skills=[str(s) for s in data.get("skills", [])],
         enabled=bool(data.get("enabled", True)),
         source=str(data.get("source", "user")),
+        model=data.get("model"),
+        effort=data.get("effort"),
+        timeout_s=float(data["timeout_s"]) if data.get("timeout_s") is not None else None,
         command=data.get("command"),
         input_mode=str(data.get("input_mode", "arg")),
         output_format=str(data.get("output_format", "text")),
