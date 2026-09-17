@@ -49,8 +49,9 @@ You normally **do not need to run Maestro manually**.
 ## Multi-agent platform (0.9)
 
 Maestro now delegates to **any registered agent** — Codex, Claude Code, pi, Cline,
-Hermes Agent, Cursor, OpenHands, or any CLI via the generic spec — with every host
-agent (Claude, Kilo, Cline, ...) able to call any other through the same MCP tools.
+Hermes Agent, Cursor, OpenHands, the GitHub Copilot CLI, another Maestro daemon
+(`a2a_remote`), or any CLI via the generic spec — with every host agent (Claude,
+Kilo, Cline, ...) able to call any other through the same MCP tools.
 
 - **Local broker daemon** (`maestro-daemon`): A2A-aligned task API
   (agent card at `GET /.well-known/agent.json`, JSON-RPC `message/send` /
@@ -58,9 +59,20 @@ agent (Claude, Kilo, Cline, ...) able to call any other through the same MCP too
   task per workspace, retry → fallback chain → escalation, per-task branches.
 - **Reactive by design — no polling**: everything completes over the event bus;
   MCP `delegate`/`task_wait` block on it, dashboards stream SSE.
-- **Observability**: web dashboard at `http://127.0.0.1:<port>/`,
+- **Observability**: React web console at `http://127.0.0.1:<port>/`,
+  terminal dashboard `maestro dashboard` (raw-TUI, SSE-driven),
   `maestro task tail <id>` (live), `maestro task audit <id>` (durable),
   `maestro gc` (TTL 90 days, manual only).
+- **P2P discovery**: daemons announce over UDP multicast and record peers in
+  `peers.json`; `maestro peers list|add|remove` for inspection and manual
+  registration on networks without multicast.
+- **Remote agents**: the generic adapter runs against REST task servers (`api`
+  mode, auto-selected when the command is an http(s) URL), and `a2a_remote`
+  delegates to another Maestro daemon over the A2A wire (full handoff travels
+  as a data part).
+- **Budget caps**: `MAESTRO_BUDGET_PER_AGENT_USD` / `MAESTRO_BUDGET_DAILY_USD`
+  block new launches once spent (per agent or per UTC day); running tasks
+  always finish. `maestro budgets` shows caps and current spend.
 - **Flagship demo**: `examples/full-swap.sh` — the full role swap, one command.
 
 See [docs/architecture-proposal.md](docs/architecture-proposal.md) for the design
