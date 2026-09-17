@@ -671,9 +671,25 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             if self.path == "/.well-known/agent.json":
                 self._send_json(200, daemon.card())
                 return
+            if self.path == "/tasks":
+                self._send_json(200, {"tasks": daemon.list_tasks()})
+                return
+            if self.path == "/events":
+                self._sse(None)  # global stream: every task, never terminates on its own
+                return
             if self.path.startswith("/tasks/") and self.path.endswith("/events"):
                 task_id = self.path[len("/tasks/") : -len("/events")]
                 self._sse(task_id)
+                return
+            if self.path in ("/", "/index.html"):
+                from .dashboard import DASHBOARD_HTML
+
+                body = DASHBOARD_HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             self._send_json(404, {"error": "not found"})
 
@@ -690,7 +706,7 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             response = dispatcher.handle(body)
             self._send_json(200 if "result" in response else 400, response)
 
-        def _sse(self, task_id: str) -> None:
+        def _sse(self, task_id: str | None) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -703,11 +719,11 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
-                    if event.task_id != task_id:
+                    if task_id is not None and event.task_id != task_id:
                         continue
                     self.wfile.write(sse_encode(event.type, event.to_dict()).encode("utf-8"))
                     self.wfile.flush()
-                    if event.type == "state" and event.data.get("state") in TERMINAL_STATES:
+                    if task_id is not None and event.type == "state" and event.data.get("state") in TERMINAL_STATES:
                         break
             except (BrokenPipeError, ConnectionResetError, OSError):
                 pass

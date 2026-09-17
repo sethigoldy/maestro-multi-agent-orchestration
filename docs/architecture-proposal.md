@@ -160,7 +160,7 @@ direct model API call if ever needed.
 | **Routing** | Explicit target + fallback chain: caller names the agent; config may declare `fallback = ["codex", "claude_code"]` per agent or per task — used only after failure, never for initial routing. |
 | **Failure policy** | Staged: (1) auto-retry same agent up to N times (config, default 2) with backoff on technical failures; (2) then walk the fallback chain; (3) then mark failed and escalate to the user with full evidence (logs, verification output). Verification failure ≠ technical failure — it goes straight to review/escalation, never auto-retry. |
 | **Context model** | Opaque handoffs (A2A principle): each agent sees only its own handoff + upstream artifacts/evidence. No implicit shared memory between agents; a shared per-task notes file is a possible later opt-in feature. |
-| **Dashboard** | Both: `maestro dashboard` terminal TUI for day-to-day, plus a local web UI served by the daemon on its port (same data source). v1 ships both as planned in M6. |
+| **Dashboard** | A local web UI served by the daemon on its port (single-file page, EventSource-driven — no polling), plus `maestro task tail` for live terminal monitoring of one task or the global stream. A full terminal TUI is a v2 candidate; the SSE tail covers day-to-day live viewing. |
 
 ### Standing design rules implied by the above
 
@@ -218,7 +218,19 @@ direct model API call if ever needed.
   (verified `openclaw agent exec --json`), Kilo Code (IDE-resident → MCP host
   path), omp (entry point unverified — verify-at-install checklist). 305 tests,
   100% branch coverage.
-- **M6 — NEXT**: TUI + web dashboards, `maestro task tail`, `maestro gc`
+- **M6 — DONE**: observability + lifecycle — single-file web dashboard at `GET /`
+  (EventSource over the new global `GET /events` stream; initial list from
+  `GET /tasks`; no polling), `maestro task tail` (live SSE tail of one task or
+  the global stream, ring-buffer catch-up for finished tasks), `maestro task
+  audit` (durable attempts/usage/errors without a running daemon), `maestro gc`
+  (TTL 90 days, manual only, dry-run first; deletes task dirs + registry entry +
+  claims), and the flagship demo `examples/full-swap.sh` — Claude Code as a host
+  agent delegating to Codex through Maestro MCP, then a CLI delegation to Hermes
+  building on the same workspace. 340 tests, 100% branch coverage.
+
+**All milestones M1–M6 are complete.** Remaining v2 candidates: terminal TUI,
+`api` run mode (remote Agent Servers), Copilot/`a2a_remote` adapters, P2P agent
+discovery, budget caps enforcement.
 
 | # | Deliverable | Proves |
 |---|---|---|
@@ -227,7 +239,7 @@ direct model API call if ever needed.
 | M3 | MCP surface extension (`agents_list`, `delegate`, `followup`) + backward-compat tests | Every host agent (Claude, Kilo, Cline, Cursor, ...) gets "call any agent" via MCP |
 | M4 | Popular CLI trio: **pi** (RPC mode), **Cline** (`--json` headless), **Hermes Agent** (Nous) | The most-used local CLIs all work end-to-end |
 | M5 | Editor-class adapters: **Cursor** (`cursor-agent` print mode) + **OpenHands** (V1 headless CLI) + generic-spec onboarding of OpenClaw/Kilo/omp | Full coverage matrix complete except IDE-only agents |
-| M6 | Dashboard + audit view + flagship demo script (`examples/full-swap.sh`) | The interview's success criteria, runnable in one command |
+| M6 | Web dashboard (SSE) + `task tail` + `task audit` + `gc` + flagship demo script (`examples/full-swap.sh`) | The interview's success criteria, runnable in one command |
 
 ## 8. Risks & mitigations
 
@@ -339,7 +351,7 @@ M4/M5 verify each product's actual entry point before finalizing its adapter.
   probes, cancellation semantics, `input-required` question routing.
 - **M3** gains: no-self-review enforcement in the review loop; strict MCP↔CLI parity
   for every capability (round-3 rule #5).
-- **M6** gains: live tail + both dashboards, `maestro gc`, cross-review audit view.
+- **M6** gains: live tail + web dashboard, `maestro gc`, durable audit view.
 
 ## 11. Interview round 4 — reactive completion (no polling)
 

@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from .agents import AgentRegistry, AgentSpec, BUILTIN_ADAPTERS, GENERIC_KIND
 from .core import Maestro, maestro_user_dir
@@ -39,13 +42,14 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
+    known_task_cmds = {"list", "status", "show", "tail", "audit"}
     if len(argv) >= 2 and argv[0] == "task":
         subcommand = argv[1]
-        if not subcommand.startswith("-") and subcommand not in {"list", "status", "show"}:  # pragma: no branch
+        if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
             return ["task", "status", *argv[1:]]
     if len(argv) >= 3 and argv[1] == "task":
         subcommand = argv[2]
-        if not subcommand.startswith("-") and subcommand not in {"list", "status", "show"}:  # pragma: no branch
+        if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
             return [argv[0], "task", "status", *argv[2:]]
     return argv
 
@@ -91,7 +95,227 @@ def _task_workspace(value: str | None) -> Path:
     return Path.cwd().resolve()
 
 
-def main() -> int:
+# ---------------------------------------------------------------- daemon clients
+
+def _daemon_url() -> str:
+    """Find the local broker: MAESTRO_DAEMON_URL, else the daemon.json marker.
+
+    The marker is written by whichever broker started last (a standalone
+    ``maestro-daemon`` or an MCP server's embedded daemon); a stale marker from
+    a dead process is rejected so callers get a clear error instead of a
+    connection failure mid-stream.
+    """
+    env = os.environ.get("MAESTRO_DAEMON_URL", "").strip()
+    if env:
+        return env.rstrip("/")
+    try:
+        info = json.loads((maestro_user_dir() / "daemon.json").read_text(encoding="utf-8"))
+        pid = int(info["pid"])
+        os.kill(pid, 0)  # liveness check; raises if the broker is gone
+        return f"http://127.0.0.1:{int(info['port'])}"
+    except (OSError, ValueError, KeyError, TypeError):
+        raise ValueError("no daemon reachable — start one with 'maestro-daemon' or set MAESTRO_DAEMON_URL") from None
+
+
+def _post_jsonrpc(url: str, method: str, params: dict[str, Any]) -> Any:
+    import urllib.error
+    import urllib.request
+
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode("utf-8")
+    request = urllib.request.Request(f"{url}/", data=body, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:  # the daemon answers JSON-RPC errors with HTTP 400
+        try:
+            err = json.loads(exc.read().decode("utf-8"))
+        except ValueError:
+            raise ValueError(f"daemon answered HTTP {exc.code}") from None
+        raise ValueError(str((err.get("error") or {}).get("message", f"daemon answered HTTP {exc.code}"))) from None
+    return (payload or {}).get("result")
+
+
+def _sse_events(url: str, path: str):
+    """Yield ``(event_name, data_dict)`` from an SSE endpoint.
+
+    Blocks on the socket between events — this is a push stream, not polling.
+    The per-task stream closes after a terminal state; the global one runs
+    until the caller stops it (Ctrl-C).
+    """
+    import urllib.request
+
+    with urllib.request.urlopen(f"{url}{path}", timeout=None) as resp:
+        event = "message"
+        data_lines: list[str] = []
+        for raw in resp:  # blocking line iteration
+            line = raw.decode("utf-8", "replace").rstrip("\n")
+            if not line:
+                if data_lines:
+                    yield event, json.loads("\n".join(data_lines))
+                event, data_lines = "message", []
+                continue
+            if line.startswith(":"):
+                continue  # keepalive comment
+            if line.startswith("event: "):
+                event = line[7:].strip()
+            elif line.startswith("data: "):
+                data_lines.append(line[6:])
+        if data_lines:
+            yield event, json.loads("\n".join(data_lines))
+
+
+def _stream_task(url: str, task_id: str | None) -> int:
+    """Follow one task (or the global stream when task_id is None) live."""
+    path = f"/tasks/{task_id}/events" if task_id else "/events"
+    final_state: str | None = None
+    try:
+        for event, envelope in _sse_events(url, path):
+            data = envelope.get("data") or {}  # TaskEvent.to_dict nests the payload under "data"
+            if event == "output":
+                print(data.get("line", ""), flush=True)
+            elif event == "state":
+                state = data.get("state") or "?"
+                note = f" — {data['error']}" if data.get("error") else ""
+                note += f" (question: {data['question']})" if data.get("question") else ""
+                print(f"[state] {state}{note}", flush=True)
+                final_state = state
+            elif event == "usage":
+                print(f"[usage] {json.dumps(data, ensure_ascii=False)}", flush=True)
+    except KeyboardInterrupt:
+        print("\n[tail stopped]", flush=True)
+        return 130
+    if task_id is not None and final_state is not None:
+        return 0 if final_state == "completed" else 1
+    return 0
+
+
+def _cmd_delegate(args: argparse.Namespace) -> int:
+    from .handoff import HandoffDoc, load_handoff_file
+
+    workspace = str(_workspace(getattr(args, "workspace", None)))
+    if getattr(args, "project", None):
+        workspace = str(_project(args.project))
+    if args.file:
+        doc = load_handoff_file(args.file)
+    else:
+        if not (args.title and args.request and args.target):
+            raise ValueError("provide --file or all of --title/--request/--target")
+        design = ""
+        if args.design_file:
+            try:
+                design = Path(args.design_file).read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"Unable to read design file: {exc}") from exc
+        doc = HandoffDoc(
+            title=args.title, request=args.request, design=design,
+            target_agent=args.target, fallback=list(args.fallback),
+        )
+    url = _daemon_url()
+    result = _post_jsonrpc(url, "message/send", {"message": {
+        "kind": "message", "role": "user",
+        "parts": [{"kind": "data", "data": doc.to_dict()}],
+        "metadata": {"maestro": {"workspace": workspace}},
+    }})
+    task = (result or {}).get("task") or {}
+    task_id = task.get("id")
+    if not task_id:  # queued behind an active task in this workspace
+        print(json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line"}, indent=2))
+        return 0
+    if args.no_wait:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"[task] {task_id} — target={doc.target_agent} workspace={workspace}", flush=True)
+    return _stream_task(url, task_id)
+
+
+def _cmd_task_audit(args: argparse.Namespace) -> int:
+    state_dir = maestro_user_dir()
+    m = Maestro(state_dir)
+    try:
+        claims = m._claims(args.task_id)
+        runtime: dict[str, Any] = {}
+        if claims.get("task_runtime"):
+            try:
+                parsed = json.loads(claims["task_runtime"])
+                if isinstance(parsed, dict):
+                    runtime = parsed
+            except ValueError:
+                pass
+        results: list[dict[str, Any]] = []
+        task_dir = state_dir / "tasks" / args.task_id
+        if task_dir.is_dir():
+            for path in sorted(task_dir.glob("result-*.json")):
+                try:
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(value, dict):
+                        results.append(value)
+                except (OSError, ValueError):
+                    continue
+        print(json.dumps({
+            "task_id": args.task_id,
+            "title": claims.get("task_title"),
+            "state": runtime.get("state") or claims.get("task_status"),
+            "workspace": claims.get("task_workspace"),
+            "branch": claims.get("task_branch"),
+            "origin_agent": claims.get("task_origin_agent"),
+            "target_agent": claims.get("task_target_agent"),
+            "attempts": runtime.get("attempts") or [],
+            "usage": runtime.get("usage"),
+            "error": runtime.get("error"),
+            "results": results,
+        }, indent=2))
+        return 0
+    finally:
+        m.close()
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    state_dir = maestro_user_dir()
+    m = Maestro(state_dir)
+    try:
+        now = datetime.now(timezone.utc)
+
+        def age_days_for(task_id: str, record: dict[str, Any]) -> float | None:
+            task_dir = state_dir / "tasks" / task_id
+            if task_dir.is_dir():
+                return (now - datetime.fromtimestamp(task_dir.stat().st_mtime, tz=timezone.utc)).total_seconds() / 86400.0
+            created_at = record.get("created_at")
+            if isinstance(created_at, str):
+                try:
+                    created = datetime.fromisoformat(created_at)
+                    if created.tzinfo is None:
+                        created = created.replace(tzinfo=timezone.utc)
+                    return (now - created).total_seconds() / 86400.0
+                except ValueError:
+                    return None
+            return None
+
+        removed: list[dict[str, Any]] = []
+        kept = 0
+        for record in m._registry_records():
+            task_id = str(record.get("task_id") or "")
+            if not task_id:
+                continue
+            phase = str(m._claims(task_id).get("task_status") or "")
+            terminal = phase in {"COMPLETE", "FAILED"}  # canceled tasks land in FAILED
+            age = age_days_for(task_id, record)
+            if not terminal or age is None or age < args.days:
+                kept += 1
+                continue
+            if args.dry_run:
+                removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "dry_run": True})
+                continue
+            shutil.rmtree(state_dir / "tasks" / task_id, ignore_errors=True)
+            m._save_index([x for x in m._load_index() if str(x.get("task_id")) != task_id])
+            dropped = m.mem.forget(m._subject(task_id))
+            removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "claims_dropped": dropped})
+        print(json.dumps({"removed": removed, "kept": kept}, indent=2))
+        return 0
+    finally:
+        m.close()
+
+
+def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="maestro", description="Claude-supervised orchestration with user-level task state")
     p.add_argument("--version", action="version", version=VERSION)
     _add_target_args(p)
@@ -107,6 +331,25 @@ def main() -> int:
     task_show = task_sub.add_parser("show", help="Alias for task status")
     task_show.add_argument("task_id")
     _add_target_args(task_show)
+    task_tail = task_sub.add_parser("tail", help="Live-tail a task's event stream (SSE, no polling)")
+    task_tail.add_argument("task_id")
+    task_tail.add_argument("--all", action="store_true", help="Follow the global stream instead of one task")
+    task_audit = task_sub.add_parser("audit", help="Show the durable audit record (attempts, usage, errors)")
+    task_audit.add_argument("task_id")
+
+    d = sub.add_parser("delegate", help="Delegate a handoff to any registered agent via the local daemon")
+    d.add_argument("--file", default=None, help="Handoff document file (TOML or JSON)")
+    d.add_argument("--title", default=None)
+    d.add_argument("--request", default=None)
+    d.add_argument("--target", default=None)
+    d.add_argument("--fallback", action="append", default=[], help="Fallback agent (repeatable)")
+    d.add_argument("--design-file", default=None, help="Design text file to attach")
+    d.add_argument("--no-wait", action="store_true", help="Return immediately after enqueueing")
+    _add_target_args(d)
+
+    gc = sub.add_parser("gc", help="Delete terminal tasks older than the TTL (manual; never runs automatically)")
+    gc.add_argument("--days", type=int, default=90, help="TTL in days (default 90)")
+    gc.add_argument("--dry-run", action="store_true", help="List what would be deleted")
 
     h = sub.add_parser("handoff", help="Manually create and launch a Codex handoff")
     h.add_argument("--title", required=True)
@@ -152,11 +395,22 @@ def main() -> int:
     agents_status = agents_sub.add_parser("status", help="Show registration/availability status for one agent")
     agents_status.add_argument("name")
 
-    args = p.parse_args(_normalize_argv(sys.argv[1:]))
+    args = p.parse_args(_normalize_argv(argv if argv is not None else sys.argv[1:]))
     if args.cmd == "task" and args.task_cmd is None:
         task.print_help()
         return 2
     try:
+        if args.cmd == "delegate":
+            return _cmd_delegate(args)
+        if args.cmd == "gc":
+            return _cmd_gc(args)
+        if args.cmd == "task" and args.task_cmd == "tail":
+            url = _daemon_url()
+            target_id = None if args.all else args.task_id
+            return _stream_task(url, target_id)
+        if args.cmd == "task" and args.task_cmd == "audit":
+            return _cmd_task_audit(args)
+
         if args.cmd == "storage" and args.storage_cmd == "migrate-memvara":
             m = Maestro(_workspace(getattr(args, "workspace", None)))
             try:

@@ -75,6 +75,19 @@ class _FileState:
     def get_all(self) -> list[_Claim]:
         return self._read()
 
+    def forget(self, subject: str) -> int:
+        """Rewrite the journal without any claim for ``subject``; returns how many were dropped."""
+        lines = self._read()
+        kept = [c for c in lines if c.subject != subject]
+        dropped = len(lines) - len(kept)
+        if dropped:
+            tmp = self.path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                for claim in kept:
+                    fh.write(json.dumps({"subject": claim.subject, "predicate": claim.predicate, "object": claim.object, "episode_ids": claim.episode_ids or []}, ensure_ascii=False) + "\n")
+            os.replace(tmp, self.path)
+        return dropped
+
     def add(self, content: str, role: str = "system", ts: datetime | None = None) -> _Episode:
         episode = uuid.uuid4().hex
         self._append(_Claim("maestro:event", role, content, [episode]))
@@ -301,7 +314,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request", "task_runtime"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)
