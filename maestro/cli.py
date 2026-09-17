@@ -6,7 +6,8 @@ import os
 import sys
 from pathlib import Path
 
-from .core import Maestro
+from .agents import AgentRegistry, AgentSpec, BUILTIN_ADAPTERS, GENERIC_KIND
+from .core import Maestro, maestro_user_dir
 
 VERSION = "0.8.4"
 
@@ -133,6 +134,24 @@ def main() -> int:
     migrate = storage_sub.add_parser("migrate-memvara", help="Import legacy state")
     _add_target_args(migrate)
 
+    agents = sub.add_parser("agents", help="Manage registered agents (user-level)")
+    agents_sub = agents.add_subparsers(dest="agents_cmd", required=True)
+    agents_list = agents_sub.add_parser("list", help="List registered agents")
+    agents_add = agents_sub.add_parser("add", help="Register an agent")
+    agents_add.add_argument("--name", required=True)
+    agents_add.add_argument("--kind", required=True, choices=[*BUILTIN_ADAPTERS, GENERIC_KIND])
+    agents_add.add_argument("--display-name", default="")
+    agents_add.add_argument("--skill", action="append", default=[])
+    agents_add.add_argument("--command", default=None, help="Launch command for generic agents (supports {workspace} and {prompt})")
+    agents_add.add_argument("--input-mode", choices=["arg", "stdin"], default="arg")
+    agents_add.add_argument("--output-format", choices=["text", "jsonl", "rpc"], default="text")
+    agents_add.add_argument("--workspace-policy", choices=["cwd", "flag"], default="cwd")
+    agents_remove = agents_sub.add_parser("remove", help="Unregister an agent")
+    agents_remove.add_argument("name")
+    agents_discover = agents_sub.add_parser("discover", help="Scan PATH for known agent CLIs")
+    agents_status = agents_sub.add_parser("status", help="Show registration/availability status for one agent")
+    agents_status.add_argument("name")
+
     args = p.parse_args(_normalize_argv(sys.argv[1:]))
     if args.cmd == "task" and args.task_cmd is None:
         task.print_help()
@@ -160,6 +179,29 @@ def main() -> int:
                     tasks = m.list_tasks()
                 print(json.dumps(tasks, indent=2)); return 0
             finally: m.close()
+
+        if args.cmd == "agents":
+            registry = AgentRegistry(maestro_user_dir())
+            if args.agents_cmd == "list":
+                print(json.dumps([s.to_dict() for s in registry.list()], indent=2)); return 0
+            if args.agents_cmd == "add":
+                spec = AgentSpec(
+                    name=args.name, kind=args.kind, display_name=args.display_name,
+                    skills=list(args.skill), command=args.command,
+                    input_mode=args.input_mode, output_format=args.output_format,
+                    workspace_policy=args.workspace_policy,
+                )
+                registry.save(spec)
+                print(json.dumps(registry.get(args.name).to_dict(), indent=2)); return 0
+            if args.agents_cmd == "remove":
+                if not registry.remove(args.name):
+                    raise ValueError(f"Agent not registered: {args.name}")
+                print(json.dumps({"name": args.name, "removed": True}, indent=2)); return 0
+            if args.agents_cmd == "discover":
+                print(json.dumps(registry.discover(), indent=2)); return 0
+            if args.agents_cmd == "status":
+                print(json.dumps(registry.status(args.name), indent=2)); return 0
+            raise AssertionError("unhandled agents command")  # pragma: no cover
 
         target = _workspace(getattr(args, "workspace", None))
         if getattr(args, "project", None):
