@@ -33,11 +33,12 @@ from .a2a import (
     sse_encode,
 )
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
-from .agents import AgentRegistry, AgentSpec
+from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
 from .handoff import HandoffDoc
 from .models import Phase
+from .modes import DEFAULT_MAX_BOUNCES, expand as expand_mode, resolve_mode
 from .worker import _verification_command
 
 _TASK_ID_RE = re.compile(r"^task-\d{8}-\d{6}-[0-9a-f]{6}$")
@@ -93,6 +94,128 @@ PREVIOUS Q&A (if any):
 
 Report back with: files changed, commands run and their results, deviations from the design, and remaining issues.
 """
+
+# Work-mode gate helpers (see docs/design-work-modes.md). Gate turns are read-only
+# LLM passes that end with a machine-readable verdict line; the deterministic
+# verification result can never be overridden by an LLM verdict (invariant I1).
+
+_GATE_TEXT_LIMIT = 20_000
+
+
+def _cap_text(text: str, limit: int = _GATE_TEXT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[truncated {len(text) - limit} chars]"
+
+
+def parse_verdict(text: str) -> dict[str, Any] | None:
+    """Parse the trailing verdict protocol from a gate turn's output.
+
+    Finds the last ``VERDICT: PASS|FAIL`` line (case-insensitive). On FAIL it
+    collects bullet lines ("-" or "*"): only after an ``ISSUES:`` marker when one
+    is present, otherwise anywhere after the verdict line. Returns None when no
+    verdict line exists — callers must park on that, never treat it as a pass.
+    """
+    matches = list(re.finditer(r"^VERDICT:\s*(PASS|FAIL)\b", text, re.IGNORECASE | re.MULTILINE))
+    if not matches:
+        return None
+    match = matches[-1]
+    ok = match.group(1).upper() == "PASS"
+    issues: list[str] = []
+    if not ok:
+        tail = text[match.start():].splitlines()
+        has_marker = any(re.match(r"^\s*ISSUES\s*:?", line, re.IGNORECASE) for line in tail)
+        collecting = not has_marker
+        for line in tail[1:]:
+            stripped = line.strip()
+            if re.match(r"^ISSUES\s*:?", stripped, re.IGNORECASE):
+                collecting = True
+                continue
+            if collecting and stripped.startswith(("-", "*")):
+                issues.append(stripped.lstrip("-*").strip())
+    return {"ok": ok, "issues": issues}
+
+
+def _gate_context(doc: HandoffDoc, task_id: str, workspace: Path) -> str:
+    design = doc.design or "(none — use your judgment within the request's scope)"
+    return (
+        f"Task ID: {task_id}\nWorkspace: {workspace}\n\nTITLE: {doc.title}\n\nREQUEST:\n{doc.request}\n\n"
+        f"AUTHORITATIVE DESIGN:\n{design}\n"
+    )
+
+
+def _verification_excerpt(report_path: Path) -> str:
+    if report_path.is_file():
+        try:
+            return _cap_text(report_path.read_text(encoding="utf-8"))
+        except OSError:
+            return "(verification report unreadable)"
+    return "(none — deterministic verification was not run)"
+
+
+def _diff_excerpt(workspace: Path) -> str:
+    diff = subprocess.run(["git", "diff", "HEAD"], cwd=workspace, text=True, capture_output=True)
+    untracked = subprocess.run(["git", "ls-files", "--others", "--exclude-standard"], cwd=workspace, text=True, capture_output=True)
+    parts = [f"git diff HEAD:\n{diff.stdout}" if diff.stdout.strip() else "git diff HEAD: (no changes to tracked files)"]
+    if untracked.stdout.strip():
+        parts.append("Untracked files:\n" + untracked.stdout)
+    return _cap_text("\n\n".join(parts))
+
+
+def build_verify_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path) -> str:
+    status = "PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped (verification disabled for this task)")
+    triage = (
+        "The deterministic check FAILED. First determine whether the failure is caused by this change; "
+        "pre-existing or unrelated failures must be reported as such, not fixed by you.\n\n"
+        if verification_ok is False else ""
+    )
+    return f"""You are the VERIFIER for a Maestro multi-agent task.
+
+{_gate_context(doc, task_id, workspace)}DETERMINISTIC VERIFICATION: {status}
+
+{_verification_excerpt(report_path)}
+
+CURRENT DIFF:
+{_diff_excerpt(workspace)}
+
+Your job: does the change actually work and meet the request? You may inspect files and re-run targeted tests, but you must not modify any file.
+{triage}End your reply with exactly one verdict line:
+VERDICT: PASS   or   VERDICT: FAIL
+On FAIL, follow it with an ISSUES: section listing one bullet per issue (each line starting with "- ")."""
+
+
+def build_review_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path, prior_issues: list[str]) -> str:
+    status = "PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped (verification disabled for this task)")
+    findings = "\n".join(f"- {issue}" for issue in prior_issues) if prior_issues else "(none)"
+    return f"""You are the REVIEWER for a Maestro multi-agent task.
+
+{_gate_context(doc, task_id, workspace)}DETERMINISTIC VERIFICATION: {status}
+
+{_verification_excerpt(report_path)}
+
+CURRENT DIFF:
+{_diff_excerpt(workspace)}
+
+VERIFIER FINDINGS (from an earlier verification pass):
+{findings}
+
+Your job: should we accept this code? Assess quality, conformance to the design, and scope creep against the request. You may inspect files, but you must not modify any file.
+End your reply with exactly one verdict line:
+VERDICT: PASS   or   VERDICT: FAIL
+On FAIL, follow it with an ISSUES: section listing one bullet per issue (each line starting with "- ")."""
+
+
+def build_fix_prompt(doc: HandoffDoc, task_id: str, workspace: Path, issues: list[str], det_failed: bool) -> str:
+    issue_text = "\n".join(f"- {issue}" for issue in issues) or "(deterministic verification failed; see the verification report)"
+    return f"""You are the FIX agent for a Maestro multi-agent task.
+
+{_gate_context(doc, task_id, workspace)}The previous implementation work for this task is already on the task branch/working tree; build on it rather than redoing it.
+
+UNRESOLVED ISSUES FROM VERIFICATION AND REVIEW:
+{issue_text}
+
+Your job: fix exactly these issues with the smallest change that resolves them. Do not commit, and do not restructure beyond what the issues require.
+Report back with: files changed, commands run and their results, and how each issue was resolved."""
 
 
 class MaestroDaemon:
@@ -232,10 +355,36 @@ class MaestroDaemon:
     def default_target(self) -> str:
         return "codex"
 
+    def _agent_known(self, name: str) -> bool:
+        """True when the name resolves to a registered agent or a builtin adapter kind."""
+        return self.registry.get(name) is not None or name in BUILTIN_ADAPTERS
+
+    def _apply_work_mode(self, doc: HandoffDoc) -> HandoffDoc:
+        """Expand a work-mode preset onto the handoff and validate its routing pins.
+
+        Explicit routing fields win over the preset (see maestro/modes.py). After
+        expansion: self-review is rejected (review_agent == implementer), every named
+        verifier/reviewer/fixer must be known to this daemon, and a mode-provided
+        implementer must be known too. Raises ValueError with an actionable message.
+        """
+        if doc.mode:
+            preset = resolve_mode(self.maestro.config.get("modes") or {}, doc.mode)
+            expand_mode(preset, doc)
+        if doc.review_agent and doc.review_agent == doc.target_agent:
+            raise ValueError(f"review_agent {doc.review_agent!r} cannot equal the implementer (self-review is not a gate)")
+        registered = ", ".join(spec.name for spec in self.registry.list()) or "none"
+        if doc.mode and not self._agent_known(doc.target_agent):
+            raise ValueError(f"Unknown implementer agent {doc.target_agent!r} (from mode {doc.mode!r}). Registered agents: {registered}")
+        for role, name in (("verifier", doc.verify_agent), ("reviewer", doc.review_agent), ("fixer", doc.fix_agent)):
+            if name and not self._agent_known(name):
+                raise ValueError(f"Unknown {role} agent {name!r}. Registered agents: {registered}")
+        return doc
+
     def delegate(self, doc: HandoffDoc, workspace: str | Path) -> dict[str, Any]:
         from .handoff import validate_handoff
 
         doc = validate_handoff(doc)
+        doc = self._apply_work_mode(doc)
         if doc.target_agent == doc.origin_agent:
             raise ValueError(
                 f"Agent {doc.target_agent!r} cannot delegate to itself (no self-review/self-delegation); "
@@ -394,13 +543,7 @@ class MaestroDaemon:
                     prompt,
                     workspace,
                     task_id,
-                    settings={
-                        **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort", "token"}},
-                        **doc.agent_settings,
-                        # Reserved key for api-mode adapters (e.g. a2a_remote) so
-                        # the full handoff survives daemon-to-daemon hops.
-                        "maestro_handoff": doc.to_dict(),
-                    },
+                    settings=self._turn_settings(spec, doc),
                     timeout=spec.timeout_s,
                     log_dir=self.state_dir / "tasks" / task_id,
                     on_line=_on_line,
@@ -410,18 +553,8 @@ class MaestroDaemon:
                     task_id, agent_name, result,
                     None if result.ok else (result.error or f"agent {agent_name} failed"),
                 )
-                (self.state_dir / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
-                (self.state_dir / "tasks" / task_id / f"result-{agent_name}-t{turn}-{attempt}.json").write_text(
-                    json.dumps(result.to_dict(), indent=2), encoding="utf-8"
-                )
-                if result.usage:
-                    self.bus.publish(TaskEvent(task_id=task_id, type="usage", data={"agent": agent_name, **result.usage}))
+                self._bookkeep_turn(task_id, agent_name, result, turn, attempt)
                 record = self._tasks.get(task_id) or {}
-                if result.usage:
-                    # Accumulate cost across attempts: failed work still costs money.
-                    merged = dict(record.get("usage") or {})
-                    merged.update(result.usage)
-                    record["usage"] = merged
                 if record.get("state") == STATE_CANCELED:
                     return
                 if result.question:
@@ -465,6 +598,31 @@ class MaestroDaemon:
         for queued_id in started:
             self._start_queued(queued_id)
 
+    @staticmethod
+    def _turn_settings(spec: AgentSpec, doc: HandoffDoc) -> dict[str, Any]:
+        """Adapter settings for one turn: registry defaults, per-task overrides, handoff."""
+        return {
+            **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort", "token"}},
+            **doc.agent_settings,
+            # Reserved key for api-mode adapters (e.g. a2a_remote) so
+            # the full handoff survives daemon-to-daemon hops.
+            "maestro_handoff": doc.to_dict(),
+        }
+
+    def _bookkeep_turn(self, task_id: str, agent_name: str, result: Any, turn: int, attempt: int) -> None:
+        """Persist one turn's result file and fold its usage into the task record."""
+        (self.state_dir / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
+        (self.state_dir / "tasks" / task_id / f"result-{agent_name}-t{turn}-{attempt}.json").write_text(
+            json.dumps(result.to_dict(), indent=2), encoding="utf-8"
+        )
+        if result.usage:
+            self.bus.publish(TaskEvent(task_id=task_id, type="usage", data={"agent": agent_name, **result.usage}))
+            record = self._tasks.get(task_id) or {}
+            # Accumulate cost across attempts: failed work still costs money.
+            merged = dict(record.get("usage") or {})
+            merged.update(result.usage)
+            record["usage"] = merged
+
     def _record_attempt(self, task_id: str, agent_name: str, result: Any, error: str | None = None) -> None:
         record = self._tasks.get(task_id)
         if record is None:
@@ -491,8 +649,225 @@ class MaestroDaemon:
             record["agent"] = agent_name
             # usage was already accumulated per attempt in _run_task
         self.maestro._write_claim(task_id, "task_result", str(result.output_path or ""))
+        parked = self._gate_cycle(task_id, doc, workspace, verification_ok)
+        record = self._tasks.get(task_id)
+        if parked or (record is not None and record.get("state") == STATE_CANCELED):
+            return  # a parked task keeps its workspace slot; a canceled one already released it
         self._set_state(task_id, STATE_COMPLETED, verification="PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped"))
         self._release(task_id)
+
+    def _canceled(self, task_id: str) -> bool:
+        record = self._tasks.get(task_id)
+        return record is not None and record.get("state") == STATE_CANCELED
+
+    def _write_gates_claim(self, task_id: str, verdicts: dict[str, Any], bounces: int) -> None:
+        """Record gate verdicts durably (claim) and on the live task record."""
+        self.maestro._write_claim(task_id, "task_gates", json.dumps({"verdicts": verdicts, "bounces": bounces}, ensure_ascii=False))
+        record = self._tasks.get(task_id)
+        if record is not None:
+            record["gates"] = dict(verdicts)
+            record["bounces"] = bounces
+
+    def _park_question(self, issues: list[str], det_failed: bool, bounces: int) -> str:
+        lines = [f"Work-mode gates parked this task after {bounces} auto-fix bounce(s)."]
+        if det_failed:
+            lines.append("Deterministic verification: FAILED (report in the task artifacts).")
+        if issues:
+            lines.append("Unresolved issues:")
+            lines.extend(f"- {issue}" for issue in issues)
+        lines.append("Answer with fix instructions to resume on the task branch, or cancel.")
+        return "\n".join(lines)
+
+    def _gate_cycle(self, task_id: str, doc: HandoffDoc, workspace: Path, verification_ok: bool | None) -> bool:
+        """Run work-mode gates (LLM verify/review) plus capped auto-fix bounces.
+
+        Returns True when the task was parked in input-required (the caller must not
+        mark it completed and must keep the workspace slot). With no gate agents
+        configured it returns False immediately — legacy behavior, where completion
+        proceeds regardless of the deterministic outcome. A failed deterministic
+        check joins the bounce loop only when at least one gate agent is set; an LLM
+        verdict can add failures but never override the deterministic result (I1).
+        """
+        if not doc.verify_agent and not doc.review_agent:
+            return False
+        record = self._tasks.get(task_id) or {}
+        turn = int(record.get("turn") or 1)
+        report_path = self.state_dir / "tasks" / task_id / "verification.txt"
+        verdicts: dict[str, Any] = {}
+        issues: list[str] = []
+        det_failed = verification_ok is False
+
+        if doc.verify_agent and doc.verification != "none":
+            v = self._gate_turn(task_id, doc, workspace, agent_name=doc.verify_agent, role="verifier", verification_ok=verification_ok, report_path=report_path)
+            verdicts["verify"] = {"agent": doc.verify_agent, "ok": v["ok"], "issues": list(v["issues"])}
+            if v["parked"]:
+                self._write_gates_claim(task_id, verdicts, 0)
+                self._set_state(task_id, STATE_INPUT_REQUIRED, question=v["reason"])
+                return True
+            issues.extend(v["issues"])
+
+        if doc.review_agent:
+            r = self._gate_turn(task_id, doc, workspace, agent_name=doc.review_agent, role="reviewer", verification_ok=verification_ok, report_path=report_path, prior_issues=issues)
+            verdicts["review"] = {"agent": doc.review_agent, "ok": r["ok"], "issues": list(r["issues"])}
+            if r["parked"]:
+                self._write_gates_claim(task_id, verdicts, 0)
+                self._set_state(task_id, STATE_INPUT_REQUIRED, question=r["reason"])
+                return True
+            issues.extend(r["issues"])
+
+        max_bounces = doc.max_bounces if doc.max_bounces is not None else DEFAULT_MAX_BOUNCES
+        bounces = 0
+        while (det_failed or issues) and bounces < max_bounces:
+            bounces += 1
+            self._set_state(task_id, STATE_WORKING, fixing=True)
+            fix_agent = doc.fix_agent or doc.target_agent
+            fix_status, fix_error = self._fix_turn(task_id, doc, workspace, fix_agent, issues, det_failed, turn=turn)
+            if fix_status == "canceled":
+                return False
+            if fix_status == "parked":
+                self._write_gates_claim(task_id, verdicts, bounces)
+                self._set_state(task_id, STATE_INPUT_REQUIRED, question=fix_error or "fixer could not run")
+                return True
+            verification_ok = self._verify(workspace, task_id, doc) if doc.verification != "none" else None
+            det_failed = verification_ok is False
+            issues = []
+            if fix_status == "failed":
+                issues.append(f"previous fix attempt by {fix_agent!r} failed: {fix_error}")
+            if doc.review_agent:
+                r = self._gate_turn(task_id, doc, workspace, agent_name=doc.review_agent, role="reviewer", verification_ok=verification_ok, report_path=report_path, prior_issues=issues)
+                verdicts["review"] = {"agent": doc.review_agent, "ok": r["ok"], "issues": list(r["issues"])}
+                if self._canceled(task_id):
+                    return False
+                if r["parked"]:
+                    self._write_gates_claim(task_id, verdicts, bounces)
+                    self._set_state(task_id, STATE_INPUT_REQUIRED, question=r["reason"])
+                    return True
+                issues.extend(r["issues"])
+        self._write_gates_claim(task_id, verdicts, bounces)
+        if det_failed or issues:
+            self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._park_question(issues, det_failed, bounces))
+            return True
+        return False
+
+    def _gate_park(self, agent_name: str, role: str, reason: str) -> dict[str, Any]:
+        """Build a park result because a gate turn produced no verdict.
+
+        The caller writes the gates claim first and only then sets the task to
+        input-required, so waiters never observe a parked state without verdicts.
+        """
+        return {
+            "ok": False,
+            "issues": [],
+            "parked": True,
+            "reason": (
+                f"Work-mode {role} gate for agent {agent_name!r} could not be completed:\n{reason}\n\n"
+                "Answer with instructions to resume on the task branch, or cancel."
+            ),
+        }
+
+    def _gate_turn(self, task_id: str, doc: HandoffDoc, workspace: Path, *, agent_name: str, role: str, verification_ok: bool | None, report_path: Path, prior_issues: list[str] | None = None) -> dict[str, Any]:
+        """Run one read-only LLM gate turn (verifier or reviewer) and parse its verdict.
+
+        Returns {"ok", "issues", "parked"} — on park, "reason" carries the question
+        text; the caller writes the gates claim first and only then sets the task to
+        input-required (agent unavailable, failed run, agent question, or unparseable
+        verdict). Cancellation is not a park: it returns ok=True/parked=False and the
+        caller checks _canceled() before proceeding.
+        """
+        record = self._tasks.get(task_id) or {}
+        turn = int(record.get("turn") or 1)
+        # Per-turn log dir: spawn adapters share one log file per (kind, task), so
+        # gate turns get their own directory to keep output_path unambiguous.
+        seq = int(record.get("gate_seq") or 0) + 1
+        record["gate_seq"] = seq
+        turn_log_dir = self.state_dir / "tasks" / task_id / f"{role}-{seq}"
+        spec = self.registry.get(agent_name) or AgentSpec(name=agent_name, kind=agent_name)
+        try:
+            adapter = make_adapter(spec)
+        except AdapterNotAvailable as exc:
+            return self._gate_park(agent_name, role, f"agent {agent_name!r} unavailable: {exc}")
+        preflight = adapter.preflight()
+        if not preflight.ok:
+            return self._gate_park(agent_name, role, f"agent {agent_name!r} failed preflight: {preflight.error or 'unknown error'}")
+        if role == "verifier":
+            prompt = build_verify_prompt(doc, task_id, workspace, verification_ok, report_path)
+        else:
+            prompt = build_review_prompt(doc, task_id, workspace, verification_ok, report_path, prior_issues or [])
+        cancel_flag = self._cancel_flags.get(task_id)
+
+        def _on_line(line: str, _task_id: str = task_id) -> None:
+            self.bus.publish(TaskEvent(task_id=_task_id, type="output", data={"agent": agent_name, "line": line}))
+
+        result = adapter.run(
+            prompt, workspace, task_id,
+            settings=self._turn_settings(spec, doc),
+            timeout=spec.timeout_s,
+            log_dir=turn_log_dir,
+            on_line=_on_line,
+            should_cancel=(lambda: cancel_flag.is_set()) if cancel_flag is not None else None,
+        )
+        self._record_attempt(task_id, agent_name, result, None if result.ok else (result.error or f"{role} turn failed"))
+        self._bookkeep_turn(task_id, agent_name, result, turn, 0)
+        if self._canceled(task_id):
+            return {"ok": True, "issues": [], "parked": False}
+        if result.question:
+            return self._gate_park(agent_name, role, f"{role} agent asked a question: {result.question}")
+        if not result.ok:
+            return self._gate_park(agent_name, role, f"{role} turn failed: {result.error or 'unknown error'}")
+        output_text = ""
+        if result.output_path:
+            try:
+                output_text = Path(result.output_path).read_text(encoding="utf-8")
+            except OSError:
+                output_text = ""
+        verdict = parse_verdict(output_text)
+        if verdict is None:
+            snippet = _cap_text(output_text.strip(), 2000)
+            return self._gate_park(agent_name, role, f"{role} output contained no parsable VERDICT line (raw output kept in result files)\n\n{snippet}")
+        return {"ok": verdict["ok"], "issues": list(verdict["issues"]), "parked": False}
+
+    def _fix_turn(self, task_id: str, doc: HandoffDoc, workspace: Path, fix_agent: str, issues: list[str], det_failed: bool, turn: int) -> tuple[str, str | None]:
+        """Run one auto-fix bounce under the fix agent.
+
+        Returns (status, error) where status is "ok", "failed" (error holds the
+        failure text), "parked" (error holds the park question — the caller writes
+        the gates claim and sets input-required), or "canceled".
+        """
+        record = self._tasks.get(task_id) or {}
+        seq = int(record.get("gate_seq") or 0) + 1
+        record["gate_seq"] = seq
+        turn_log_dir = self.state_dir / "tasks" / task_id / f"fix-{seq}"
+        spec = self.registry.get(fix_agent) or AgentSpec(name=fix_agent, kind=fix_agent)
+        try:
+            adapter = make_adapter(spec)
+        except AdapterNotAvailable as exc:
+            return "parked", f"Work-mode fixer agent {fix_agent!r} is unavailable:\n{exc}\n\nAnswer with instructions to resume on the task branch, or cancel."
+        preflight = adapter.preflight()
+        if not preflight.ok:
+            return "parked", f"Work-mode fixer agent {fix_agent!r} failed preflight:\n{preflight.error or 'unknown error'}\n\nAnswer with instructions to resume on the task branch, or cancel."
+        prompt = build_fix_prompt(doc, task_id, workspace, issues, det_failed)
+        cancel_flag = self._cancel_flags.get(task_id)
+
+        def _on_line(line: str, _task_id: str = task_id) -> None:
+            self.bus.publish(TaskEvent(task_id=_task_id, type="output", data={"agent": fix_agent, "line": line}))
+
+        result = adapter.run(
+            prompt, workspace, task_id,
+            settings=self._turn_settings(spec, doc),
+            timeout=spec.timeout_s,
+            log_dir=turn_log_dir,
+            on_line=_on_line,
+            should_cancel=(lambda: cancel_flag.is_set()) if cancel_flag is not None else None,
+        )
+        self._record_attempt(task_id, fix_agent, result, None if result.ok else (result.error or "fix turn failed"))
+        self._bookkeep_turn(task_id, fix_agent, result, turn, 0)
+        if self._canceled(task_id):
+            return "canceled", None
+        if result.question:
+            return "parked", f"Fix agent {fix_agent!r} asked a question:\n{result.question}\n\nAnswer to resume on the task branch."
+        if not result.ok:
+            return "failed", result.error or "fix turn failed"
+        return "ok", None
 
     def _verify(self, workspace: Path, task_id: str, doc: HandoffDoc) -> bool:
         import shlex
@@ -582,10 +957,19 @@ class MaestroDaemon:
                 (doc.context_notes + "\n" if doc.context_notes else "")
                 + "Follow-up turn: the previous work for this task is already on the task branch/working tree; build on it rather than redoing it."
             ),
-            target_agent=record.get("target_agent") or doc.target_agent,
+            # A pinned fixer owns follow-up turns (a follow-up is a fix); otherwise
+            # the original target continues as before. Work-mode slots carry over so
+            # later turns keep the same profile.
+            target_agent=doc.fix_agent or record.get("target_agent") or doc.target_agent,
+            explicit_target=True,
             fallback=list(doc.fallback),
             origin_agent=record.get("origin_agent") or doc.origin_agent,
             parent_task_id=task_id,
+            mode=doc.mode,
+            review_agent=doc.review_agent,
+            verify_agent=doc.verify_agent,
+            fix_agent=doc.fix_agent,
+            max_bounces=doc.max_bounces,
             artifacts=list(doc.artifacts),
             verification=doc.verification,
             commit_policy=doc.commit_policy,
@@ -596,6 +980,8 @@ class MaestroDaemon:
         if followup_doc.max_depth_remaining <= 0:
             raise ValueError("Max delegation depth exceeded; refusing to nest further")
         record["doc"] = followup_doc.to_dict()  # the chain accumulates: later follow-ups see reduced depth
+        record["target_agent"] = followup_doc.target_agent  # a pinned fixer becomes the task's current target
+        self._persist(task_id, followup_doc)
         workspace = Path(record["workspace"])
         self._set_state(task_id, STATE_SUBMITTED)
         thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
@@ -683,6 +1069,8 @@ class MaestroDaemon:
             usage = record.get("usage")
             attempts = record.get("attempts") or []
             error = record.get("error")
+            gates = record.get("gates")
+            bounces = record.get("bounces")
         else:  # durable fallback for tasks from earlier daemon runs
             claims = self.maestro._claims(task_id)
             state = _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING)
@@ -703,27 +1091,34 @@ class MaestroDaemon:
             usage = runtime.get("usage")
             attempts = runtime.get("attempts") or []
             error = runtime.get("error")
+            gates = runtime.get("gates")
+            bounces = runtime.get("bounces")
         artifacts: list[dict[str, Any]] = []
         task_dir = self.state_dir / "tasks" / task_id
         if task_dir.is_dir():
             for path in sorted(task_dir.iterdir()):
                 if path.is_file() and path.suffix in {".json", ".txt", ".log"}:
                     artifacts.append({"artifactId": f"{task_id}:{path.name}", "name": path.name, "parts": [{"kind": "url", "url": str(path)}]})
+        metadata = {
+            "workspace": workspace,
+            "branch": branch,
+            "origin_agent": origin,
+            "target_agent": target,
+            "title": title,
+            "usage": usage,
+            "attempts": attempts,
+            "error": error,
+        }
+        if gates is not None:
+            metadata["gates"] = gates
+        if bounces is not None:
+            metadata["bounces"] = bounces
         return {
             "kind": "task",
             "id": task_id,
             "status": {"state": state, "timestamp": utcnow_iso()},
             "artifacts": artifacts,
-            "metadata": {
-                "workspace": workspace,
-                "branch": branch,
-                "origin_agent": origin,
-                "target_agent": target,
-                "title": title,
-                "usage": usage,
-                "attempts": attempts,
-                "error": error,
-            },
+            "metadata": metadata,
         }
 
     def list_tasks(self) -> list[dict[str, Any]]:

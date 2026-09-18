@@ -52,8 +52,10 @@ def delegate(workspace: str, handoff_file: str) -> str:
     completes, fails, or needs input. No polling: this call resolves when done.
 
     The handoff file may be the 4-section Maestro document (JSON or TOML) or a
-    legacy 0.8.x staged handoff. Returns the final A2A task object (state,
-    artifacts, workspace/branch metadata)."""
+    legacy 0.8.x staged handoff. A [routing] mode name selects a work-mode preset
+    from config that pins implementer/reviewer/verifier/fixer agents to the task's
+    phases; explicit routing fields in the file win over the preset. Returns the
+    final A2A task object (state, artifacts, workspace/branch metadata)."""
     d = get_daemon()
     try:
         doc = load_handoff_file(handoff_file)
@@ -123,8 +125,9 @@ def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
 def followup(workspace: str, task_id: str, instruction: str) -> str:
     """Send a follow-up instruction to a finished task (completed/failed/canceled).
     The same agent resumes on the same task branch with the new instruction and
-    its previous Q&A in context. Blocks until the follow-up turn finishes or
-    needs input — no polling."""
+    its previous Q&A in context — unless the task's handoff pins a fixer agent,
+    in which case the follow-up runs under it. Blocks until the follow-up turn
+    finishes or needs input — no polling."""
     d = get_daemon()
     try:
         started = d.followup(d.resolve(task_id), instruction)

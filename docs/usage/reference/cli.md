@@ -52,7 +52,7 @@ when authentication is enabled.
 ## delegate
 
 ```text
-maestro delegate (--file FILE | --title T --request R --target A)
+maestro delegate (--file FILE | --title T --request R (--target A | --mode NAME))
                  [--fallback A …] [--design-file FILE] [--no-wait]
                  [--workspace DIR | --project DIR]
 ```
@@ -62,16 +62,18 @@ task's event stream.
 
 | Option | Meaning |
 |---|---|
-| `--file FILE` | Handoff document file (TOML or JSON; 4-section or legacy format). Mutually exclusive in effect with the flag trio — one of the two forms is required |
-| `--title T` / `--request R` / `--target A` | Minimal handoff from flags. All three are required together |
+| `--file FILE` | Handoff document file (TOML or JSON; 4-section or legacy format). Mutually exclusive in effect with the flag form — one of the two forms is required |
+| `--title T` / `--request R` / `--target A` | Minimal handoff from flags. `--title` and `--request` are always required in this form, plus either `--target` or `--mode` |
+| `--mode NAME` | Apply the work-mode preset of that name (a `[modes.NAME]` config table) — it pins the implementer/verifier/reviewer/fixer agents for this task. With `--file`, a flag value overrides the file's `[routing] mode` |
 | `--fallback A` | Fallback agent, tried in order after the target fails or is unavailable. Repeatable |
 | `--design-file FILE` | File whose text becomes the handoff's authoritative design |
 | `--no-wait` | Return immediately after enqueueing; prints the daemon's response (task id or queued notice) and exits 0 |
 
-Output while waiting: a `[task] <id> — target=… workspace=…` line, then stream
-lines — agent output, `[state] <state>` (with `— <error>` or `(question: …)`
-annotations), and `[usage] {…}`. Exit code follows the final state (0 for
-`completed`, 1 otherwise; 130 on Ctrl-C).
+Output while waiting: a `[task] <id> — target=… workspace=…` line (`mode=…`
+instead of `target=…` when a work mode is set), then stream lines — agent
+output, `[state] <state>` (with `— <error>` or `(question: …)` annotations),
+and `[usage] {…}`. Exit code follows the final state (0 for `completed`, 1
+otherwise; 130 on Ctrl-C).
 
 If the workspace already has an active task, the handoff is queued FIFO and the
 command prints `{"queued": true, "reason": …}` and exits 0.
@@ -157,8 +159,10 @@ cap. Prints a notice when no caps are configured (`MAESTRO_BUDGET_PER_AGENT_USD`
 maestro config [--workspace DIR | --project DIR]
 ```
 
-Prints the effective Codex defaults for the resolved scope as JSON:
-`{"model": …, "effort": …}` (either may be `null`). See
+Prints the effective Codex defaults and work-mode presets for the resolved
+scope as JSON: `{"model": …, "effort": …, "modes": {NAME: {"implementer": …,
+"verifier": …, "reviewer": …, "fixer": …, "max_bounces": N}}}` — `model`/
+`effort` may be `null`, and `modes` is `{}` when no presets are defined. See
 [Configuration reference](configuration.md).
 
 ## storage

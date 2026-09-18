@@ -173,6 +173,52 @@ multi-agent chains is exactly where errors compound: each downstream consumer
 inherits the previous agent's unverified claim. Verification is what makes a
 `completed` task safe to build on.
 
+## Work modes: gates and bounces
+
+A **work mode** is a named preset that pins agents to the phases of a task
+cycle — cheap model implements, expensive model reviews, and so on. The design
+question it answers: how do you make cost/quality profiles *data* instead of
+prompt discipline? Today, "have the cheap model implement and the expensive
+model review" is something a supervisor has to orchestrate by hand across
+several delegations; a preset expresses it once in config, and every task that
+names it gets the same shape automatically.
+
+The mechanics extend the lifecycle rather than replacing it:
+
+- **Gates run after the implementer, in order.** Deterministic verification
+  first (when `verification != "none"`), then an optional LLM verifier turn,
+  then an optional reviewer turn. Each gate is one agent turn with a strict
+  output contract — a trailing `VERDICT: PASS` or `VERDICT: FAIL` line plus
+  optional `ISSUES:` bullets — so the daemon can parse the outcome without
+  trusting prose. A gate that cannot produce a parsable verdict parks the task
+  immediately rather than guessing; an unparseable review is treated as "no
+  signal", not "pass".
+- **LLM gates add failures, they never remove them.** The invariant that keeps
+  this honest: a failed deterministic check can be *confirmed* by an LLM but
+  never overridden. A reviewer that says PASS while the tests fail still parks
+  the task. This is why the deterministic gate always runs first — it is the
+  floor, and everything above it can only raise the bar.
+- **Bounces are bounded auto-fix.** When a gate (or the deterministic check)
+  fails, the work goes to the fixer — by default the implementer — for one
+  attempt, then re-verification and re-review run again. The loop is capped by
+  `max_bounces` (default 2; `0` disables it), so a mode can never spend
+  unboundedly on iteration. Each bounce is a recorded attempt attributed to its
+  agent, which is what makes per-phase cost visible in audits and budgets.
+- **Exhaustion parks, it does not fail.** When the cap is hit with issues
+  remaining, the task moves to `input-required` with every unresolved issue
+  listed — and keeps its workspace slot while parked, exactly like a mid-task
+  question. The distinction matters: `failed` means "no agent could do this",
+  while a parked gate means "the work needs a judgment call" (fix these
+  specific issues, or approve the risk). Answering resumes under the
+  implementer; follow-ups after a terminal state run under the mode's fixer,
+  since that agent is already pinned to fixing.
+
+Two refusals keep the gates meaningful: `review_agent == target_agent` is
+rejected at delegation time (self-review manufactures the appearance of an
+independent signal — the same epistemic rule as no-self-delegation), and a
+preset's agents are checked against the live registry when the task starts, so
+a stale preset fails fast with the registered list rather than mid-cycle.
+
 ## Retries, fallbacks, and money
 
 Each agent in the target→fallback chain gets `1 + MAESTRO_MAX_RETRIES`

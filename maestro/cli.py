@@ -174,9 +174,11 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
         workspace = str(_project(args.project))
     if args.file:
         doc = load_handoff_file(args.file)
+        if args.mode:
+            doc.mode = args.mode  # --mode overrides any mode named in the file
     else:
-        if not (args.title and args.request and args.target):
-            raise ValueError("provide --file or all of --title/--request/--target")
+        if not (args.title and args.request and (args.target or args.mode)):
+            raise ValueError("provide --file or all of --title/--request/(--target or --mode)")
         design = ""
         if args.design_file:
             try:
@@ -185,7 +187,8 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
                 raise ValueError(f"Unable to read design file: {exc}") from exc
         doc = HandoffDoc(
             title=args.title, request=args.request, design=design,
-            target_agent=args.target, fallback=list(args.fallback),
+            target_agent=args.target or "codex", fallback=list(args.fallback),
+            mode=args.mode, explicit_target=args.target is not None,
         )
     url, token = _daemon_endpoint()
     result = _post_jsonrpc(url, "message/send", {"message": {
@@ -201,7 +204,8 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     if args.no_wait:
         print(json.dumps(result, indent=2))
         return 0
-    print(f"[task] {task_id} — target={doc.target_agent} workspace={workspace}", flush=True)
+    routing = f"mode={doc.mode}" if doc.mode else f"target={doc.target_agent}"
+    print(f"[task] {task_id} — {routing} workspace={workspace}", flush=True)
     return _stream_task(url, task_id, token=token)
 
 
@@ -387,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--title", default=None)
     d.add_argument("--request", default=None)
     d.add_argument("--target", default=None)
+    d.add_argument("--mode", default=None, help="Work-mode preset name from config [modes] (pins implementer/reviewer/verifier/fixer)")
     d.add_argument("--fallback", action="append", default=[], help="Fallback agent (repeatable)")
     d.add_argument("--design-file", default=None, help="Design text file to attach")
     d.add_argument("--no-wait", action="store_true", help="Return immediately after enqueueing")
@@ -525,7 +530,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "status":
                 print(json.dumps(m.status(args.task_id), indent=2)); return 0
             if args.cmd == "config":
-                print(json.dumps(m.codex_defaults(), indent=2)); return 0
+                modes = {name: preset.to_dict() for name, preset in (m.config.get("modes") or {}).items()}
+                print(json.dumps({**m.codex_defaults(), "modes": modes}, indent=2)); return 0
             raise AssertionError("unhandled command")  # pragma: no cover
         finally:
             m.close()

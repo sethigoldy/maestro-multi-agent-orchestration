@@ -35,6 +35,11 @@ object:
 }
 ```
 
+For tasks delegated with a work mode (or explicit gate agents), `metadata` also
+carries `gates` — one entry per LLM gate turn that ran, shaped
+`{"agent": …, "ok": true|false, "issues": [ … ]}` — and `bounces`, the number of
+auto-fix bounces consumed. Both are absent for tasks without gates.
+
 States: `submitted`, `working`, `input-required`, `completed`, `failed`,
 `canceled`. Terminal states: `completed`, `failed`, `canceled`. The mapping to
 human-level phases is in [How delegation works](../explanation/how-delegation-works.md#task-lifecycle).
@@ -49,6 +54,11 @@ Loads the handoff file (4-section TOML/JSON or legacy 0.8.x JSON — see
 [handoff format reference](handoff-format.md)) and submits it to the daemon for
 the given workspace. Blocks until the task reaches a terminal state or
 `input-required`, or until the timeout expires.
+
+A handoff file may carry `[routing] mode = "NAME"` (or the explicit
+`review_agent`/`verify_agent`/`fix_agent`/`max_bounces` fields) to run the task
+under a work-mode preset — see [Configure work modes](../how-to/configure-work-modes.md).
+Signature unchanged: the routing lives in the file.
 
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
@@ -65,8 +75,10 @@ followup(workspace: str, task_id: str, instruction: str) -> str
 
 Resumes a finished task (`completed`/`failed`/`canceled`) with a new
 instruction; the same agent continues on the same task branch with its previous
-Q&A in context. Blocks like `delegate` (same timeout and `timed_out` semantics).
-Each follow-up decrements `max_depth_remaining` by one.
+Q&A in context. When the task was delegated under a work mode, follow-ups run
+under that mode's `fixer` (the agent already pinned to fixing) instead of the
+original implementer. Blocks like `delegate` (same timeout and `timed_out`
+semantics). Each follow-up decrements `max_depth_remaining` by one.
 
 Errors: unknown task (`KeyError` text), empty instruction, task still active
 (`"…cancel it or answer its question before following up"`), depth exhausted —
@@ -92,7 +104,8 @@ task_status(workspace: str, task_id: str) -> str
 Returns the human-level state record (the same JSON as `maestro task status`):
 `task_id`, `task_number`, `title`, `phase`, `workspace`, `branch`,
 `origin_agent`, `target_agent`, `model`, `effort`, `result`, `verification`,
-`project_root`. Numeric task numbers are accepted.
+`project_root`, and — for work-mode tasks — `gates` (per-gate agent, ok, issue
+count) and `bounces`. Numeric task numbers are accepted.
 
 The workspace argument is resolved to its git root, so it must be inside a git
 repository.

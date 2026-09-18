@@ -5,7 +5,8 @@ delegation. It has four sections plus an optional per-task settings table:
 
 ```text
 [handoff]       what to do        (title, request, design, context pointers)
-[routing]       who does it       (target_agent, fallback, origin_agent, parent_task)
+[routing]       who does it       (target_agent, fallback, origin_agent, parent_task,
+                                   work modes: mode, review_agent, verify_agent, fix_agent, max_bounces)
 [expectations]  what done looks like (artifacts, verification, commit_policy, budget_hint)
 [constraints]   guardrails        (sensitive, max_depth_remaining)
 agent_settings  per-task overrides for the target agent (model, effort, …)
@@ -34,6 +35,17 @@ with the task.
 | `fallback` | list of strings | `[]` | no | Agents tried in order if the target fails or is unavailable; entries must be non-empty |
 | `origin_agent` | string | `"human"` | no | Who asked for the work — a person, or the name of a supervising agent delegating via MCP |
 | `parent_task_id` | string or null | `null` | no | Set automatically by follow-ups; not normally set by authors |
+| `mode` | string | `null` | no | Name of a `[modes.NAME]` work-mode preset. Expanded at delegate time: the preset's `implementer` becomes `target_agent` (unless one was set explicitly), and its optional slots fill in the fields below where they are absent |
+| `review_agent` | string | `null` | no | Agent for the LLM review gate turn after verification. Must differ from `target_agent` (self-review is refused) |
+| `verify_agent` | string | `null` | no | Agent for the optional LLM verification gate turn; runs in addition to, never instead of, the deterministic check |
+| `fix_agent` | string | `null` | no | Agent for auto-fix bounces after a failed gate. Defaults to the implementer (`target_agent`) when omitted |
+| `max_bounces` | integer | `2` (preset default) | no | Cap on auto-fix bounces; must be an integer ≥ 0 when set. `0` = park on the first issue |
+
+Work-mode precedence: explicit fields on the handoff beat the preset for that
+task — a handoff with both `mode = "economy"` and `review_agent = "other"` uses
+the preset's implementer but reviews with `other`. A task with no `mode` and no
+gate fields behaves exactly as before (deterministic verification only). See
+[Configure work modes](../how-to/configure-work-modes.md).
 
 ### `[expectations]`
 
@@ -72,11 +84,15 @@ A handoff is rejected with a `ValueError` when any of these holds:
 - `max_depth_remaining` < 0
 - `budget_hint` is set and ≤ 0
 - any `fallback` entry is empty
+- `max_bounces` is set but not an integer ≥ 0 (booleans are rejected)
 
 Additional refusals happen at delegation time (see
 [Delegate a task — rules](../how-to/delegate-a-task.md#rules-that-will-refuse-your-delegation)):
 self-delegation, depth exhausted, missing workspace, non-git workspace with
-`commit_policy = "branch"`, budget cap exceeded.
+`commit_policy = "branch"`, budget cap exceeded. With work modes: an unknown
+`mode` name, an unknown agent in any of the preset's slots or the explicit gate
+fields (the error lists the registered agents), and `review_agent == target_agent`
+(self-review is not a gate).
 
 ## File loading rules
 

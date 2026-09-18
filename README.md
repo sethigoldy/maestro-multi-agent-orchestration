@@ -349,7 +349,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | Command | What it does |
 |---|---|
 | `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | Start the broker daemon. `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
-| `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--no-wait` returns immediately |
+| `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
 | `maestro task list [--project DIR]` | List tasks (number or id) |
 | `maestro task status <id\|n>` | Show one task's current state (`task show`, `status`, and bare `task <n>` are aliases) |
@@ -358,12 +358,13 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro agents list \| add \| remove \| discover \| status <name>` | Manage registered agents |
 | `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
 | `maestro budgets` | Show budget caps and current spend |
-| `maestro config` | Show effective Codex defaults |
+| `maestro config` | Show effective Codex defaults and defined work-mode presets |
 | `maestro storage migrate-memvara` | Import legacy Memvara state into the current backend |
 | `maestro gc [--days N] [--dry-run]` | Delete terminal tasks older than the TTL (manual only) |
 
 Handoff files are TOML or JSON in the 4-section format — `[handoff]` (title,
-request, design, context), `[routing]` (target_agent, fallback, origin_agent),
+request, design, context), `[routing]` (target_agent, fallback, origin_agent,
+and the optional work-mode fields mode/review_agent/verify_agent/fix_agent/max_bounces),
 `[expectations]` (artifacts, verification, commit_policy, budget_hint),
 `[constraints]` (sensitive, max_depth_remaining) plus optional `agent_settings`
 (per-task model/effort). Legacy 0.8.x JSON files are converted automatically.
@@ -392,6 +393,21 @@ Verification is not configured here — it is set per handoff (`verification =
 "auto" | "command" | "none"`) and auto-detected per workspace; see
 "Deterministic verification" below. A `[verification]` table in this file is
 accepted for forward compatibility but not run by the daemon.
+
+**Work-mode presets:** a `[modes.<name>]` table pins agents to the phases of a
+task cycle (see "Work modes" below). Every key except `implementer` is
+optional:
+
+```toml
+[modes.economy]
+implementer = "codex-mini"     # required — cheap model, low effort
+verifier    = "codex-mini"     # optional LLM verification pass
+reviewer    = "codex"          # expensive: verifies requested changes only
+fixer       = "codex-mini"     # optional → defaults to implementer
+max_bounces = 2                # optional → default 2; 0 = no auto-fix, park on first issue
+```
+
+`maestro config` lists the defined presets with their slots.
 
 ### Environment variables
 
@@ -452,8 +468,43 @@ explicit note. The full report is saved per task (`verification.txt`). The
 handoff's `verification` field can switch this to an explicit command or skip
 it — see the [configuration reference](docs/usage/reference/configuration.md#verification-auto-detection).
 
+Work-mode presets can add LLM verifier and reviewer turns on top of this gate,
+but the deterministic check always runs first when `verification != "none"`,
+and an LLM verdict can only **add** failures — it can never override a failed
+deterministic result. See "Work modes".
+
 Maestro never installs dependencies or changes your tooling; a real non-zero
 result is recorded as a verification failure in the task record.
+
+---
+
+## Work modes
+
+A **work mode** is a named preset that pins specific agents to the phases of a
+task cycle, so cost/quality profiles are data instead of prompt discipline —
+e.g. "economy": a cheap model implements and fixes, an expensive model only
+reviews the requested changes. Presets live in `[modes.<name>]` config tables
+(see Configuration above); each task picks one with `--mode NAME` or
+`[routing] mode = "NAME"` in a handoff file.
+
+| Slot | Phase | Optional? | Default when omitted |
+|---|---|---|---|
+| `implementer` | implementing | **required** | — (becomes the task's target agent) |
+| `verifier` | verifying | yes | deterministic check only |
+| `reviewer` | reviewing | yes | no LLM review turn |
+| `fixer` | fixing | yes | `implementer` |
+
+After the implementer finishes, Maestro runs its deterministic verification,
+then the optional verifier and reviewer turns. A failing verdict (or a failed
+deterministic check) bounces the work to the fixer — re-verify, re-review, up
+to `max_bounces` times; when the cap is hit the task parks in `input-required`
+for you instead of spending more. An LLM verdict can **add** failures but never
+override a failed deterministic check. Every turn attributes its usage to its
+own agent, so per-phase cost shows up in `task audit` and budgets.
+
+Explicit routing fields on the handoff beat the preset for that task; a task
+with no mode behaves exactly as before. Step-by-step setup:
+[docs/usage/how-to/configure-work-modes.md](docs/usage/how-to/configure-work-modes.md).
 
 ---
 

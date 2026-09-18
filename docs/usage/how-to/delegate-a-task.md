@@ -2,8 +2,8 @@
 
 This guide shows you how to author a handoff — the work order Maestro sends to
 an agent — and launch it: via CLI flags, via a handoff file, with fallbacks,
-per-task settings, budgets, and queueing. For the complete field-by-field
-description of the handoff document, see the
+per-task settings, work-mode presets, budgets, and queueing. For the complete
+field-by-field description of the handoff document, see the
 [handoff format reference](../reference/handoff-format.md).
 
 ## Prerequisites
@@ -100,6 +100,51 @@ first:
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, `max`.
 
+## Delegate with a work mode
+
+A work-mode preset pins agents to the phases of the task cycle (cheap model
+implements, expensive model reviews, …). If you haven't defined presets yet,
+do that first: [Configure work modes](configure-work-modes.md).
+
+From flags — `--mode` stands in for `--target` (the preset's implementer
+becomes the target):
+
+```bash
+maestro delegate \
+  --title "Add pagination to the documents API" \
+  --request "Add cursor-based pagination; page_size defaults to 50." \
+  --mode economy \
+  --workspace /path/to/repo
+```
+
+From a handoff file — set `[routing] mode`:
+
+```toml
+[routing]
+mode = "economy"
+```
+
+Overriding one slot for a single task: any explicit routing field beats the
+preset, so this reviews with a different agent while keeping the rest of the
+preset:
+
+```toml
+[routing]
+mode = "economy"
+review_agent = "claude-max"   # just this review turn uses the expensive tier
+```
+
+And from flags, `--target` beats the preset's implementer:
+`maestro delegate --title … --request … --target codex --mode economy`.
+
+What you get: after the implementer finishes, Maestro runs deterministic
+verification, then the preset's verifier and reviewer turns (if set). A failed
+verdict or a failed deterministic check bounces the work to the fixer — up to
+`max_bounces` times — and if the cap is hit the task parks in `input-required`
+with the unresolved issues listed; answer it, follow up, or cancel. Per-phase
+cost shows up in `maestro task audit <id>` (each attempt names its agent) and
+in `maestro budgets`.
+
 ## Choose the commit policy
 
 - `branch` (default) — Maestro creates and checks out branch
@@ -156,6 +201,9 @@ These fail fast, before any agent runs — read the error rather than retrying:
 - **Workspace not a directory**, or **not a git repository** with
   `commit_policy = "branch"`.
 - **Budget cap exceeded** for the target agent.
+- **Work-mode problems** — an unknown `mode` name, an unknown agent in any
+  preset slot or explicit gate field (the error lists the registered agents),
+  or `review_agent == target_agent` (self-review is not a gate).
 
 ## Delegate from a host agent (MCP path)
 
