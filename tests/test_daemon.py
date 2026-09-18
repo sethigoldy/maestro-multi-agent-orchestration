@@ -1153,18 +1153,26 @@ def test_mcp_followup_and_self_delegation_errors(tmp_path, monkeypatch):
         dm._instance = old
 
 
-def test_legacy_mcp_tools_keep_stable_signatures():
+def test_mcp_tools_keep_stable_signatures():
     import inspect
 
     from maestro import mcp_server
 
     expected = {
-        "delegate_to_codex": ["workspace", "handoff_file"],
+        "delegate": ["workspace", "handoff_file"],
         "task_status": ["workspace", "task_id"],
         "list_tasks": ["workspace"],
-        "codex_followup": ["workspace", "task_id", "instruction"],
-        "review_task": ["workspace", "task_id", "review", "approved"],
+        "task_wait": ["workspace", "task_id", "timeout"],
+        "agents_list": [],
+        "cancel_task": ["workspace", "task_id", "reason"],
+        "answer_task_question": ["workspace", "task_id", "answer"],
+        "followup": ["workspace", "task_id", "instruction"],
     }
     for name, params in expected.items():
         sig = list(inspect.signature(getattr(mcp_server, name)).parameters)
         assert sig == params, f"{name} signature drifted: {sig}"
+
+    # The 0.8.x Claude→Codex engine (staged handoff + worker subprocess) is gone;
+    # its MCP tools must stay removed — delegation goes through the daemon.
+    for name in ("delegate_to_codex", "codex_followup", "review_task"):
+        assert not hasattr(mcp_server, name), f"legacy MCP tool {name} must stay removed"

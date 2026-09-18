@@ -173,7 +173,9 @@ def from_legacy(payload: dict[str, Any]) -> HandoffDoc:
         request=str(payload["request"]),
         design=design,
         target_agent=str(payload.get("implementer") or "codex"),
-        origin_agent=str(payload.get("supervisor") or "claude_code"),
+        # Old 0.8.x files rarely name their supervisor; record the honest generic
+        # default instead of assuming a specific agent played that role.
+        origin_agent=str(payload.get("supervisor") or "human"),
         commit_policy="branch",
     )
     settings: dict[str, Any] = {}

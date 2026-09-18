@@ -11,11 +11,9 @@ Use this skill as the operational contract for Maestro. Do not open Maestro sour
 
 1. Identify the target repository/worktree.
 2. Prepare a compact design/handoff; do not implement substantial code yourself.
-3. Call `delegate_to_codex` with the active absolute `workspace`.
-4. Poll `task_status`.
-5. Review the diff and verification evidence.
-6. Use `codex_followup` for implementation/debugging/test/refactor fixes.
-7. Use `review_task` only for the final approve/reject decision.
+3. Call `delegate` with the active absolute `workspace` — it blocks until the work completes, fails, or needs input.
+4. Review the returned task result and the diff/verification evidence yourself.
+5. Use `followup` for implementation/debugging/test/refactor fixes; use `task_wait` to follow up on earlier delegations.
 
 ## Do not
 

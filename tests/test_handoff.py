@@ -88,8 +88,14 @@ def test_from_legacy(tmp_path):
     design.write_text("# design\nbody", encoding="utf-8")
     doc = from_legacy({"title": "T", "request": "R", "design_file": str(design), "model": "gpt-x", "effort": "high"})
     assert doc.design == "# design\nbody" and doc.target_agent == "codex"
-    assert doc.origin_agent == "claude_code" and doc.commit_policy == "branch"
+    # No supervisor field in the old file: record the honest generic default.
+    assert doc.origin_agent == "human" and doc.commit_policy == "branch"
     assert doc.agent_settings == {"model": "gpt-x", "effort": "high"}
+
+
+def test_from_legacy_explicit_supervisor(tmp_path):
+    doc = from_legacy({"title": "T", "request": "R", "supervisor": "copilot"})
+    assert doc.origin_agent == "copilot" and doc.target_agent == "codex"
 
 
 def test_from_legacy_missing_fields():

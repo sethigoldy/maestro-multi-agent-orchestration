@@ -12,8 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from .models import Phase
-
 
 def maestro_user_dir() -> Path:
     """Return Maestro's user-level state directory."""
@@ -139,19 +137,10 @@ class Maestro:
         self.workspace_state = self.user_state_dir
         self.state_dir = self.user_state_dir
 
-        self.design_dir = self.user_state_dir / "designs"
-        self.staged_dir = self.user_state_dir / "staged"
-        self.task_artifacts = self.user_state_dir / "tasks"
-
-        self.design_dir.mkdir(exist_ok=True)
-        self.staged_dir.mkdir(exist_ok=True)
-        self.task_artifacts.mkdir(exist_ok=True)
+        (self.user_state_dir / "tasks").mkdir(exist_ok=True)
 
         self.index_path = self.user_state_dir / "registry.json"
         self.lock_path = self.user_state_dir / "registry.lock"
-        self.design_dir.mkdir(exist_ok=True)
-        self.staged_dir.mkdir(exist_ok=True)
-        self.task_artifacts.mkdir(exist_ok=True)
 
         # self.user_state_dir = maestro_user_dir()
         # self.user_state_dir.mkdir(parents=True, exist_ok=True)
@@ -444,87 +433,3 @@ class Maestro:
             output.append(record)
         return sorted(output,key=lambda x:int(x.get("task_number") or x.get("number") or 0))
 
-    def create_handoff(self, title: str, request: str, design: str, model: str | None = None, effort: str | None = None) -> dict[str, Any]:
-        selected_model=model or self.config.get("model"); selected_effort=(effort or self.config.get("effort"))
-        if selected_effort is not None and str(selected_effort).lower() not in {"low","medium","high","xhigh","max"}: raise ValueError(f"Unsupported Codex reasoning effort: {selected_effort}")
-        selected_effort=str(selected_effort).lower() if selected_effort is not None else None
-        task_id=f"task-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"; design_path=self.design_dir/f"{task_id}.md"; design_path.write_text(design,encoding="utf-8")
-        with self._task_lock():
-            number=self._new_task_number(); episode=self.mem.add(f"Approved design handoff. Task: {task_id}. Task number: {number}. Title: {title}. Request: {request}\n\n{design}",role="system",ts=self._now())
-            for pred,val in (("task_status",Phase.DESIGNED.value),("task_owner","claude"),("task_implementer","codex"),("task_design",str(design_path)),("task_workspace",str(self.root)),("task_number",str(number)),("task_title",title)):
-                self._write_claim(task_id,pred,val,episode.episode_ids)
-            if selected_model: self._write_claim(task_id,"task_model",str(selected_model),episode.episode_ids)
-            if selected_effort: self._write_claim(task_id,"task_effort",selected_effort,episode.episode_ids)
-            self._register_task(task_id,title,number)
-        return {"task_id":task_id,"task_number":number,"design_path":str(design_path),"phase":Phase.DESIGNED.value,"model":selected_model,"effort":selected_effort}
-
-    def _stage_path(self, handoff_file: str | Path) -> Path:
-        path=Path(handoff_file).expanduser(); path=(self.root/path if not path.is_absolute() else path).resolve()
-        try: path.relative_to(self.staged_dir.resolve())
-        except ValueError as exc: raise ValueError(f"Handoff file must be under {self.staged_dir}") from exc
-        return path
-
-    def _load_staged_handoff(self, handoff_file: str | Path) -> tuple[Path,dict[str,Any]]:
-        path=self._stage_path(handoff_file)
-        if not path.exists(): raise ValueError(f"Handoff file does not exist: {path}")
-        try: payload=json.loads(path.read_text(encoding="utf-8"))
-        except (OSError,json.JSONDecodeError) as exc: raise ValueError(f"Invalid handoff file: {path}") from exc
-        if not isinstance(payload,dict): raise ValueError("Handoff file must contain a JSON object")
-        for key in ("title","request","design_file"):
-            if not payload.get(key): raise ValueError(f"Handoff file is missing required field: {key}")
-        design=Path(str(payload["design_file"])).expanduser(); design=(self.root/design if not design.is_absolute() else design).resolve()
-        try: design.relative_to(self.root)
-        except ValueError as exc: raise ValueError("design_file must be inside the active workspace") from exc
-        if not design.is_file(): raise ValueError(f"Design file does not exist: {design}")
-        payload["design_file"]=str(design); return path,payload
-
-    def create_handoff_from_file(self, handoff_file: str | Path) -> dict[str,Any]:
-        path,payload=self._load_staged_handoff(handoff_file)
-        if payload.get("task_id"):
-            status=self.status(str(payload["task_id"])); status["staged_handoff"]=str(path); return status
-        design=Path(payload["design_file"]).read_text(encoding="utf-8")
-        task=self.create_handoff(str(payload["title"]),str(payload["request"]),design,model=payload.get("model"),effort=payload.get("effort"))
-        payload.update({"task_id":task["task_id"],"task_number":task["task_number"],"created_at":self._now().isoformat()})
-        tmp=path.with_suffix(".tmp"); tmp.write_text(json.dumps(payload,indent=2),encoding="utf-8"); tmp.replace(path)
-        return {**task,"staged_handoff":str(path)}
-
-    def finalize_staged_handoff(self, handoff_file: str | Path, task_id: str) -> str:
-        path=self._stage_path(handoff_file)
-        if not path.exists(): return str(path)
-        target=self.task_artifacts/self.resolve_task(task_id); target.mkdir(parents=True,exist_ok=True); dest=target/"handoff.json"; path.replace(dest); return str(dest)
-
-    def _worker_command(self, task_id: str, action: str, review: str | None=None) -> list[str]:
-        cmd=[sys.executable,"-m","maestro.worker",action,task_id,"--workspace",str(self.root)]
-        if review is not None: cmd += ["--review",review]
-        return cmd
-
-    def launch(self, task_id: str, action: str, review: str | None=None) -> dict[str,Any]:
-        task_id=self.resolve_task(task_id); task_dir=self.task_artifacts/task_id; task_dir.mkdir(parents=True,exist_ok=True); log_path=task_dir/f"{action}.log"; log=log_path.open("a",encoding="utf-8")
-        process=subprocess.Popen(self._worker_command(task_id,action,review),cwd=self.root,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,env=os.environ.copy())
-        (task_dir/f"{action}.pid").write_text(str(process.pid),encoding="utf-8")
-        log.close()
-        exit_code = process.poll()
-        result = {"task_id":task_id,"pid":process.pid,"action":action,"log":str(log_path),"started":exit_code is None or exit_code == 0}
-        if exit_code is not None:
-            result["exit_code"] = exit_code
-            if exit_code != 0:
-                episode = self.mem.add(f"Maestro worker failed to start task {task_id}: exit code {exit_code}", role="system", ts=self._now())
-                self._write_claim(task_id,"task_status",Phase.FAILED.value,episode.episode_ids)
-                result["error"] = f"Maestro worker exited immediately with code {exit_code}; see {log_path}"
-        return result
-
-    def implement_async(self, task_id: str) -> dict[str,Any]:
-        task_id=self.resolve_task(task_id); self._write_claim(task_id,"task_status",Phase.IMPLEMENTING.value); return self.launch(task_id,"implement")
-
-    def fix_async(self, task_id: str, review: str) -> dict[str,Any]:
-        task_id=self.resolve_task(task_id); self._write_claim(task_id,"task_status",Phase.FIXING.value); return self.launch(task_id,"fix",review)
-
-    def codex_followup(self, task_id: str, instruction: str) -> dict[str,Any]:
-        """Delegate implementation/debugging/test/refactor follow-up directly to Codex."""
-        task_id=self.resolve_task(task_id); instruction=instruction.strip()
-        if not instruction: raise ValueError("Codex follow-up instruction cannot be empty")
-        self._write_claim(task_id,"task_status",Phase.IMPLEMENTING.value)
-        return self.launch(task_id,"followup",instruction)
-
-    def review(self, task_id: str, review: str, approved: bool) -> dict[str,Any]:
-        task_id=self.resolve_task(task_id); phase=Phase.COMPLETE if approved else Phase.FIXING; episode=self.mem.add(f"Claude review for {task_id}. Approved={approved}.\n{review}",role="system",ts=self._now()); self._write_claim(task_id,"task_review",review,episode.episode_ids); self._write_claim(task_id,"task_status",phase.value,episode.episode_ids); return {"task_id":task_id,"approved":approved,"phase":phase.value}

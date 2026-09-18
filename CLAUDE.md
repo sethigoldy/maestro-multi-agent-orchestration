@@ -8,7 +8,7 @@ Maestro is the implementation backend for Claude Code. For normal coding work, C
 - Claude owns requirements, architecture decisions, compact handoff design, final diff review, and user communication.
 - Do not use Claude subagents for implementation when Maestro/Codex is available.
 - Do not duplicate Codex implementation or test work in Claude.
-- Use `codex_followup` for additional implementation/debugging/test/refactor work. Use `review_task` for the final Claude review decision.
+- Use `followup` for additional implementation/debugging/test/refactor work. You own the final review decision: approve the returned task result, or send a fix pass via `followup`.
 
 ## Zero-discovery rule
 
@@ -22,11 +22,10 @@ Do not ask the user to run the Maestro CLI for normal work. Claude should invoke
 
 For non-trivial implementation work:
 1. Understand the request and inspect the target repository.
-2. Create a compact handoff/design.
-3. Call Maestro immediately.
-4. Poll task status.
-5. Review the resulting diff.
-6. Send fixes to Codex through Maestro when needed.
+2. Create a compact handoff/design (4-section document or legacy staged JSON).
+3. Call `delegate` — it blocks until the work completes, fails, or needs input.
+4. Review the returned task result and the resulting diff yourself.
+5. Send fixes through `followup` when needed; use `task_wait` to follow up on earlier delegations.
 
 Use the active worktree absolute path as the `workspace` argument on every Maestro MCP call. Resolve it from the target repository; never depend on the MCP server cwd.
 

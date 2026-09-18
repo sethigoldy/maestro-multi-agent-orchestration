@@ -20,25 +20,36 @@ def git_repo(tmp):
 def env(tmp, monkeypatch):
     monkeypatch.setenv('MAESTRO_HOME', str(tmp/'home'))
 
+def _seed(m, title="A"):
+    """Register a task the way the daemon does (claims + registry record)."""
+    import uuid as _uuid
+    tid = f"task-seed-{_uuid.uuid4().hex[:10]}"
+    number = m._new_task_number()
+    episode = m.mem.add(f"Approved design handoff. Task: {tid}. Title: {title}", role="system", ts=m._now())
+    m._register_task(tid, title, number)
+    for pred, val in (("task_status", "DESIGNED"), ("task_workspace", str(m.root)), ("task_number", str(number)), ("task_title", title)):
+        m._write_claim(tid, pred, val, episode.episode_ids)
+    return {"task_id": tid, "task_number": number}
+
 def test_user_scope_cross_worktree(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); project,w1,w2=git_repo(tmp_path)
-    a=Maestro(w1); t1=a.create_handoff('A','r','d'); a.close()
-    b=Maestro(w2); t2=b.create_handoff('B','r','d'); assert [x['task_id'] for x in b.list_tasks(project_filter=project)] == [t1['task_id'], t2['task_id']]; b.close()
+    a=Maestro(w1); t1=_seed(a); a.close()
+    b=Maestro(w2); t2=_seed(b,'B'); assert [x['task_id'] for x in b.list_tasks(project_filter=project)] == [t1['task_id'], t2['task_id']]; b.close()
 
 def test_global_status_from_other_worktree(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); _,w1,w2=git_repo(tmp_path)
-    a=Maestro(w1); t=a.create_handoff('A','r','d'); a.close()
+    a=Maestro(w1); t=_seed(a); a.close()
     b=Maestro(w2); s=b.status(t['task_id']); assert s['workspace']==str(w1); b.close()
 
 def test_project_filter_and_workspace_filter(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); project,w1,w2=git_repo(tmp_path)
-    a=Maestro(w1); t1=a.create_handoff('A','r','d'); a.close(); b=Maestro(w2); t2=b.create_handoff('B','r','d')
+    a=Maestro(w1); t1=_seed(a); a.close(); b=Maestro(w2); t2=_seed(b,'B')
     assert len(b.list_tasks(workspace_filter=str(w2)))==1 and b.list_tasks(workspace_filter=str(w2))[0]['task_id']==t2['task_id']
     assert len(b.list_tasks(project_filter=str(project)))==2; b.close()
 
 def test_unique_numbers_across_worktrees(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); _,w1,w2=git_repo(tmp_path)
-    a=Maestro(w1); n1=a.create_handoff('A','r','d')['task_number']; a.close(); b=Maestro(w2); n2=b.create_handoff('B','r','d')['task_number']; b.close(); assert (n1,n2)==(1,2)
+    a=Maestro(w1); n1=_seed(a)['task_number']; a.close(); b=Maestro(w2); n2=_seed(b,'B')['task_number']; b.close(); assert (n1,n2)==(1,2)
 
 def test_home_override(tmp_path, monkeypatch):
     monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'custom')); assert maestro_user_dir()==(tmp_path/'custom').resolve()
@@ -97,61 +108,13 @@ def test_registry_corrupt_and_unknown(tmp_path, monkeypatch):
     with pytest.raises(KeyError): m.resolve_task('bogus')
     m.close()
 
-def test_status_fallback_and_review(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('x','r','d')
+def test_status_workspace_fallback(tmp_path, monkeypatch):
+    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'x')
     tid=t['task_id']
-    # artifact fallback when task_workspace claim is absent
+    # registry-record fallback when the task_workspace claim is blank
     m._write_claim(tid,'task_workspace','')
     st=m.status(tid); assert st['workspace']==str(w1)
-    assert m.review(tid,'ok',True)['phase']=='COMPLETE'; assert m.review(tid,'fix',False)['phase']=='FIXING'; m.close()
-
-def test_staged_handoff_paths_and_reuse(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); design=w1/'d.md'; design.write_text('design'); stage=m.staged_dir/'h.json'; stage.write_text(json.dumps({'title':'T','request':'R','design_file':str(design)})); out=m.create_handoff_from_file(stage); assert out['task_id'].startswith('task-'); reused=m.create_handoff_from_file(stage); assert reused['task_id']==out['task_id']; archived=m.finalize_staged_handoff(stage,out['task_id']); assert Path(archived).is_file()
-    missing=m.finalize_staged_handoff(stage,out['task_id']); assert missing==str(stage)
-    with pytest.raises(ValueError): m._stage_path(w1/'x.json')
-    with pytest.raises(ValueError): m._load_staged_handoff(w1/'no.json')
-    bad=m.staged_dir/'bad.json'; bad.write_text('{}');
-    with pytest.raises(ValueError): m.create_handoff_from_file(bad)
-    outside=w1/'outside.md'; outside.write_text('x'); evil=m.staged_dir/'evil.json'; evil.write_text(json.dumps({'title':'t','request':'r','design_file':str(outside.parent.parent/'outside.md')}));
-    with pytest.raises(ValueError): m.create_handoff_from_file(evil)
     m.close()
-
-def test_launch_and_worker_commands(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('x','r','d'); assert '--review' not in m._worker_command(t['task_id'],'implement'); assert '--review' in m._worker_command(t['task_id'],'fix','r')
-    class P:
-        pid=1234
-        def poll(self): return None
-    calls={}
-    def popen(*a,**kw): calls['a']=a; calls['kw']=kw; return P()
-    monkeypatch.setattr('maestro.core.subprocess.Popen',popen); result=m.launch(t['task_id'],'implement'); assert result['pid']==1234 and Path(result['log']).is_file(); m.close()
-
-def test_launch_reports_immediate_worker_failure(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff("x","r","d")
-    class P:
-        pid=4321
-        def poll(self): return 2
-    monkeypatch.setattr("maestro.core.subprocess.Popen",lambda *a,**kw:P())
-    result=m.launch(t["task_id"],"followup","x")
-    assert result["started"] is False and result["exit_code"] == 2 and "error" in result
-    assert m.status(t["task_id"])["phase"] == "FAILED"
-    m.close()
-
-
-def test_launch_reports_immediate_success(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff("x","r","d")
-    class P:
-        pid=4322
-        def poll(self): return 0
-    monkeypatch.setattr("maestro.core.subprocess.Popen",lambda *a,**kw:P())
-    result=m.launch(t["task_id"],"followup","x")
-    assert result["started"] is True and result["exit_code"] == 0 and "error" not in result
-    assert m.status(t["task_id"])["phase"] == "DESIGNED"
-    m.close()
-
-
-def test_implement_fix_and_filters(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); project,w1,w2=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('x','r','d');
-    monkeypatch.setattr(m,'launch',lambda task,action,review=None:{'task':task,'action':action,'review':review}); assert m.implement_async(t['task_id'])['action']=='implement'; assert m.fix_async(t['task_id'],'x')['action']=='fix'; assert m.list_tasks(workspace_filter=str(w2))==[]; assert len(m.list_tasks(project_filter=str(project)))==1; m.close()
 
 def test_model_effort_and_storage_memvara_error(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch)
@@ -221,11 +184,11 @@ def test_fake_memvara_backend(tmp_path, monkeypatch):
         def close(self): pass
     mod=types.ModuleType('memvara'); mod.Memvara=FakeClient; mod.NullLLM=lambda:None; monkeypatch.setitem(sys.modules,'memvara',mod)
     (w1/'.maestro/config.toml').write_text('[storage]\nbackend="memvara"\n')
-    m=Maestro(w1); t=m.create_handoff('M','R','D'); assert m.status(t['task_id'])['phase']=='DESIGNED'; assert len(m.list_tasks())==1; m.close()
+    m=Maestro(w1); t=_seed(m,'M'); assert m.status(t['task_id'])['phase']=='DESIGNED'; assert len(m.list_tasks())==1; m.close()
 
 def test_resolve_project_fallback_and_status_artifact_fallback(tmp_path, monkeypatch):
     env(tmp_path,monkeypatch); plain=tmp_path/'plain'; plain.mkdir(); m=Maestro(plain); assert m.project_root==plain.resolve(); m.close()
-    _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('x','r','d'); tid=t['task_id'];
+    _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'x'); tid=t['task_id'];
     # Replace the workspace claim with blank in a fake in-memory history by suppressing it in status.
     orig=m._claims
     def claims_without_workspace(tid2):
@@ -258,7 +221,7 @@ def test_legacy_memvara_strict_failure(tmp_path, monkeypatch):
     m.close()
 
 def test_cli_main_commands(tmp_path, monkeypatch, capsys):
-    env(tmp_path,monkeypatch); project,w1,w2=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('CLI','R','D'); m.close()
+    env(tmp_path,monkeypatch); project,w1,w2=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'CLI'); m.close()
     import maestro.cli as cli
     def run(argv): monkeypatch.setattr(sys,'argv',['maestro',*argv]); return cli.main()
     with pytest.raises(SystemExit) as exc: run(['--version'])
@@ -274,15 +237,6 @@ def test_cli_main_commands(tmp_path, monkeypatch, capsys):
     assert exc.value.code == 0
     out=capsys.readouterr().out; assert t['task_id'] in out
 
-def test_cli_handoff_and_run(monkeypatch,tmp_path,capsys):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); design=w1/'design.md'; design.write_text('D');
-    import maestro.cli as cli
-    calls=[]
-    m1=Maestro(w1); monkeypatch.setattr(Maestro,'implement_async',lambda self,tid: calls.append(tid) or {'task_id':tid,'pid':1});
-    monkeypatch.setattr(sys,'argv',['maestro','handoff','--title','T','--request','R','--design-file',str(design),'--workspace',str(w1)])
-    assert cli.main()==0; tid=calls[0]
-    monkeypatch.setattr(sys,'argv',['maestro','run',tid,'--workspace',str(w1)]); assert cli.main()==0; m1.close(); assert 'task_id' in capsys.readouterr().out
-
 def test_cli_storage_and_errors(monkeypatch,tmp_path,capsys):
     env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); import maestro.cli as cli
     monkeypatch.setattr(sys,'argv',['maestro','storage','migrate-memvara','--workspace',str(w1)]); assert cli.main()==0
@@ -292,22 +246,11 @@ def test_cli_storage_and_errors(monkeypatch,tmp_path,capsys):
         monkeypatch.setattr(sys,'argv',['maestro','--version']); cli.main()
 
 def test_worker_branches(tmp_path,monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('W','R','D');
+    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path)
     import maestro.worker as worker
-    assert worker.design_for(m,t['task_id'])=='D'; assert worker._claim_value(m,t['task_id'],'missing') is None
     assert worker._verification_command(w1,['echo','x'])[0]==['echo','x'];
     (w1/'package.json').write_text(json.dumps({'scripts':{'test':'x'}})); assert worker._verification_command(w1)[0][0]=='npm'; (w1/'package.json').unlink(); (w1/'go.mod').write_text('module x'); assert worker._verification_command(w1)[0][0]=='go'; (w1/'go.mod').unlink(); (w1/'Cargo.toml').write_text('[package]'); assert worker._verification_command(w1)[0][0]=='cargo'; (w1/'Cargo.toml').unlink()
     (w1/'pyproject.toml').write_text(''); monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:type('R',(),{'returncode':1,'stdout':'','stderr':''})()); cmd,note=worker._verification_command(w1); assert cmd[:2]==['git','diff'] and note
-    class R: returncode=0; stdout='ok'; stderr=''
-    monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:R()); monkeypatch.setattr(worker,'_verification_command',lambda *a,**k:(['echo','ok'],None)); assert worker.verify(m,t['task_id']);
-    m.close()
-
-def test_worker_run_codex_and_main(tmp_path,monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('W','R','D',model='m',effort='max')
-    import maestro.worker as worker
-    class R: returncode=0; stdout='ok'; stderr='err'
-    monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:R()); monkeypatch.setattr(worker,'verify',lambda *a:True); assert worker.run_codex(m,t['task_id'],'implement',None)==0
-    m.close()
 
 def test_cli_helpers_extra(tmp_path, monkeypatch):
     import maestro.cli as cli
@@ -320,27 +263,18 @@ def test_cli_helpers_extra(tmp_path, monkeypatch):
 def test_cli_exception_paths(tmp_path, monkeypatch):
     env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); import maestro.cli as cli
     monkeypatch.setattr(cli.Path,'read_text',lambda *a,**k: (_ for _ in ()).throw(OSError('bad')))
-    monkeypatch.setattr(sys,'argv',['maestro','handoff','--title','t','--request','r','--design-file',str(w1/'d'),'--workspace',str(w1)])
+    monkeypatch.setattr(sys,'argv',['maestro','delegate','--title','t','--request','r','--target','codex','--design-file',str(w1/'d'),'--workspace',str(w1)])
     assert cli.main()==2
 
 def test_worker_more_branches(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('W','R','D'); import maestro.worker as worker
-    with pytest.raises(KeyError): worker.design_for(m,'task-absent')
+    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path)
+    import maestro.worker as worker
     monkeypatch.setenv('MAESTRO_PYTHON',str(w1/'missing')); (w1/'.venv/bin').mkdir(parents=True); (w1/'.venv/bin/python').write_text('x'); assert worker._python_executable(w1)==sys.executable
     (w1/'.venv/bin/python').unlink(); (w1/'.venv/bin/python').write_text('x'); os.chmod(w1/'.venv/bin/python',0o755); assert worker._python_executable(w1)==str(w1/'.venv/bin/python')
     (w1/'package.json').write_text('{bad'); assert worker._verification_command(w1)[0][0]=='git'; (w1/'package.json').write_text(json.dumps({'scripts':{}})); assert worker._verification_command(w1)[0][0]=='git';
     (w1/'package.json').write_text(json.dumps({'scripts':{'test':'x'}})); (w1/'pnpm-lock.yaml').write_text(''); assert worker._verification_command(w1)[0]==['pnpm','test']; (w1/'pnpm-lock.yaml').unlink(); (w1/'yarn.lock').write_text(''); assert worker._verification_command(w1)[0]==['yarn','test']; (w1/'yarn.lock').unlink(); (w1/'package.json').unlink()
     class R: returncode=1; stdout=''; stderr=''
     monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:R()); (w1/'pyproject.toml').write_text(''); assert worker._verification_command(w1)[1]
-    m.close()
-
-def test_worker_verify_failure_and_run_codex_fix(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('W','R','D'); import maestro.worker as worker
-    class R: returncode=1; stdout='bad'; stderr='oops'
-    monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:R()); assert worker.verify(m,t['task_id']) is False
-    # restore a successful command and exercise fix prompt/result path
-    class OK: returncode=0; stdout='ok'; stderr=''
-    monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:OK()); monkeypatch.setattr(worker,'verify',lambda *a: True); assert worker.run_codex(m,t['task_id'],'fix','review')==0; m.close()
 
 def test_mcp_server_with_fake_fastmcp(tmp_path, monkeypatch):
     import types,sys
@@ -351,15 +285,13 @@ def test_mcp_server_with_fake_fastmcp(tmp_path, monkeypatch):
     pkg=types.ModuleType('mcp'); server=types.ModuleType('mcp.server'); fast=types.ModuleType('mcp.server.fastmcp'); fast.FastMCP=FakeFast; server.fastmcp=fast; pkg.server=server
     monkeypatch.setitem(sys.modules,'mcp',pkg); monkeypatch.setitem(sys.modules,'mcp.server',server); monkeypatch.setitem(sys.modules,'mcp.server.fastmcp',fast)
     import importlib; mod=importlib.reload(importlib.import_module('maestro.mcp_server'))
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('M','R','D');
-    stage=m.staged_dir/'h.json'; design=w1/'d.md'; design.write_text('D'); stage.write_text(json.dumps({'title':'T','request':'R','design_file':str(design)}));
-    monkeypatch.setattr(Maestro,'implement_async',lambda self,tid:{'task_id':tid,'pid':1});
-    assert 'task_id' in mod.delegate_to_codex(str(w1),str(stage)); assert t['task_id'] in mod.task_status(str(w1),t['task_id']); assert t['task_id'] in mod.list_tasks(str(w1)); assert 'approved' in mod.review_task(str(w1),t['task_id'],'ok',True); m.close()
+    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'M');
+    assert t['task_id'] in mod.task_status(str(w1),t['task_id']); assert t['task_id'] in mod.list_tasks(str(w1)); m.close()
 
 def test_cli_all_list_scopes_and_helpers(tmp_path, monkeypatch):
     env(tmp_path,monkeypatch); project,w1,_=git_repo(tmp_path); import maestro.cli as cli
     ns=type('N',(),{})(); ns.project=None; ns.workspace=None; monkeypatch.delenv('MAESTRO_WORKSPACE',raising=False); base,scope=cli._scope_for_list(ns); assert scope is None
-    m=Maestro(w1); t=m.create_handoff('x','r','d'); m.close()
+    m=Maestro(w1); _seed(m,'x'); m.close()
     monkeypatch.setenv('MAESTRO_WORKSPACE',str(project)); monkeypatch.setattr(sys,'argv',['maestro','task','list']); assert cli.main()==0
     monkeypatch.setattr(sys,'argv',['maestro','list','--workspace',str(w1)]); assert cli.main()==0
     monkeypatch.setattr(sys,'argv',['maestro','config','--project',str(project)]); assert cli.main()==0
@@ -385,28 +317,6 @@ def test_worker_remaining_paths(tmp_path, monkeypatch):
     (w1/'pyproject.toml').write_text('')
     class OK: returncode=0; stdout=''; stderr=''
     monkeypatch.setattr(worker.subprocess,'run',lambda *a,**k:OK()); assert worker._verification_command(w1)[0][1:] == ['-m','pytest']
-    m=Maestro(w1); t=m.create_handoff('x','r','d')
-    class FAIL: returncode=1; stdout=''; stderr=''
-    calls=[]
-    def run(*a,**k): calls.append(a[0]); return FAIL()
-    monkeypatch.setattr(worker.subprocess,'run',run); assert worker.run_codex(m,t['task_id'],'implement',None)==1; m.close()
-
-def test_worker_main_dispatch(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); import maestro.worker as worker
-    monkeypatch.setattr(sys,'argv',['worker','implement','task-x','--workspace',str(w1)])
-    monkeypatch.setattr(worker.Maestro,'resolve_task',lambda self,x:x); monkeypatch.setattr(worker,'run_codex',lambda *a: 7)
-    assert worker.main()==7
-
-def test_mcp_rejected_review_and_main(monkeypatch):
-    import maestro.mcp_server as mod
-    calls=[]
-    class Fake:
-        def __init__(self): self.project_root=Path('/tmp/project')
-        def review(self,*a): return {'approved':False}
-        def fix_async(self,*a): calls.append(a); return {'pid':1}
-        def close(self): pass
-    monkeypatch.setattr(mod,'_instance',lambda ws:Fake()); assert 'fix' in mod.review_task('x','t','bad',False); assert calls
-    monkeypatch.setattr(mod,'mcp',type('M',(),{'run':lambda self: calls.append('run')})()); mod.main(); assert 'run' in calls
 
 def test_core_edge_branches(tmp_path, monkeypatch):
     env(tmp_path,monkeypatch); project,w1,_=git_repo(tmp_path); import maestro.core as core
@@ -444,7 +354,7 @@ def test_legacy_memvara_private_branches(tmp_path, monkeypatch):
     m.close()
 
 def test_claim_fallback_and_status_artifacts(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('x','r','d'); tid=t['task_id']
+    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'x'); tid=t['task_id']
     # Remove index workspace and task workspace claim; result path supplies workspace.
     idx=m._load_index(); idx[0]['workspace']=None; idx[0]['project_root']=None; m._save_index(idx)
     m.mem.remember(m._subject(tid),'task_workspace','')
@@ -456,21 +366,6 @@ def test_claim_fallback_and_status_artifacts(tmp_path, monkeypatch):
     assert Maestro._workspace_from_artifact_path('/tmp/nope/result.json') is None
     # Registry duplicate and missing status: list should skip invalid entries.
     idx=m._load_index(); idx.append({'number':99,'task_id':'task-missing','title':'missing','workspace':str(w1),'project_root':str(w1)}); m._save_index(idx); orig_status=m.status; m.status=lambda ref: (_ for _ in ()).throw(KeyError(ref)) if ref=='task-missing' else orig_status(ref); assert all(x['task_id']!='task-missing' for x in m.list_tasks())
-    m.close()
-
-def test_staged_remaining_errors(tmp_path, monkeypatch):
-    env(tmp_path,monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); s=m.staged_dir
-    p=s/'missing.json'
-    # nonexistent
-    with pytest.raises(ValueError): m._load_staged_handoff(p)
-    p.write_text('{bad');
-    with pytest.raises(ValueError): m._load_staged_handoff(p)
-    p.write_text('[]');
-    with pytest.raises(ValueError): m._load_staged_handoff(p)
-    p.write_text(json.dumps({'title':'t','request':'r','design_file':str(w1/'missing.md')}));
-    with pytest.raises(ValueError): m._load_staged_handoff(p)
-    d=w1/'real.md'; d.write_text('d'); outside=w1.parent/'outside.md'; outside.write_text('x'); p.write_text(json.dumps({'title':'t','request':'r','design_file':str(outside)}));
-    with pytest.raises(ValueError): m._load_staged_handoff(p)
     m.close()
 
 def test_final_branch_edges(tmp_path, monkeypatch):
@@ -504,7 +399,7 @@ def test_final_branch_edges(tmp_path, monkeypatch):
 
 def test_remaining_core_cli_coverage(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); project,w1,_=git_repo(tmp_path); m=Maestro(w1)
-    t=m.create_handoff('A','r','d'); tid=t['task_id']
+    t=_seed(m,'A'); tid=t['task_id']
     # Numeric resolution and live-claim-only resolution.
     assert m.resolve_task(str(t['task_number'])) == tid
     m._save_index([])
@@ -519,7 +414,7 @@ def test_remaining_core_cli_coverage(tmp_path, monkeypatch):
     assert cli.main() == 0
 
 def test_status_artifact_loop_exhausts_without_workspace(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=m.create_handoff('A','r','d'); tid=t['task_id']
+    env(tmp_path, monkeypatch); _,w1,_=git_repo(tmp_path); m=Maestro(w1); t=_seed(m,'A'); tid=t['task_id']
     m._save_index([{**m._load_index()[0], 'workspace': None}])
     for predicate in ('task_workspace','task_design','task_result','task_verification'):
         m._write_claim(tid, predicate, '')
@@ -543,70 +438,6 @@ def test_pyproject_version_is_release_version():
     assert data["project"]["version"] == "0.8.4"
 
 
-def test_codex_followup_delegates_without_claude_implementation(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _, w1, _ = git_repo(tmp_path); m = Maestro(w1)
-    task = m.create_handoff("A", "r", "design")
-    calls = []
-    monkeypatch.setattr(m, "launch", lambda task_id, action, review=None: calls.append((task_id, action, review)) or {"task_id": task_id, "action": action})
-    result = m.codex_followup(task["task_id"], "run the focused tests and fix any failures")
-    assert result["task_id"] == task["task_id"]
-    assert calls == [(task["task_id"], "followup", "run the focused tests and fix any failures")]
-    assert m.status(task["task_id"])["phase"] == "IMPLEMENTING"
-    m.close()
-
-
-def test_codex_followup_rejects_empty_instruction(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _, w1, _ = git_repo(tmp_path); m = Maestro(w1)
-    task = m.create_handoff("A", "r", "design")
-    with pytest.raises(ValueError, match="cannot be empty"):
-        m.codex_followup(task["task_id"], "   ")
-    m.close()
-
-
-def test_cli_codex_followup_command(tmp_path, monkeypatch, capsys):
-    env(tmp_path, monkeypatch); _, w1, _ = git_repo(tmp_path); m = Maestro(w1); task = m.create_handoff("A", "r", "design"); m.close()
-    from maestro import cli
-    monkeypatch.setattr(cli.Maestro, "codex_followup", lambda self, task_id, instruction: {"task_id": task_id, "instruction": instruction})
-    monkeypatch.setattr(sys, "argv", ["maestro", "codex-followup", task["task_id"], "fix tests", "--workspace", str(w1)])
-    assert cli.main() == 0
-    assert "fix tests" in capsys.readouterr().out
-
-
-def test_mcp_codex_followup_tool(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _, w1, _ = git_repo(tmp_path); m = Maestro(w1); task = m.create_handoff("A", "r", "design"); m.close()
-    import maestro.mcp_server as mod
-    class Fake:
-        def __init__(self): self.calls = []
-        def codex_followup(self, task_id, instruction): return {"task_id": task_id, "instruction": instruction}
-        def close(self): pass
-    fake = Fake(); monkeypatch.setattr(mod, "_instance", lambda ws: fake)
-    result = json.loads(mod.codex_followup(str(w1), task["task_id"], "fix tests"))
-    assert result["task_id"] == task["task_id"]
-
-
-def test_worker_main_accepts_followup_action(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _,w1,_=git_repo(tmp_path); import maestro.worker as worker
-    monkeypatch.setattr(sys,'argv',['worker','followup','task-x','--workspace',str(w1)])
-    monkeypatch.setattr(worker.Maestro,'resolve_task',lambda self,x:x)
-    monkeypatch.setattr(worker,'run_codex',lambda *a: 9)
-    assert worker.main()==9
-
-
-def test_worker_followup_mode_uses_instruction(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch); _, w1, _ = git_repo(tmp_path); m = Maestro(w1); task = m.create_handoff("A", "r", "design")
-    import maestro.worker as worker
-    class R:
-        returncode = 0; stdout = "ok"; stderr = ""
-    captured = {}
-    def run(cmd, **kwargs):
-        captured["input"] = kwargs.get("input", "")
-        return R()
-    monkeypatch.setattr(worker.subprocess, "run", run); monkeypatch.setattr(worker, "verify", lambda *a: True)
-    assert worker.run_codex(m, task["task_id"], "followup", "fix the flaky test") == 0
-    assert "FOLLOW-UP INSTRUCTION FROM CLAUDE" in captured["input"]
-    assert "fix the flaky test" in captured["input"]
-    m.close()
-
 def test_project_root_codex_config_overrides_user_for_worktree(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch)
     project, w1, _ = git_repo(tmp_path)
@@ -616,38 +447,4 @@ def test_project_root_codex_config_overrides_user_for_worktree(tmp_path, monkeyp
     (project / '.maestro' / 'config.toml').write_text('[codex]\nmodel="gpt-5.6-luna"\neffort="max"\n', encoding='utf-8')
     m = Maestro(w1)
     assert m.codex_defaults() == {'model': 'gpt-5.6-luna', 'effort': 'max'}
-    t = m.create_handoff('x', 'r', 'd')
-    assert t['model'] == 'gpt-5.6-luna'
-    assert t['effort'] == 'max'
-    st = m.status(t['task_id'])
-    assert st['model'] == 'gpt-5.6-luna'
-    assert st['effort'] == 'max'
-    m.close()
-
-
-def test_codex_worker_uses_persisted_model_and_effort(tmp_path, monkeypatch):
-    env(tmp_path, monkeypatch)
-    project, w1, _ = git_repo(tmp_path)
-    (project / '.maestro').mkdir(exist_ok=True)
-    (project / '.maestro' / 'config.toml').write_text('[codex]\nmodel="gpt-5.6-luna"\neffort="max"\n', encoding='utf-8')
-    m = Maestro(w1)
-    task = m.create_handoff('x', 'r', 'd')
-    import maestro.worker as worker
-    class R:
-        returncode = 0
-        stdout = 'ok'
-        stderr = ''
-    captured = {}
-    def run(cmd, **kwargs):
-        captured['cmd'] = cmd
-        return R()
-    monkeypatch.setattr(worker.subprocess, 'run', run)
-    monkeypatch.setattr(worker, 'verify', lambda *a: True)
-    assert worker.run_codex(m, task['task_id'], 'implement', None) == 0
-    # the fake run() also answers the flag probe with empty help -> current surface
-    assert captured['cmd'][0:2] == ['codex', 'exec']
-    assert '--approve-for-me' in captured['cmd'] or '--full-auto' in captured['cmd']
-    assert '--model' in captured['cmd']
-    assert captured['cmd'][captured['cmd'].index('--model') + 1] == 'gpt-5.6-luna'
-    assert 'model_reasoning_effort="max"' in captured['cmd']
     m.close()
