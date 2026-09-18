@@ -437,14 +437,13 @@ the project root.
 ## Deterministic verification
 
 After an agent finishes, Maestro runs a deterministic check before reporting
-completion. Selection order:
-
-1. `[verification] command` in `.maestro/config.toml`, if set.
-2. `make check` when a `Makefile` exists.
-3. Node projects with a `test` script (npm/pnpm/yarn per lockfile).
-4. Go → `go test ./...`; Rust → `cargo test`.
-5. Python → pytest, when installed.
-6. Fallback: `git diff --check`.
+completion: an auto-detected test command — `make check` when a `Makefile`
+exists, else the Node `test` script (npm/pnpm/yarn per lockfile), then Go,
+Cargo, or pytest — plus `git diff --check`, which always runs. Both must pass;
+when no runner is detected the check degrades to the whitespace check with an
+explicit note. The full report is saved per task (`verification.txt`). The
+handoff's `verification` field can switch this to an explicit command or skip
+it — see the [configuration reference](docs/usage/reference/configuration.md#verification-auto-detection).
 
 Maestro never installs dependencies or changes your tooling; a real non-zero
 result is recorded as a verification failure in the task record.
@@ -553,9 +552,11 @@ cd web && npm install && npm run build   # rewrites maestro/web_dist/
 ```
 
 The flagship end-to-end demo (full role swap, one command) is
-`examples/full-swap.sh`. Design rationale and the milestone history live in
-[docs/architecture-proposal.md](docs/architecture-proposal.md); agent onboarding
-recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
+`examples/full-swap.sh`. In-depth usage documentation — tutorials, how-to
+guides, reference, and design explanation — lives in
+[docs/usage/](docs/usage/README.md). Design rationale and the milestone history
+live in [docs/architecture-proposal.md](docs/architecture-proposal.md); agent
+onboarding recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
 ---
 
