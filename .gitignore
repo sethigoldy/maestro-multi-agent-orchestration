@@ -27,3 +27,9 @@ dist/
 # Maestro runtime state
 .maestro/*
 !.maestro/config.toml
+# Node (web console build deps; maestro/web_dist holds the committed build)
+node_modules/
+
+# Coverage artifacts
+coverage.json
+coverage.xml

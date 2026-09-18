@@ -509,6 +509,14 @@ python -m coverage run --branch -m pytest -q
 python -m coverage report --fail-under=100     # CI enforces 100% line+branch
 ```
 
+The web console's built artifacts are committed in `maestro/web_dist/`, so
+Node is **not** needed to use Maestro. To rebuild the console after changing
+`web/src/`:
+
+```bash
+cd web && npm install && npm run build   # rewrites maestro/web_dist/
+```
+
 The flagship end-to-end demo (full role swap, one command) is
 `examples/full-swap.sh`. Design rationale and the milestone history live in
 [docs/architecture-proposal.md](docs/architecture-proposal.md); agent onboarding
