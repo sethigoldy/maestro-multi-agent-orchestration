@@ -52,6 +52,36 @@ The durable-state backend. When absent, `MAESTRO_STORAGE` is used as a
 fallback. Switching backends for existing state: `maestro storage
 migrate-memvara`.
 
+### `[modes]` — work-mode presets
+
+```toml
+[modes.economy]
+implementer = "codex-mini"     # required — cheap model, low effort
+verifier    = "codex-mini"     # optional LLM verification pass
+reviewer    = "codex"          # expensive: verifies requested changes only
+fixer       = "codex-mini"     # optional → defaults to implementer
+max_bounces = 2                # optional → default 2; 0 = no auto-fix, park on first issue
+```
+
+Each `[modes.<name>]` table is one named preset pinning agents to the phases of
+a task cycle (see [Work modes in the README](../../../README.md#work-modes) and
+[Configure work modes](../how-to/configure-work-modes.md)). Keys:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `implementer` | string | — (required) | The agent that implements; becomes the task's target when the handoff sets no explicit target |
+| `verifier` | string | omitted | Optional LLM verification gate turn; deterministic verification always runs first and can never be overridden by it |
+| `reviewer` | string | omitted | LLM review gate turn over the diff of requested changes |
+| `fixer` | string | `implementer` | Agent for auto-fix bounces after a failed gate |
+| `max_bounces` | integer ≥ 0 | `2` | Cap on auto-fix bounces; `0` parks on the first issue |
+
+Validation at load: `[modes]` must be a table of preset tables, each with an
+`implementer`; unknown keys, non-string slot values, and non-integer/negative
+`max_bounces` are errors. Agent names are checked against the live registry at
+delegate time (presets are config, registries are state). Precedence follows
+the config chain: a project's `[modes.<name>]` table wins over the user-level
+one for that preset name. `maestro config` prints every defined preset.
+
 ## Verification auto-detection
 
 With handoff `verification = "auto"` (the default), the check command is

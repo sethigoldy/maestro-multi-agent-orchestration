@@ -244,7 +244,9 @@ class Maestro:
             command = [x for x in command.split() if x]
         elif command is not None and not (isinstance(command, list) and all(isinstance(x, str) for x in command)):
             raise ValueError("Verification command must be a string or list of strings")
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend}
+        from .modes import parse_modes
+
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes"))}
 
     def codex_defaults(self) -> dict[str, Any]:
         return {"model": self.config.get("model"), "effort": self.config.get("effort")}
@@ -303,7 +305,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request", "task_runtime"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request", "task_runtime", "task_gates"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)
@@ -414,6 +416,16 @@ class Maestro:
             try: result["task_number"]=int(claims["task_number"])
             except ValueError: pass
         if claims.get("task_title"): result["title"]=claims["task_title"]
+        gates_claim = claims.get("task_gates")
+        if gates_claim:
+            try: parsed_gates = json.loads(gates_claim)
+            except (ValueError, TypeError): parsed_gates = None
+            if isinstance(parsed_gates, dict):
+                verdicts = parsed_gates.get("verdicts")
+                if isinstance(verdicts, dict):
+                    result["gates"] = {role: {"agent": v.get("agent"), "ok": v.get("ok"), "issue_count": len(v.get("issues") or [])} for role, v in verdicts.items() if isinstance(v, dict)}
+                if parsed_gates.get("bounces") is not None:
+                    result["bounces"] = parsed_gates["bounces"]
         if not result["workspace"]:  # pragma: no branch
             for key in ("design","result","verification"):
                 result["workspace"]=self._workspace_from_artifact_path(result[key])

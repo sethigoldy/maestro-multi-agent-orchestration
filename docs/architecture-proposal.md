@@ -441,3 +441,29 @@ Every first-class adapter is event-driven by construction (codex JSON events,
 claude stream-json, pi RPC, Cline `--json`, OpenHands WebSocket). The 0.8.x
 pattern of the supervisor looping on `task_status` is retired; `task_status`
 remains for one-shot inspection, not as a wait mechanism.
+
+## 12. Addendum — work modes (post-M6)
+
+After M6, one capability gap remained: nothing in the engine expressed *which*
+agent runs each phase of a task cycle. "Cheap model implements, expensive model
+reviews" had to be orchestrated by hand across several delegations. Work modes
+close it with preset-driven per-phase routing:
+
+- A `[modes.<name>]` config table pins agents to the phases — `implementer`
+  (required), optional `verifier`, `reviewer`, `fixer`, and a `max_bounces`
+  cap. Presets are pure data in the existing config chain; agent names are
+  checked against the live registry at delegate time.
+- The handoff opts in with `[routing] mode = "NAME"` (or the explicit
+  `review_agent`/`verify_agent`/`fix_agent`/`max_bounces` fields, which beat
+  the preset per task). A task with no mode behaves byte-for-byte as before.
+- After the implementer: deterministic verification always first, then optional
+  LLM verifier/reviewer turns under a strict `VERDICT: PASS|FAIL` + `ISSUES:`
+  protocol; failures bounce to the fixer (re-verify, re-review) up to the cap,
+  then the task parks in `input-required` with the unresolved issues listed.
+- Invariants: an LLM verdict can add failures but never override a failed
+  deterministic check; self-review (`review_agent == target_agent`) is refused;
+  every gate/fix turn is a recorded attempt attributed to its agent, so
+  per-phase cost shows up in audits and budgets.
+
+Design spec: [docs/design-work-modes.md](design-work-modes.md). User guide:
+[Configure work modes](usage/how-to/configure-work-modes.md).

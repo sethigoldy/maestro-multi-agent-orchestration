@@ -3,7 +3,9 @@
 Every delegation between agents — human or machine — is normalized to this shape:
 
     [handoff]       what to do      (title, request, design, context pointers)
-    [routing]       who does it     (target_agent, fallback, origin_agent, parent_task)
+    [routing]       who does it     (target_agent, fallback, origin_agent, parent_task,
+                                     plus work-mode pins: mode, review_agent, verify_agent,
+                                     fix_agent, max_bounces — see maestro/modes.py)
     [expectations]  what done looks like (artifacts, verification, commit_policy, budget_hint)
     [constraints]   guardrails inherited from config (sensitive, max_depth_remaining)
 
@@ -37,6 +39,16 @@ class HandoffDoc:
     fallback: list[str] = field(default_factory=list)
     origin_agent: str = "human"
     parent_task_id: str | None = None
+    # Work-mode routing (see maestro/modes.py): a preset name plus per-phase agent
+    # pins. None means "not set" — the daemon resolves defaults at delegate time.
+    mode: str | None = None
+    review_agent: str | None = None
+    verify_agent: str | None = None
+    fix_agent: str | None = None
+    max_bounces: int | None = None
+    # Parse metadata (not serialized): True when the document itself named a target,
+    # so a work-mode preset does not silently override an explicit choice.
+    explicit_target: bool = False
     # [expectations]
     artifacts: list[str] = field(default_factory=lambda: ["code"])
     verification: str = "auto"
@@ -62,6 +74,11 @@ class HandoffDoc:
                 "fallback": list(self.fallback),
                 "origin_agent": self.origin_agent,
                 "parent_task_id": self.parent_task_id,
+                "mode": self.mode,
+                "review_agent": self.review_agent,
+                "verify_agent": self.verify_agent,
+                "fix_agent": self.fix_agent,
+                "max_bounces": self.max_bounces,
             },
             "expectations": {
                 "artifacts": list(self.artifacts),
@@ -90,6 +107,8 @@ def validate_handoff(doc: HandoffDoc) -> HandoffDoc:
         raise ValueError(f"verification must be one of {VERIFICATION_MODES}: {doc.verification!r}")
     if doc.max_depth_remaining < 0:
         raise ValueError("max_depth_remaining must be >= 0")
+    if doc.max_bounces is not None and (isinstance(doc.max_bounces, bool) or not isinstance(doc.max_bounces, int) or doc.max_bounces < 0):
+        raise ValueError("max_bounces must be an integer >= 0 when set")
     if doc.budget_hint is not None and float(doc.budget_hint) <= 0:
         raise ValueError("budget_hint must be positive when set")
     for agent in doc.fallback:
@@ -123,6 +142,12 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         fallback=[str(x) for x in routing.get("fallback", [])],
         origin_agent=str(routing.get("origin_agent") or "human"),
         parent_task_id=routing.get("parent_task_id"),
+        mode=routing.get("mode"),
+        review_agent=routing.get("review_agent"),
+        verify_agent=routing.get("verify_agent"),
+        fix_agent=routing.get("fix_agent"),
+        max_bounces=routing.get("max_bounces"),
+        explicit_target="target_agent" in routing,
         artifacts=[str(x) for x in expectations.get("artifacts", ["code"])],
         verification=str(expectations.get("verification") or "auto"),
         commit_policy=str(expectations.get("commit_policy") or "branch"),

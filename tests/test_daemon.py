@@ -1181,3 +1181,615 @@ def test_mcp_tools_keep_stable_signatures():
     # its MCP tools must stay removed — delegation goes through the daemon.
     for name in ("delegate_to_codex", "codex_followup", "review_task"):
         assert not hasattr(mcp_server, name), f"legacy MCP tool {name} must stay removed"
+
+
+# ------------------------------------------------------------------ work modes
+def _register_generic(daemon, binpath, name, body):
+    # The preflight version probe runs the binary with "--version" from the
+    # daemon's cwd, so side-effecting bodies must be guarded by the real
+    # invocation flag ("--go") or they pollute the checkout.
+    _fake_bin(binpath, name, f'[ "$1" = "--go" ] || exit 0\n{body}')
+    daemon.registry.save(AgentSpec(name=name, kind="generic", command=f"{name} --go"))
+
+
+def test_parse_verdict_protocol():
+    from maestro.daemon import parse_verdict
+
+    assert parse_verdict("blah\nVERDICT: PASS") == {"ok": True, "issues": []}
+    assert parse_verdict("verdict: pass") == {"ok": True, "issues": []}
+    text = "analysis\nVERDICT: FAIL\nISSUES:\n- one\n- two\ntrailing note"
+    assert parse_verdict(text) == {"ok": False, "issues": ["one", "two"]}
+    assert parse_verdict("VERDICT: FAIL\n- a\n* b\nplain line") == {"ok": False, "issues": ["a", "b"]}
+    assert parse_verdict("VERDICT: FAIL\n-x\nVERDICT: PASS") == {"ok": True, "issues": []}
+    assert parse_verdict("no verdict here") is None
+
+
+def test_work_mode_economy_end_to_end(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho implemented\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    md = final["metadata"]
+    assert md["target_agent"] == "impl"  # preset implementer took over the default target
+    assert md["gates"]["review"] == {"agent": "rev", "ok": True, "issues": []}
+    assert md["bounces"] == 0
+    assert [a["agent"] for a in md["attempts"]] == ["impl", "rev"]
+
+
+def test_work_mode_bounce_loop_fixes_then_passes(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\necho fixing\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\nif [ -f .reviewed ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; echo "ISSUES:"; echo "- missing tests"; touch .reviewed; fi\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    md = final["metadata"]
+    assert md["bounces"] == 1
+    assert [a["agent"] for a in md["attempts"]] == ["impl", "rev", "fixer", "rev"]
+    assert md["gates"]["review"] == {"agent": "rev", "ok": True, "issues": []}
+
+
+def test_work_mode_bounce_exhaustion_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- still broken"\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "still broken" in record["question"]
+    assert record["bounces"] == 2  # default cap
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev", "impl", "rev", "impl", "rev"]
+
+
+def test_work_mode_zero_bounces_parks_without_fix(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- nope"\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"zero": {"implementer": "impl", "reviewer": "rev", "max_bounces": 0}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="zero"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert record["bounces"] == 0
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev"]
+
+
+def test_work_mode_verifier_issues_join_bounce_loop(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "verif", 'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- untested edge"\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"both": {"implementer": "impl", "verifier": "verif", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="both"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    md = final["metadata"]
+    assert md["gates"]["verify"] == {"agent": "verif", "ok": False, "issues": ["untested edge"]}
+    assert md["gates"]["review"] == {"agent": "rev", "ok": True, "issues": []}
+    assert md["bounces"] == 1
+    # verifier runs once (first pass only); reviewer re-runs after the fix
+    assert [a["agent"] for a in md["attempts"]] == ["impl", "verif", "rev", "impl", "rev"]
+
+
+def test_work_mode_llm_cannot_override_failed_deterministic_check(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    ws = _git_repo(tmp_path)
+    (ws / "data.txt").write_text("ok\n", encoding="utf-8")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "-C", str(ws), "add", "data.txt"], text=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "data"], text=True, capture_output=True, env=env)
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nprintf "x \\n" >> data.txt\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"strict": {"implementer": "impl", "reviewer": "rev", "max_bounces": 0}})
+    started = daemon.delegate(_doc(verification="auto", mode="strict"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    # I1: the LLM verdict passed, but the failed deterministic check parks the task.
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "Deterministic verification: FAILED" in record["question"]
+    assert record["gates"]["review"]["ok"] is True
+
+
+def test_work_mode_unparseable_verdict_parks_without_bounce(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho "I think it is fine"\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "no parsable VERDICT line" in record["question"]
+    assert record["bounces"] == 0
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev"]
+
+
+def test_work_mode_delegate_validation(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    ws = _git_repo(tmp_path)
+    daemon.registry.save(AgentSpec(name="impl", kind="generic", command="impl --go"))
+    _fake_bin(binpath, "impl", 'cat > /dev/null\nexit 0')
+    with pytest.raises(ValueError, match="self-review"):
+        daemon.delegate(_doc(target_agent="impl", review_agent="impl"), ws)
+    for role, kw in (("verifier", {"verify_agent": "ghost"}), ("reviewer", {"review_agent": "ghost"}), ("fixer", {"fix_agent": "ghost"})):
+        with pytest.raises(ValueError, match=f"Unknown {role} agent 'ghost'"):
+            daemon.delegate(_doc(target_agent="impl", **kw), ws)
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl"}})
+    with pytest.raises(ValueError, match=r"Unknown work mode 'nope'. Defined modes: economy"):
+        daemon.delegate(_doc(mode="nope"), ws)
+    daemon.maestro.config["modes"] = parse_modes({"bad": {"implementer": "ghost-impl"}})
+    with pytest.raises(ValueError, match="Unknown implementer agent"):
+        daemon.delegate(_doc(mode="bad"), ws)
+
+
+def test_work_mode_explicit_target_beats_preset(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "other", 'cat > /dev/null\necho other did it\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy", target_agent="other", explicit_target=True), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    assert final["metadata"]["target_agent"] == "other"
+
+
+def test_work_mode_verifier_skipped_when_verification_none(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "verif", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"both": {"implementer": "impl", "verifier": "verif", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="none", mode="both"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    md = final["metadata"]
+    assert "verify" not in md["gates"] and md["gates"]["review"]["ok"] is True
+    assert [a["agent"] for a in md["attempts"]] == ["impl", "rev"]
+
+
+def test_work_mode_no_gates_keeps_legacy_behavior(daemon, tmp_path, binpath):
+    ws = _git_repo(tmp_path)
+    (ws / "data.txt").write_text("ok\n", encoding="utf-8")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "-C", str(ws), "add", "data.txt"], text=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "data"], text=True, capture_output=True, env=env)
+    # Guarded: the codex preflight probes "--version" and "exec --help" from
+    # the daemon's cwd; only the real run carries the stdin marker "-" (after
+    # the probed autonomy flags).
+    _fake_bin(binpath, "codex", 's=0; for a in "$@"; do [ "$a" = "-" ] && s=1; done; [ $s -eq 1 ] || exit 0\ncat > /dev/null\nprintf "x \\n" >> data.txt\nexit 0')
+    daemon.registry.save(AgentSpec(name="codex", kind="codex"))
+    started = daemon.delegate(_doc(verification="auto"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    # No gate agents: completion proceeds with the FAILED verification marker (legacy).
+    assert final["status"]["state"] == "completed"
+    assert "gates" not in final["metadata"]
+    claims = daemon.maestro._claims(started["task_id"])
+    assert claims["task_verification"].startswith("FAILED")
+
+
+def test_work_mode_gate_agent_unavailable_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    daemon.registry.save(AgentSpec(name="rev", kind="generic", command="/nonexistent/rev --go"))
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "failed preflight" in record["question"]
+    assert [a["agent"] for a in record["attempts"]] == ["impl"]
+
+
+def test_work_mode_gate_adapter_unavailable_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    # Bypass delegate-time validation: a gate agent whose kind has no adapter parks.
+    doc = _doc(verification="auto")
+    turn = daemon._gate_turn(started["task_id"], doc, ws, agent_name="badkind", role="reviewer", verification_ok=True, report_path=ws / "none.txt")
+    assert turn["parked"] is True and turn["ok"] is False and "unavailable" in turn["reason"]
+
+
+def test_work_mode_fix_turn_unavailable_parks(daemon, tmp_path, binpath):
+    doc = _doc(verification="auto")
+    ws = _git_repo(tmp_path)
+    daemon._tasks["ghost-fix"] = {"task_id": "ghost-fix", "state": "working"}
+    status, error = daemon._fix_turn("ghost-fix", doc, ws, "badkind", ["- x"], False, turn=1)
+    assert status == "parked" and "unavailable" in (error or "")
+
+
+def test_work_mode_gate_turn_failed_run_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho boom >&2\nexit 3')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "reviewer turn failed" in record["question"]
+
+
+def test_work_mode_gate_agent_question_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _fake_bin(binpath, "asker", 'cat > /dev/null\necho \'{"question": "which database?"}\'\nexit 0')
+    daemon.registry.save(AgentSpec(name="asker", kind="generic", command="asker --go", output_format="jsonl"))
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "asker"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "asked a question" in record["question"] and "which database?" in record["question"]
+
+
+def test_work_mode_fixer_unavailable_parks_mid_loop(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- broken"\nexit 0',
+    )
+    daemon.registry.save(AgentSpec(name="fixer", kind="generic", command="/nonexistent/fix --go"))
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "fixer agent 'fixer' failed preflight" in record["question"]
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev"]
+
+
+def test_work_mode_cancel_during_gate_does_not_park(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\nsleep 30\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    task_id = started["task_id"]
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        record = daemon._tasks.get(task_id) or {}
+        if record.get("verifying") and [a["agent"] for a in record.get("attempts", [])] == []:
+            break
+        time.sleep(0.05)
+    daemon.cancel(task_id, reason="stop the review")
+    final = daemon.wait(task_id, timeout=60)
+    assert final["status"]["state"] == "canceled"
+    record = daemon._tasks[task_id]
+    assert "question" not in record or record.get("question") is None
+
+
+def test_work_mode_followup_runs_under_fixer(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\ntouch .impl-ran\nexit 0')
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\ntouch .fixer-ran\nexit 0')
+    _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    assert daemon.wait(started["task_id"], timeout=60)["status"]["state"] == "completed"
+    followup = daemon.followup(started["task_id"], "polish the docs")
+    final = daemon.wait(followup["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    md = final["metadata"]
+    assert md["target_agent"] == "fixer"  # follow-ups resume under the pinned fixer
+    assert (ws / ".impl-ran").exists() and (ws / ".fixer-ran").exists()
+
+
+def test_work_mode_status_renders_gates_claim(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- nope"\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"zero": {"implementer": "impl", "reviewer": "rev", "max_bounces": 0}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="zero"), ws)
+    assert daemon.wait(started["task_id"], timeout=60)["status"]["state"] == "input-required"
+    status = daemon.maestro.status(started["task_id"])
+    assert status["gates"]["review"] == {"agent": "rev", "ok": False, "issue_count": 1}
+    assert status["bounces"] == 0
+
+
+def test_work_mode_status_ignores_malformed_gates_claim(daemon, tmp_path):
+    task_id = "task-20990101-000000-abcd12"
+    daemon.maestro._write_registry_record({"number": 1, "task_id": task_id, "title": "t", "created_at": "x", "workspace": str(tmp_path), "project_root": str(tmp_path)})
+    daemon.maestro._write_claim(task_id, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(task_id, "task_gates", "{not json")
+    status = daemon.maestro.status(task_id)
+    assert "gates" not in status and "bounces" not in status
+
+
+def test_config_file_modes_load_into_maestro(tmp_path):
+    from maestro.core import Maestro
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.toml").write_text(
+        '[modes.economy]\nimplementer = "impl"\nreviewer = "rev"\nmax_bounces = 1\n', encoding="utf-8"
+    )
+    import os as _os
+
+    old = _os.environ.get("MAESTRO_HOME")
+    _os.environ["MAESTRO_HOME"] = str(home)
+    try:
+        m = Maestro(tmp_path)
+        preset = m.config["modes"]["economy"]
+        assert (preset.implementer, preset.reviewer, preset.max_bounces) == ("impl", "rev", 1)
+        m.close()
+        (home / "config.toml").write_text('[modes.bad]\nreviewer = "rev"\n', encoding="utf-8")
+        with pytest.raises(ValueError, match="requires an 'implementer'"):
+            Maestro(tmp_path)
+    finally:
+        if old is None:
+            _os.environ.pop("MAESTRO_HOME", None)
+        else:
+            _os.environ["MAESTRO_HOME"] = old
+
+
+def test_cap_text_truncates_long_gate_text():
+    from maestro.daemon import _cap_text
+
+    out = _cap_text("x" * 30_000)
+    assert len(out) < 30_000 and out.endswith("\n...[truncated 10000 chars]")
+
+
+def test_verification_excerpt_unreadable_report(tmp_path):
+    from maestro.daemon import _verification_excerpt
+
+    report = tmp_path / "v.txt"
+    report.write_text("x", encoding="utf-8")
+    report.chmod(0)
+    try:
+        assert _verification_excerpt(report) == "(verification report unreadable)"
+    finally:
+        report.chmod(0o644)
+
+
+def test_write_gates_claim_without_live_record(daemon):
+    daemon._write_gates_claim("ghost-gates", {"review": {"agent": "r", "ok": True, "issues": []}}, 1)
+    claims = daemon.maestro._claims("ghost-gates")
+    assert json.loads(claims["task_gates"])["bounces"] == 1
+
+
+def test_work_mode_verifier_failure_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "verif", 'cat > /dev/null\necho boom >&2\nexit 4')
+    daemon.maestro.config["modes"] = parse_modes({"v": {"implementer": "impl", "verifier": "verif"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="v"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "verifier turn failed" in record["question"]
+    # The gates claim is written before the state flip: parkers never observe a parked task without verdicts.
+    assert record["gates"]["verify"]["ok"] is False and record["bounces"] == 0
+
+
+def test_work_mode_det_failure_bounce_without_reviewer(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    ws = _git_repo(tmp_path)
+    (ws / "data.txt").write_text("ok\n", encoding="utf-8")
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    subprocess.run(["git", "-C", str(ws), "add", "data.txt"], text=True, capture_output=True, env=env)
+    subprocess.run(["git", "-C", str(ws), "commit", "-qm", "data"], text=True, capture_output=True, env=env)
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nprintf "x \\n" >> data.txt\nexit 0')
+    _register_generic(daemon, binpath, "verif", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"v": {"implementer": "impl", "verifier": "verif", "max_bounces": 1}})
+    started = daemon.delegate(_doc(verification="auto", mode="v"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "Deterministic verification: FAILED" in record["question"]
+    # No reviewer configured: the bounce loop re-verifies deterministically only.
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "verif", "impl"]
+
+
+def test_work_mode_fixer_failure_feeds_next_review(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\necho fix failed >&2\nexit 7')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- broken"\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer", "max_bounces": 1}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert any("previous fix attempt by 'fixer' failed" in line for line in record["question"].splitlines())
+    assert "- broken" in record["question"]
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev", "fixer", "rev"]
+
+
+def test_work_mode_cancel_during_fix_turn(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- broken"\nexit 0',
+    )
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\nsleep 30\nexit 0')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    task_id = started["task_id"]
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        record = daemon._tasks.get(task_id) or {}
+        if [a["agent"] for a in record.get("attempts", [])] == ["impl", "rev"]:
+            break
+        time.sleep(0.05)
+    daemon.cancel(task_id, reason="stop the fix")
+    final = daemon.wait(task_id, timeout=60)
+    assert final["status"]["state"] == "canceled"
+
+
+def test_work_mode_cancel_during_re_review(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\necho fixed\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\nif [ -f .reviewed ]; then sleep 30; else echo "VERDICT: FAIL"; echo "ISSUES:"; echo "- x"; touch .reviewed; fi\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    task_id = started["task_id"]
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        record = daemon._tasks.get(task_id) or {}
+        if [a["agent"] for a in record.get("attempts", [])] == ["impl", "rev", "fixer"]:
+            break
+        time.sleep(0.05)
+    daemon.cancel(task_id, reason="stop the re-review")
+    final = daemon.wait(task_id, timeout=60)
+    assert final["status"]["state"] == "canceled"
+
+
+def test_work_mode_re_review_failure_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\necho fixed\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\nif [ -f .reviewed ]; then echo boom >&2; exit 3; else echo "VERDICT: FAIL"; echo "ISSUES:"; echo "- x"; touch .reviewed; fi\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "reviewer turn failed" in record["question"]
+    assert [a["agent"] for a in record["attempts"]] == ["impl", "rev", "fixer", "rev"]
+
+
+def test_work_mode_fixer_question_parks(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(
+        daemon, binpath, "rev",
+        'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- broken"\nexit 0',
+    )
+    _fake_bin(binpath, "askfixer", 'cat > /dev/null\necho \'{"question": "which branch strategy?"}\'\nexit 0')
+    daemon.registry.save(AgentSpec(name="askfixer", kind="generic", command="askfixer --go", output_format="jsonl"))
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "askfixer"}})
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+    record = daemon._tasks[started["task_id"]]
+    assert "askfixer" in record["question"] and "which branch strategy?" in record["question"]
+
+
+def test_work_mode_gate_turn_output_edge_cases(daemon, tmp_path, binpath, monkeypatch):
+    from maestro import daemon as daemon_module
+    from maestro.adapters.base import AdapterPreflight, AdapterResult
+
+    class _StubAdapter:
+        def __init__(self, result):
+            self._result = result
+
+        def preflight(self):
+            return AdapterPreflight(ok=True)
+
+        def run(self, prompt, workspace, task_id, settings=None, timeout=None, log_dir=None, on_line=None, should_cancel=None):
+            return self._result
+
+    ws = _git_repo(tmp_path)
+    doc = _doc(verification="auto")
+
+    # No output path at all: the verdict parse sees empty text and parks.
+    daemon._tasks["ghost-out1"] = {"task_id": "ghost-out1", "state": "working"}
+    monkeypatch.setattr(daemon_module, "make_adapter", lambda spec: _StubAdapter(AdapterResult(ok=True)))
+    turn = daemon._gate_turn("ghost-out1", doc, ws, agent_name="x", role="reviewer", verification_ok=True, report_path=ws / "none.txt")
+    assert turn["parked"] is True and "no parsable VERDICT" in turn["reason"]
+
+    # Unreadable output file: the OSError path falls back to empty text.
+    daemon._tasks["ghost-out2"] = {"task_id": "ghost-out2", "state": "working"}
+    monkeypatch.setattr(daemon_module, "make_adapter", lambda spec: _StubAdapter(AdapterResult(ok=True, output_path=str(tmp_path / "missing.log"))))
+    turn = daemon._gate_turn("ghost-out2", doc, ws, agent_name="x", role="reviewer", verification_ok=True, report_path=ws / "none.txt")
+    assert turn["parked"] is True and "no parsable VERDICT" in turn["reason"]
+
+
+def test_work_mode_status_partial_gates_claims(daemon, tmp_path):
+    # verdicts not a dict: no gates rendered, bounces still shown.
+    tid1 = "task-20990101-000001-abcd13"
+    daemon.maestro._write_registry_record({"number": 1, "task_id": tid1, "title": "t", "created_at": "x", "workspace": str(tmp_path), "project_root": str(tmp_path)})
+    daemon.maestro._write_claim(tid1, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(tid1, "task_gates", json.dumps({"verdicts": [1], "bounces": 3}))
+    s1 = daemon.maestro.status(tid1)
+    assert "gates" not in s1 and s1["bounces"] == 3
+
+    # Valid verdicts without a bounces key.
+    tid2 = "task-20990101-000002-abcd14"
+    daemon.maestro._write_registry_record({"number": 2, "task_id": tid2, "title": "t", "created_at": "x", "workspace": str(tmp_path), "project_root": str(tmp_path)})
+    daemon.maestro._write_claim(tid2, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(tid2, "task_gates", json.dumps({"verdicts": {"review": {"agent": "r", "ok": True, "issues": []}}}))
+    s2 = daemon.maestro.status(tid2)
+    assert s2["gates"]["review"] == {"agent": "r", "ok": True, "issue_count": 0} and "bounces" not in s2

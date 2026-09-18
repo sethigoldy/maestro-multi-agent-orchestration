@@ -145,3 +145,34 @@ def test_load_handoff_file_rejects_json_array(tmp_path):
     p.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
     with pytest.raises(ValueError, match="object"):
         load_handoff_file(p)
+
+
+# ------------------------------------------------------------------ work modes
+def test_work_mode_fields_round_trip_dict():
+    doc = _doc(mode="economy", review_agent="rev", verify_agent="ver", fix_agent="fix", max_bounces=3, explicit_target=True)
+    data = doc.to_dict()
+    routing = data["routing"]
+    assert (routing["mode"], routing["review_agent"], routing["verify_agent"], routing["fix_agent"], routing["max_bounces"]) == ("economy", "rev", "ver", "fix", 3)
+    back = from_dict(data)
+    assert (back.mode, back.review_agent, back.verify_agent, back.fix_agent, back.max_bounces) == ("economy", "rev", "ver", "fix", 3)
+    assert back.explicit_target is True
+
+
+def test_work_mode_fields_absent_default_to_none():
+    doc = from_dict({"handoff": {"title": "t", "request": "r"}, "routing": {}, "expectations": {}, "constraints": {}})
+    assert (doc.mode, doc.review_agent, doc.verify_agent, doc.fix_agent, doc.max_bounces) == (None, None, None, None, None)
+    assert doc.explicit_target is False
+
+
+def test_work_mode_fields_toml_round_trip():
+    doc = _doc(mode="economy", review_agent="rev", max_bounces=1)
+    back = from_toml(to_toml(doc))
+    assert (back.mode, back.review_agent, back.verify_agent, back.fix_agent, back.max_bounces) == ("economy", "rev", None, None, 1)
+
+
+def test_max_bounces_validation():
+    with pytest.raises(ValueError, match="max_bounces"):
+        validate_handoff(_doc(max_bounces=-1))
+    with pytest.raises(ValueError, match="max_bounces"):
+        validate_handoff(_doc(max_bounces=True))  # bool is not an int here
+    assert validate_handoff(_doc(max_bounces=0)).max_bounces == 0

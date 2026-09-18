@@ -136,3 +136,78 @@ def test_agents_cli_lifecycle(monkeypatch, tmp_path, capsys):
 
     assert run("agents", "remove", "ghost") == 2
     assert "not registered" in capsys.readouterr().err
+
+
+def _delegate_capture(monkeypatch):
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
+    captured = {}
+
+    def fake_post(url, method, payload, token=None):
+        captured["payload"] = payload
+        return {"task": {"id": "task-x"}}
+
+    monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: 0)
+    return captured
+
+
+def test_delegate_mode_flag_in_payload(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _delegate_capture(monkeypatch)
+    rc = cli.main(["delegate", "--title", "T", "--request", "R", "--mode", "economy"])
+    assert rc == 0
+    data = captured["payload"]["message"]["parts"][0]["data"]
+    assert data["routing"]["mode"] == "economy"
+    assert "mode=economy" in capsys.readouterr().out
+
+
+def test_delegate_mode_flag_with_target(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _delegate_capture(monkeypatch)
+    rc = cli.main(["delegate", "--title", "T", "--request", "R", "--target", "mine", "--mode", "economy"])
+    assert rc == 0
+    data = captured["payload"]["message"]["parts"][0]["data"]
+    assert data["routing"]["mode"] == "economy" and data["routing"]["target_agent"] == "mine"
+
+
+def test_delegate_mode_overrides_file_mode(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    handoff = tmp_path / "h.toml"
+    handoff.write_text('[handoff]\ntitle = "T"\nrequest = "R"\n[routing]\nmode = "other"\n', encoding="utf-8")
+    captured = _delegate_capture(monkeypatch)
+    rc = cli.main(["delegate", "--file", str(handoff), "--mode", "economy"])
+    assert rc == 0
+    data = captured["payload"]["message"]["parts"][0]["data"]
+    assert data["routing"]["mode"] == "economy"
+
+
+def test_delegate_mode_requires_title_and_request(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    _delegate_capture(monkeypatch)
+    rc = cli.main(["delegate", "--mode", "economy"])
+    assert rc == 2
+
+
+def test_config_lists_modes(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    (home / "config.toml").write_text(
+        '[modes.economy]\nimplementer = "impl"\nreviewer = "rev"\nmax_bounces = 1\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["config"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["modes"]["economy"] == {"implementer": "impl", "verifier": None, "reviewer": "rev", "fixer": None, "max_bounces": 1}
+
+
+def test_config_without_modes_key(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["config"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["modes"] == {}
