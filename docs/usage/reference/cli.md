@@ -100,7 +100,7 @@ Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
 | `list` | Prints JSON array of tasks (`task_id`, number, title, phase, workspace). Without a scope flag or `$MAESTRO_WORKSPACE`: all user-level tasks. With `--project`: tasks of that project. With an explicit `--workspace`: the project's tasks if the path is a project root or a `.claude/worktrees` parent, else exactly that workspace |
 | `status` / `show` | Prints one task's state as JSON (see [Inspect tasks and artifacts](../how-to/inspect-tasks-and-artifacts.md#read-one-tasks-state) for the fields). Accepts a full task id or a numeric task number. Unknown references exit 2 |
 | `tail` | Live-follows one task's event stream over SSE (no polling). `--all` follows the global stream instead of one task; with `--all` the exit code is always 0 (absent Ctrl-C) |
-| `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), accumulated usage, error, and parsed result files. Works after daemon restarts |
+| `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), the composed context entries (`context`, with their sources), accumulated usage, error, and parsed result files. Works after daemon restarts |
 
 ## dashboard
 

@@ -380,6 +380,10 @@ Full field reference:
 Precedence (most specific wins): `~/.maestro/config.toml` →
 `<project-root>/.maestro/config.toml` → `<active-worktree>/.maestro/config.toml`.
 
+The daemon reads config at startup — restart it after editing a config file for
+changes to take effect (`maestro config` always shows the current files, even if
+a running daemon is still holding older values).
+
 ```toml
 [codex]
 model = "gpt-5.6-luna"

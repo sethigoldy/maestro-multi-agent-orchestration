@@ -300,6 +300,34 @@ def test_cli_task_audit(live_daemon, tmp_path, monkeypatch):
     assert payload["state"] in {"completed", "COMPLETE"}
     assert payload["attempts"] and payload["attempts"][0]["agent"] == "codex"
     assert any(r.get("ok") for r in payload["results"])
+    # No context entries on this task: the key is present but empty.
+    assert payload["context"] == []
+
+
+def test_cli_task_audit_shows_composed_context(live_daemon, tmp_path, monkeypatch):
+    from maestro import cli as clic
+
+    bp = tmp_path / "bin"
+    bp.mkdir()
+    _fake_bin(bp, "codex", 'cat > /dev/null\necho ok\nexit 0')
+    monkeypatch.setenv("PATH", f"{bp}{os.pathsep}{os.environ['PATH']}")
+
+    # Standing entry injected via the config seam (mirrors [context.<label>] tables).
+    from maestro.context import ContextEntry
+    live_daemon.maestro.config["context"] = {"style": ContextEntry(label="style", kind="text", text="Standing rule.", source="user config")}
+
+    ws = _git_repo(tmp_path)
+    started = live_daemon.delegate(_doc(context_entries=[{"label": "spec", "kind": "text", "text": "Per-task note."}]), ws)
+    live_daemon.wait(started["task_id"], timeout=60)
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(clic.sys, "stdout", type("S", (), {"write": lambda self, s: captured.__setitem__("out", (captured.get("out") or "") + s), "flush": lambda self: None})())
+    code = clic.main(["task", "audit", started["task_id"]])
+    payload = json.loads(str(captured.get("out") or "{}"))
+    assert code == 0
+    labels = [(e["label"], e["source"]) for e in payload["context"]]
+    # Composed at delegate time: standing config entry first, handoff entry after.
+    assert labels == [("style", "user config"), ("spec", "handoff")]
 
 
 def test_cli_gc_dry_run_and_delete(live_daemon, tmp_path, monkeypatch):
