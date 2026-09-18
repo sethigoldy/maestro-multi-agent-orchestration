@@ -37,12 +37,14 @@ path   = "~/skills/pdf-processing"  # directory containing SKILL.md
 phases = ["implementer"]         # optional — default: all phases
 ```
 
-- `text` entries inline the instruction verbatim.
-- `file` entries (a `path`, no `kind`) inline the file when it is ≤8KB,
-  otherwise copy it to the task directory and hand the agent a path reference.
-- `skill` entries stage a hermetic copy of the skill directory into the task;
-  Claude Code targets discover it via `--add-dir`, every other agent receives a
-  "read its SKILL.md and follow it" line in the prompt.
+Pick the kind that matches what you have:
+
+- `text` — an instruction you write inline (the default when only `text` is set)
+- `file` — an existing document the agent should read (a `path`; no `kind` needed)
+- `skill` — a reusable [Agent Skills](https://agentskills.io/) directory
+
+Field semantics, size caps, and how each kind reaches the agent are in the
+[configuration reference](../reference/configuration.md#context--standing-context-entries).
 
 Verify what Maestro sees:
 
@@ -102,8 +104,8 @@ passed via `--append-system-prompt-file`) and `context/skills/.claude/skills/…
 - **Phases:** `implementer`, `verifier`, `reviewer` (default: all). Fix bounces
   and follow-ups are implementer-phase turns, so implementer-scoped entries reach
   them too.
-- **Trust:** context is data — Maestro stages and references files but never
-  executes context content. Treat a skill like installing software: only point
-  entries at directories you manage.
+- **Trust:** treat a skill like installing software — only point entries at
+  directories you manage. Maestro itself never executes context content (see
+  [How delegation works](../explanation/how-delegation-works.md#context-injection)).
 - The legacy `design`, `context_notes`, and `context_files` handoff fields are
   unchanged; use `[[context]]` for new work.

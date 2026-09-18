@@ -255,10 +255,12 @@ Two invariants keep it safe:
 
 The one adapter-specific detail: for Claude Code targets, standing entries ride
 in the system prompt (`--append-system-prompt-file`) instead of the task
-message, and staged skills are passed via `--add-dir` (the discovery mechanism
-of the [Agent Skills open standard](https://agentskills.io/)). Every other
-adapter receives everything as a labeled block in the prompt — same data,
-different channel.
+message — because they are config-level instructions that apply across every
+task in scope, not part of this task's request; per-task handoff entries stay
+in the user block with the request. Staged skills are passed via `--add-dir`
+(the discovery mechanism of the [Agent Skills open standard](https://agentskills.io/)).
+Maestro's other adapters pass everything as a labeled block in the prompt —
+same data, different channel.
 
 ## Retries, fallbacks, and money
 
