@@ -811,7 +811,12 @@ def test_start_queued_sensitive_promotion(daemon, tmp_path):
     assert record["state"] == "input-required" and record["attempts"] == []
 
 
-def test_set_state_none_data_skipped(daemon, tmp_path):
+def test_set_state_none_data_skipped(daemon, tmp_path, binpath):
+    # Fake long-running binary: without it, preflight fails instantly on
+    # machines without codex and the background thread can mark the task
+    # failed before cancel() runs (race); with a real codex installed this
+    # would launch the actual agent (not hermetic).
+    _fake_bin(binpath, "codex", 'cat > /dev/null\ni=0\nwhile [ $i -lt 200 ]; do echo tick; sleep 0.1; i=$((i+1)); done')
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(title="none data"), ws)
     record = daemon._tasks[started["task_id"]]
