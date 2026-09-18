@@ -45,6 +45,21 @@ Field notes:
 - **`workspace_policy`** — `cwd` (default) runs the process with the workspace
   as its working directory; `flag` is for CLIs that need an explicit path flag.
 
+## Specific-agent notes (build-time research log)
+
+The three entries below are onboarding research done for specific agents at
+build time. They are kept because each illustrates a **different outcome** you
+can hit when evaluating an agent — not because their onboarding is special:
+
+| Agent | Status | What it illustrates |
+|---|---|---|
+| [OpenClaw](#openclaw--verified) | Verified recipe | A complete, tested generic-spec entry (nothing exotic — just the pattern above, confirmed against the real CLI) |
+| [Kilo Code](#kilo-code--ide-resident-mcp-host-path) | Documented dead-end | When spawn delegation is impossible (no headless CLI) and the productive direction is reversed: the agent becomes an MCP *host* instead |
+| [omp](#omp--entry-point-unverified) | Unverified stub | What to do when docs can't be verified at build time: record a template, verify on an installed machine first |
+
+Most agents need none of these — just the generic spec above. Read only the
+entry matching your situation.
+
 ## OpenClaw — verified
 
 Entry point (docs.openclaw.ai/cli/agent): `openclaw agent exec` is the
