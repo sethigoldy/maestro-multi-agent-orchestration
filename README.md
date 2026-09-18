@@ -60,10 +60,10 @@ their default binary. Register an agent when you want a custom name or settings:
 
 ```bash
 # A CLI with a first-class adapter, under your own name (e.g. custom binary/model):
-maestro agents add my-copilot --kind copilot
+maestro agents add --name my-copilot --kind copilot
 
 # Any other CLI, via the generic spec (see "Onboarding any CLI"):
-maestro agents add openclaw --kind generic \
+maestro agents add --name openclaw --kind generic \
   --command "openclaw agent exec --json --message-file -" \
   --input-mode stdin --output-format jsonl
 ```
@@ -165,8 +165,8 @@ That's the whole loop: **register agents → start daemon → delegate → watch
 
 Each kind knows how to launch its CLI, stream output, and parse usage. Use the
 kind name directly as `--target` (the binary must be on your `PATH` and
-authenticated); register a named entry with `maestro agents add <name> --kind
-<kind>` when you want an alias or per-agent settings. `maestro agents discover`
+authenticated); register a named entry with `maestro agents add --name <name> --kind <kind>`
+when you want an alias or per-agent settings. `maestro agents discover`
 finds whatever is installed, and `maestro agents status <name>` shows exactly
 what preflight will see before you delegate.
 
@@ -188,7 +188,7 @@ Anything that can run non-interactively from a shell works as `kind = "generic"`
 — no code, just a registry entry:
 
 ```bash
-maestro agents add mytool --kind generic \
+maestro agents add --name mytool --kind generic \
   --command "mytool run --json {prompt}"     # or pipe the prompt instead:
   --input-mode arg                          #   --input-mode stdin
   --output-format jsonl                     # text | jsonl | rpc
@@ -208,18 +208,49 @@ Full recipes and a verification checklist for new agents:
 
 **Another Maestro daemon (`a2a_remote`).** Daemons can delegate to each other
 over the A2A protocol — this is how you build a small agent cluster. The full
-handoff document travels with the request, so routing survives the hop:
+handoff document travels with the request, so routing survives the hop.
+
+The remote daemon must be reachable from your machine: by default daemons only
+listen on loopback, so start it bound to the network first (see "Cross-machine
+setup" below). Then register it — note the command is a URL, not a binary, and
+the token is the one printed by the remote daemon at startup:
 
 ```bash
-# On machine A, register machine B's daemon (note: it's a URL, not a binary):
-maestro agents add remote-b --kind a2a_remote --command http://10.0.0.5:8790
+# On machine A, register machine B's daemon:
+maestro agents add --name remote-b --kind a2a_remote \
+  --command http://10.0.0.5:8790 --token <printed-by-B>
+maestro agents status remote-b     # live check: fetches B's agent card
 maestro delegate --title "…" --request "…" --target remote-b --workspace /path/to/repo
 ```
 
 Maestro checks the remote's agent card before delegating, streams its output
 and usage live, and forwards cancellation. If the remote daemon has no free
 workspace slot it queues the task — Maestro reports that as a clear error rather
-than hanging.
+than hanging. A missing/wrong token fails fast with "HTTP 401 — check this
+agent's token".
+
+### Cross-machine setup
+
+Three things make a daemon reachable from other machines:
+
+```bash
+# 1. Bind to the network (default is loopback-only):
+maestro-daemon --bind 0.0.0.0        # all interfaces; prints its LAN IP + a token
+
+# 2. Share the token with whoever/whatever will connect.
+#    A token is generated automatically when you bind beyond loopback; set
+#    MAESTRO_DAEMON_TOKEN to choose your own (stable across restarts).
+
+# 3. Point the other side at it: an a2a_remote agent entry (above), or
+#    MAESTRO_DAEMON_URL=http://host:port + MAESTRO_DAEMON_TOKEN for CLI use.
+```
+
+Security notes: the token gates every data endpoint (task list, event streams,
+JSON-RPC mutations); the console's static files stay public so the app can load.
+Open the web console from another machine as `http://host:port/?token=<t>` —
+the token is captured into the browser session and stripped from the address
+bar. Discovery announcements never carry tokens; register peers you want to
+delegate to with their token via `agents add`.
 
 **REST task servers (`api` mode).** A generic agent whose command is an `http(s)`
 URL switches to API mode automatically: Maestro submits, polls for status, and
@@ -241,9 +272,14 @@ or `canceled`. The base URL can also come from per-agent settings
 
 When daemons share a network, they find each other automatically. In plain
 terms: every daemon periodically gives a small "I'm here!" shout (UDP multicast
-on port 9786) carrying its name and HTTP port; every other daemon that hears it
+on port 9786) carrying its name, HTTP port, and the host it's reachable on —
+its LAN IP when bound to all interfaces; every other daemon that hears it
 records the peer in `~/.maestro/peers.json`. Peers heard recently are **live**;
 a peer silent for ~15 seconds is marked **stale**.
+
+Peers are an *informational* roster — they tell you what's on the network. To
+actually delegate to a discovered daemon, register it as an agent with its
+token (see "Remote agents" above).
 
 ```bash
 maestro peers list                 # discovered + manually added peers, with status
@@ -311,7 +347,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 
 | Command | What it does |
 |---|---|
-| `maestro-daemon [--port N] [--state-dir DIR]` | Start the local broker daemon |
+| `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | Start the broker daemon. `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
 | `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
 | `maestro task list [--project DIR]` | List tasks (number or id) |
@@ -361,6 +397,7 @@ backend = "filesystem"    # filesystem (default) | memvara
 | `MAESTRO_HOME` | `~/.maestro` | State directory (registry, tasks, claims, peers, daemon marker) |
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for task commands |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Point CLI commands at a specific daemon (e.g. another machine's) |
+| `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that daemon; also the token a daemon uses when it generates one on a non-loopback bind |
 | `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before falling back |
 | `MAESTRO_BACKOFF_S` | `1.0` | Seconds between retries |
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP server waits for a delegated task |
@@ -382,7 +419,7 @@ project or worktree:
 ~/.maestro/                      (or $MAESTRO_HOME)
 ├── registry.json                # registered agents
 ├── state.jsonl                  # durable claim journal (task history)
-├── daemon.json                  # which daemon is running (port, pid)
+├── daemon.json                  # which daemon is running (host, port, pid; token when auth is on)
 ├── peers.json                   # discovered/registered peers
 ├── config.toml                  # user-level config
 └── tasks/<task-id>/             # per-task artifacts (logs, results)
