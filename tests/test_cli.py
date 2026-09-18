@@ -116,6 +116,14 @@ def test_agents_cli_lifecycle(monkeypatch, tmp_path, capsys):
     assert run("agents", "status", "ghost") == 0
     assert json.loads(capsys.readouterr().out) == {"name": "ghost", "registered": False}
 
+    assert run("agents", "add", "--name", "remote-b", "--kind", "a2a_remote",
+               "--command", "http://10.0.0.5:8790", "--token", "sekrit") == 0
+    remote = json.loads(capsys.readouterr().out)
+    assert remote["kind"] == "a2a_remote" and remote["command"] == "http://10.0.0.5:8790"
+    assert remote["token"] == "sekrit"
+    assert run("agents", "remove", "remote-b") == 0
+    capsys.readouterr()
+
     assert run("agents", "add", "--name", "mycli", "--kind", "generic",
                "--command", "mycli --run {prompt}", "--input-mode", "stdin",
                "--output-format", "jsonl", "--workspace-policy", "flag") == 0

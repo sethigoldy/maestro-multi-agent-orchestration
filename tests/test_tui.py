@@ -539,3 +539,113 @@ def test_tui_main_dispatch(tmp_path, monkeypatch):
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         assert t.main([]) == 1  # stale marker -> ValueError from _daemon_url
+
+
+# ------------------------------------------------------------ bearer-token support
+
+def _authed_sse_server(tmp_path, token: str):
+    """Fake daemon that 401s /tasks and /events without the right Bearer token."""
+    seen: list[str | None] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _ok(self) -> bool:
+            seen.append(self.headers.get("Authorization"))
+            return self.headers.get("Authorization") == f"Bearer {token}"
+
+        def do_GET(self):
+            if not self._ok():
+                body = json.dumps({"error": "unauthorized"}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if self.path == "/tasks":
+                body = json.dumps({"tasks": [{"id": "task-1", "status": {"state": "submitted"}, "metadata": {"title": "T"}}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif self.path == "/events":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                try:
+                    while True:
+                        time.sleep(0.2)
+                except OSError:
+                    pass
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.server_address[1]}", seen
+
+
+def test_load_tasks_sends_bearer_token(tmp_path):
+    server, url, seen = _authed_sse_server(tmp_path, "sekrit")
+    try:
+        with pytest.raises(Exception):  # no token -> 401
+            tui.load_tasks(url)
+        tasks = tui.load_tasks(url, token="sekrit")
+        assert tasks[0]["task_id"] == "task-1"
+        assert seen[-1] == "Bearer sekrit"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_with_token_streams_events(tmp_path):
+    server, url, seen = _authed_sse_server(tmp_path, "sekrit")
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, token="sekrit", stdin=_PipeStdin(b"j" + b"q", delay_s=0.3), stdout=out, is_tty=lambda: True)
+        assert rc == 0 and "T" in out.getvalue()
+        assert any(h == "Bearer sekrit" for h in seen)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_without_token_against_authed_daemon_fails(tmp_path):
+    server, url, _ = _authed_sse_server(tmp_path, "sekrit")
+    try:
+        import contextlib
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = tui.run(url, stdin=_PipeStdin(b""), stdout=io.StringIO(), is_tty=lambda: True)
+        assert rc == 1 and "cannot reach" in err.getvalue()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cli_main_uses_marker_token(tmp_path, monkeypatch):
+    # tui.main resolves the token from the daemon marker (or env) and passes it on
+    import maestro.tui as tui_mod
+
+    calls: dict = {}
+
+    def fake_run(url, *, token=None, **kw):
+        calls["url"], calls["token"] = url, token
+        return 0
+
+    monkeypatch.setattr(tui_mod, "run", fake_run)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "daemon.json").write_text(
+        json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.1", "token": "mk-token"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
+    assert tui_mod.main([]) == 0
+    assert calls == {"url": "http://127.0.0.1:8790", "token": "mk-token"}

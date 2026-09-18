@@ -58,3 +58,43 @@ def test_bundle_has_no_polling():
     js = bundle.read_text(encoding="utf-8")
     assert "setInterval" not in js
     assert "EventSource" in js
+    # token support for non-loopback daemons must be compiled into the bundle
+    assert "maestro_token" in js
+
+
+def test_auth_module_token_flow():
+    node = _node()
+    if node is None:
+        import pytest
+
+        pytest.skip("node not available; JS auth module not tested")
+    auth_js = REPO_ROOT / "web" / "src" / "lib" / "auth.js"
+    script = f"""
+import {{ initToken, authHeaders, withToken }} from {json.dumps(str(auth_js))};
+// minimal DOM stand-ins
+globalThis.sessionStorage = new Map();
+sessionStorage.getItem = (k) => (sessionStorage.has(k) ? sessionStorage.get(k) : null);
+sessionStorage.setItem = (k, v) => sessionStorage.set(k, v);
+let replaced = null;
+globalThis.window = {{
+  location: {{ href: "http://10.0.0.5:8790/?token=abc%20def" }},
+  history: {{ replaceState: (state, title, url) => {{ replaced = url; }} }},
+}};
+const assert = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+// no token yet -> headers empty, paths untouched
+assert(JSON.stringify(authHeaders()) === "{{}}", "no token headers");
+assert(withToken("/tasks") === "/tasks", "no token path");
+const tok = initToken();
+assert(tok === "abc def", "initToken decodes ?token= got " + tok);
+assert(replaced === "http://10.0.0.5:8790/", "address bar stripped, got " + replaced);
+// token now flows into headers and EventSource URLs
+const h = authHeaders();
+assert(h["Authorization"] === "Bearer abc def", "bearer header");
+assert(withToken("/events") === "/events?token=" + encodeURIComponent("abc def"), "eventsource url");
+console.log("ok");
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0 and "ok" in result.stdout, result.stderr

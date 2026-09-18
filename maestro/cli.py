@@ -97,45 +97,56 @@ def _task_workspace(value: str | None) -> Path:
 
 # ---------------------------------------------------------------- daemon clients
 
-def _daemon_url() -> str:
-    """Find the local broker: MAESTRO_DAEMON_URL, else the daemon.json marker.
+def _daemon_endpoint() -> tuple[str, str | None]:
+    """Find the local broker and return ``(base_url, token)``.
 
-    The marker is written by whichever broker started last (a standalone
-    ``maestro-daemon`` or an MCP server's embedded daemon); a stale marker from
-    a dead process is rejected so callers get a clear error instead of a
-    connection failure mid-stream.
+    Resolution: ``MAESTRO_DAEMON_URL`` (with an optional ``MAESTRO_DAEMON_TOKEN``),
+    else the daemon.json marker written by whichever broker started last (a
+    standalone ``maestro-daemon`` or an MCP server's embedded daemon). A stale
+    marker from a dead process is rejected so callers get a clear error instead
+    of a connection failure mid-stream. Non-loopback daemons record their auth
+    token in the marker, so local CLI calls are authorized automatically.
     """
     env = os.environ.get("MAESTRO_DAEMON_URL", "").strip()
     if env:
-        return env.rstrip("/")
+        return env.rstrip("/"), os.environ.get("MAESTRO_DAEMON_TOKEN") or None
     try:
         info = json.loads((maestro_user_dir() / "daemon.json").read_text(encoding="utf-8"))
         pid = int(info["pid"])
         os.kill(pid, 0)  # liveness check; raises if the broker is gone
-        return f"http://127.0.0.1:{int(info['port'])}"
+        host = str(info.get("host") or "127.0.0.1")
+        return f"http://{host}:{int(info['port'])}", info.get("token") or None
     except (OSError, ValueError, KeyError, TypeError):
         raise ValueError("no daemon reachable — start one with 'maestro-daemon' or set MAESTRO_DAEMON_URL") from None
 
 
-def _post_jsonrpc(url: str, method: str, params: dict[str, Any]) -> Any:
+def _daemon_url() -> str:
+    return _daemon_endpoint()[0]
+
+
+def _daemon_token() -> str | None:
+    return _daemon_endpoint()[1]
+
+
+def _post_jsonrpc(url: str, method: str, params: dict[str, Any], token: str | None = None) -> Any:
     from .a2a_client import post_jsonrpc
 
-    return post_jsonrpc(url, method, params)
+    return post_jsonrpc(url, method, params, token=token)
 
 
-def _sse_events(url: str, path: str):
+def _sse_events(url: str, path: str, token: str | None = None):
     """Yield ``(event_name, data_dict)`` from an SSE endpoint (see a2a_client)."""
     from .a2a_client import sse_events
 
-    yield from sse_events(url, path)
+    yield from sse_events(url, path, token=token)
 
 
-def _stream_task(url: str, task_id: str | None) -> int:
+def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int:
     """Follow one task (or the global stream when task_id is None) live."""
     path = f"/tasks/{task_id}/events" if task_id else "/events"
     final_state: str | None = None
     try:
-        for event, envelope in _sse_events(url, path):
+        for event, envelope in _sse_events(url, path, token=token):
             data = envelope.get("data") or {}  # TaskEvent.to_dict nests the payload under "data"
             if event == "output":
                 print(data.get("line", ""), flush=True)
@@ -176,12 +187,12 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
             title=args.title, request=args.request, design=design,
             target_agent=args.target, fallback=list(args.fallback),
         )
-    url = _daemon_url()
+    url, token = _daemon_endpoint()
     result = _post_jsonrpc(url, "message/send", {"message": {
         "kind": "message", "role": "user",
         "parts": [{"kind": "data", "data": doc.to_dict()}],
         "metadata": {"maestro": {"workspace": workspace}},
-    }})
+    }}, token=token)
     task = (result or {}).get("task") or {}
     task_id = task.get("id")
     if not task_id:  # queued behind an active task in this workspace
@@ -191,7 +202,7 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0
     print(f"[task] {task_id} — target={doc.target_agent} workspace={workspace}", flush=True)
-    return _stream_task(url, task_id)
+    return _stream_task(url, task_id, token=token)
 
 
 def _cmd_task_audit(args: argparse.Namespace) -> int:
@@ -436,6 +447,7 @@ def main(argv: list[str] | None = None) -> int:
     agents_add.add_argument("--input-mode", choices=["arg", "stdin"], default="arg")
     agents_add.add_argument("--output-format", choices=["text", "jsonl", "rpc"], default="text")
     agents_add.add_argument("--workspace-policy", choices=["cwd", "flag"], default="cwd")
+    agents_add.add_argument("--token", default=None, help="Bearer token for remote daemons (a2a_remote / api agents on non-loopback binds)")
     agents_remove = agents_sub.add_parser("remove", help="Unregister an agent")
     agents_remove.add_argument("name")
     agents_discover = agents_sub.add_parser("discover", help="Scan PATH for known agent CLIs")
@@ -459,7 +471,7 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 1
-            return tui.run(url)
+            return tui.run(url, token=_daemon_token())
         if args.cmd == "peers":
             return _cmd_peers(args)
         if args.cmd == "budgets":
@@ -467,7 +479,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "task" and args.task_cmd == "tail":
             url = _daemon_url()
             target_id = None if args.all else args.task_id
-            return _stream_task(url, target_id)
+            return _stream_task(url, target_id, token=_daemon_token())
         if args.cmd == "task" and args.task_cmd == "audit":
             return _cmd_task_audit(args)
 
@@ -503,7 +515,7 @@ def main(argv: list[str] | None = None) -> int:
                     name=args.name, kind=args.kind, display_name=args.display_name,
                     skills=list(args.skill), command=args.command,
                     input_mode=args.input_mode, output_format=args.output_format,
-                    workspace_policy=args.workspace_policy,
+                    workspace_policy=args.workspace_policy, token=args.token,
                 )
                 registry.save(spec)
                 print(json.dumps(registry.get(args.name).to_dict(), indent=2)); return 0

@@ -373,6 +373,32 @@ def test_daemon_url_env_override(tmp_path, monkeypatch):
     assert clic._daemon_url() == "http://127.0.0.1:9"
 
 
+def test_daemon_endpoint_env_token_pair(tmp_path, monkeypatch):
+    from maestro import cli as clic
+
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://10.0.0.5:8790/")
+    monkeypatch.setenv("MAESTRO_DAEMON_TOKEN", "env-token")
+    assert clic._daemon_endpoint() == ("http://10.0.0.5:8790", "env-token")
+    monkeypatch.delenv("MAESTRO_DAEMON_TOKEN")
+    assert clic._daemon_endpoint() == ("http://10.0.0.5:8790", None)
+
+
+def test_daemon_endpoint_marker_host_and_token(tmp_path, monkeypatch):
+    from maestro import cli as clic
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "daemon.json").write_text(
+        json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.2", "token": "mk-token"}), encoding="utf-8"
+    )
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
+    assert clic._daemon_endpoint() == ("http://127.0.0.2:8790", "mk-token")
+    # marker without host/token (loopback daemon) still resolves
+    (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": 8791}), encoding="utf-8")
+    assert clic._daemon_endpoint() == ("http://127.0.0.1:8791", None)
+
+
 def test_full_swap_demo_script_is_valid():
     script = Path(__file__).resolve().parent.parent / "examples" / "full-swap.sh"
     assert script.is_file()
@@ -445,7 +471,7 @@ def test_sse_events_parses_all_line_kinds(tmp_path):
 def test_stream_task_keyboard_interrupt(tmp_path, monkeypatch):
     from maestro import cli as clic
 
-    def boom(url, path):
+    def boom(url, path, token=None):
         yield ("output", {"data": {"line": "x"}})
         raise KeyboardInterrupt
 

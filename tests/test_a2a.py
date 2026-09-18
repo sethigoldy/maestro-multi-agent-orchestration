@@ -15,9 +15,17 @@ from maestro.a2a import (
 )
 
 
+class _FakeRegistry:
+    """Empty registry: nothing is resolvable locally (hop-name re-targeting applies)."""
+
+    def get(self, name):
+        return None
+
+
 class FakeDaemon:
     def __init__(self):
         self.calls = []
+        self.registry = _FakeRegistry()
 
     def default_target(self):
         return "codex"
@@ -197,3 +205,45 @@ def test_send_data_part_without_sections_falls_back_to_text():
 def test_tasks_cancel_empty_id():
     resp = _dispatch().handle(_req("tasks/cancel", {"id": ""}))
     assert resp["error"]["code"] == ERR_INVALID_PARAMS
+
+
+def test_send_retargets_unresolvable_hop_name_to_local_default():
+    """Cross-machine semantics: a handoff whose target is the remote hop name
+    (unknown locally) runs under this daemon's default agent."""
+    d = _dispatch()
+    doc_msg = {
+        "kind": "message",
+        "role": "user",
+        "parts": [
+            {"kind": "data", "data": {
+                "handoff": {"title": "Hop work", "request": "Do it"},
+                "routing": {"target_agent": "remote-b", "origin_agent": "human"},
+            }}
+        ],
+        "metadata": {"maestro": {"workspace": "/ws"}},
+    }
+    resp = d.handle(_req("message/send", {"message": doc_msg}))
+    assert "error" not in resp, resp
+    (kind, doc, ws) = d.daemon.calls[0]
+    assert kind == "delegate" and ws == "/ws"
+    assert doc.target_agent == "codex"  # re-targeted from the hop name
+
+
+def test_send_keeps_resolvable_builtin_target():
+    """A target that is a builtin kind (e.g. codex) runs as-is — no re-targeting."""
+    d = _dispatch()
+    doc_msg = {
+        "kind": "message",
+        "role": "user",
+        "parts": [
+            {"kind": "data", "data": {
+                "handoff": {"title": "Direct work", "request": "Do it"},
+                "routing": {"target_agent": "codex", "origin_agent": "human"},
+            }}
+        ],
+        "metadata": {"maestro": {"workspace": "/ws"}},
+    }
+    resp = d.handle(_req("message/send", {"message": doc_msg}))
+    assert "error" not in resp, resp
+    (kind, doc, ws) = d.daemon.calls[0]
+    assert doc.target_agent == "codex"

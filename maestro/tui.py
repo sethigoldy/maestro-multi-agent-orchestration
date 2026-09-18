@@ -59,8 +59,9 @@ def normalize(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_tasks(url: str) -> list[dict[str, Any]]:
-    with urllib.request.urlopen(f"{url}/tasks", timeout=10) as resp:
+def load_tasks(url: str, token: str | None = None) -> list[dict[str, Any]]:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    with urllib.request.urlopen(urllib.request.Request(f"{url}/tasks", headers=headers), timeout=10) as resp:
         body = json.loads(resp.read().decode("utf-8"))
     return [normalize(r) for r in body.get("tasks") or []]
 
@@ -222,6 +223,7 @@ def run(
     stdin: Any | None = None,
     stdout: Any | None = None,
     is_tty: Callable[[], bool] | None = None,
+    token: str | None = None,
 ) -> int:
     """Run the dashboard until the user quits. Returns a process exit code."""
     if is_tty is None:
@@ -234,7 +236,7 @@ def run(
     stdin = stdin or sys.stdin.buffer
     state = _State()
     try:
-        state.tasks = load_tasks(url)
+        state.tasks = load_tasks(url, token=token)
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"cannot reach the daemon at {url}: {exc}", file=sys.stderr)
         return 1
@@ -244,7 +246,8 @@ def run(
     try:
         conn = http.client.HTTPConnection(url.split("//", 1)[1], timeout=None)
         try:
-            conn.request("GET", "/events")
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            conn.request("GET", "/events", headers=headers)
             response = conn.getresponse()
         except (OSError, http.client.HTTPException) as exc:
             print(f"cannot reach the daemon at {url}: {exc}", file=sys.stderr)
@@ -320,11 +323,11 @@ def run(
 
 
 def main(argv: list[str] | None = None) -> int:
-    from .cli import _daemon_url
+    from .cli import _daemon_token, _daemon_url
 
     try:
         url = _daemon_url()
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    return run(url)
+    return run(url, token=_daemon_token())

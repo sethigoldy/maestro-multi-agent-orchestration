@@ -814,3 +814,125 @@ def test_api_mode_output_without_observer(tmp_path):
         assert result.ok
     finally:
         srv.close()
+
+
+# ------------------------------------------------------------ bearer-token support
+
+class _AuthServer:
+    """Captures Authorization headers; requires a shared token when set."""
+
+    def __init__(self, tmp_path, token: str | None = None):
+        self.token = token
+        self.seen_headers: list[dict] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            outer = self
+
+            def log_message(self, *a):
+                pass
+
+            def _check(self) -> bool:
+                self.outer.seen_headers.append({"Authorization": self.headers.get("Authorization")})
+                if self.outer.token is None:
+                    return True
+                return self.headers.get("Authorization") == f"Bearer {self.outer.token}"
+
+            def _deny(self):
+                body = json.dumps({"error": "unauthorized"}).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if not self._check():
+                    self._deny()
+                    return
+                body = json.dumps({"name": "auth-node", "version": "1.0"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                if not self._check():
+                    self._deny()
+                    return
+                length = int(self.headers.get("Content-Length", 0))
+                self.rfile.read(length)
+                out = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"task": {"kind": "task", "id": "r-1", "status": {"state": "submitted"}}}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def test_a2a_client_sends_bearer_token(tmp_path):
+    srv = _AuthServer(tmp_path, token="sekrit")
+    try:
+        card = fetch_agent_card(srv.url, token="sekrit")
+        assert card["name"] == "auth-node"
+        result = post_jsonrpc(srv.url, "message/send", {}, token="sekrit")
+        assert result["task"]["id"] == "r-1"
+        assert all(h["Authorization"] == "Bearer sekrit" for h in srv.seen_headers)
+    finally:
+        srv.close()
+    # no token -> no Authorization header at all (loopback daemons accept it)
+    open_srv = _AuthServer(tmp_path, token=None)
+    try:
+        fetch_agent_card(open_srv.url)
+        assert all(h["Authorization"] is None for h in open_srv.seen_headers)
+    finally:
+        open_srv.close()
+
+
+def test_a2a_client_401_raises_token_hint(tmp_path):
+    srv = _AuthServer(tmp_path, token="sekrit")
+    try:
+        with pytest.raises(ValueError, match="agent card request rejected \(HTTP 401"):
+            fetch_agent_card(srv.url)
+        with pytest.raises(ValueError, match="remote rejected the request \(HTTP 401"):
+            post_jsonrpc(srv.url, "message/send", {})
+    finally:
+        srv.close()
+
+
+def test_a2a_remote_preflight_uses_spec_token(tmp_path):
+    srv = _AuthServer(tmp_path, token="sekrit")
+    try:
+        ok = A2ARemoteAdapter(AgentSpec(name="r", kind="a2a_remote", command=srv.url, token="sekrit")).preflight()
+        assert ok.ok and ok.version == "auth-node 1.0"
+        bad = A2ARemoteAdapter(AgentSpec(name="r", kind="a2a_remote", command=srv.url)).preflight()
+        assert not bad.ok and "401" in (bad.error or "")
+    finally:
+        srv.close()
+
+
+def test_a2a_remote_run_uses_settings_token(tmp_path):
+    # message/send must carry the token from settings; the fake server 401s otherwise.
+    srv = _AuthServer(tmp_path, token="sekrit")
+    spec = AgentSpec(name="r", kind="a2a_remote", command=srv.url)
+    adapter = A2ARemoteAdapter(spec)
+    try:
+        # without a token the send itself is rejected before any SSE work
+        res = adapter.run("p", tmp_path, "t1", settings={}, timeout=5)
+        assert not res.ok and "401" in (res.error or "")
+        with_token = adapter.run("p", tmp_path, "t1", settings={"token": "sekrit"}, timeout=5)
+        # the send succeeded (200); the stream then 401s/404s — either way the
+        # request itself was authorized, which is what this test pins down.
+        assert any(h["Authorization"] == "Bearer sekrit" for h in srv.seen_headers)
+        assert with_token.duration_s >= 0
+    finally:
+        srv.close()

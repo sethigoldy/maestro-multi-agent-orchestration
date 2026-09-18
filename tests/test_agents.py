@@ -206,11 +206,10 @@ def test_status_generic_uses_command_binary(monkeypatch, tmp_path):
     assert status["binary"] == "mycli" and status["found"] is True and status["version"] == "mycli 0.1"
 
 
-def test_status_a2a_remote_has_no_binary(tmp_path):
+def test_status_a2a_remote_requires_url_on_save(tmp_path):
     reg = AgentRegistry(tmp_path)
-    reg.save(AgentSpec(name="remote", kind="a2a_remote"))
-    status = reg.status("remote")
-    assert status["binary"] is None and status["found"] is False and status["version"] is None
+    with pytest.raises(ValueError, match=r"http\(s\) base URL"):
+        reg.save(AgentSpec(name="remote", kind="a2a_remote"))
 
 
 def test_probe_version_none_and_errors(tmp_path):
@@ -255,3 +254,114 @@ def test_to_dict_includes_optional_settings():
     spec = AgentSpec(name="x", kind="codex", model="gpt-x", effort="high", timeout_s=120.0)
     data = spec.to_dict()
     assert data["model"] == "gpt-x" and data["effort"] == "high" and data["timeout_s"] == 120.0
+
+
+# ------------------------------------------------------------ cross-machine: token + a2a_remote persistence
+
+def test_a2a_remote_spec_roundtrips_command_and_token(tmp_path):
+    reg = AgentRegistry(tmp_path)
+    spec = AgentSpec(name="remote-b", kind="a2a_remote", command="http://10.0.0.5:8790", token="sekrit")
+    reg.save(spec)
+    loaded = reg.get("remote-b")
+    assert loaded is not None and loaded.kind == "a2a_remote"
+    assert loaded.command == "http://10.0.0.5:8790" and loaded.token == "sekrit"
+    # generic specs still roundtrip their command too
+    gen = AgentSpec(name="g", kind=GENERIC_KIND, command="echo hi")
+    reg.save(gen)
+    assert reg.get("g").command == "echo hi"
+
+
+def test_a2a_remote_requires_http_url(tmp_path):
+    with pytest.raises(ValueError, match="http\\(s\\) base URL"):
+        validate_agent_spec(AgentSpec(name="bad", kind="a2a_remote", command="not-a-url"))
+    with pytest.raises(ValueError, match="http\\(s\\) base URL"):
+        AgentRegistry(tmp_path).save(AgentSpec(name="bad2", kind="a2a_remote", command=None))
+
+
+def test_to_dict_token_only_when_set():
+    assert "token" not in AgentSpec(name="x", kind="codex").to_dict()
+    data = AgentSpec(name="x", kind="a2a_remote", command="http://h:1", token="t").to_dict()
+    assert data["token"] == "t" and data["command"] == "http://h:1"
+
+
+def test_registry_status_url_agent_reachable(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import json as _json
+    import threading
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = _json.dumps({"name": "node", "version": "9"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        reg = AgentRegistry(tmp_path)
+        reg.save(AgentSpec(name="remote-b", kind="a2a_remote", command=f"http://127.0.0.1:{srv.server_address[1]}"))
+        st = reg.status("remote-b")
+        assert st["reachable"] is True and st["url"].startswith("http://127.0.0.1:")
+        assert st["version"] == "node 9" and "error" not in st or st.get("error") is None
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_registry_status_url_agent_401_reports_error(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import json as _json
+    import threading
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = _json.dumps({"error": "unauthorized"}).encode()
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        reg = AgentRegistry(tmp_path)
+        reg.save(AgentSpec(name="locked", kind="a2a_remote", command=f"http://127.0.0.1:{srv.server_address[1]}"))
+        st = reg.status("locked")
+        assert st["reachable"] is False and "401" in (st.get("error") or "")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_registry_status_api_mode_unreachable(tmp_path):
+    # api mode with an unreachable URL: preflight probes it — reports unreachable, no crash
+    reg = AgentRegistry(tmp_path)
+    spec = AgentSpec(name="api-x", kind=GENERIC_KIND, command="http://127.0.0.1:1")
+    reg.save(spec)
+    st = reg.status("api-x")
+    assert st["reachable"] is False and "unreachable" in (st.get("error") or "").lower()
+
+
+def test_registry_status_url_agent_adapter_exception(tmp_path, monkeypatch):
+    # a spec that passes validation but whose adapter construction fails: status
+    # reports the error instead of crashing the CLI
+    import maestro.adapters as adapters_mod
+
+    def boom(spec):
+        raise RuntimeError("adapter exploded")
+
+    monkeypatch.setattr(adapters_mod, "make_adapter", boom)
+    reg = AgentRegistry(tmp_path)
+    reg.save(AgentSpec(name="remote-b", kind="a2a_remote", command="http://127.0.0.1:1"))
+    st = reg.status("remote-b")
+    assert st["reachable"] is False and "adapter exploded" in (st.get("error") or "")

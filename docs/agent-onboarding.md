@@ -7,7 +7,7 @@ Three ways an agent can join, from least to most effort:
    name; no config beyond that:
 
    ```bash
-   maestro agents add my-copilot --kind copilot
+   maestro agents add --name my-copilot --kind copilot
    ```
 
 2. **Generic spec** — any other CLI, configured declaratively (this page).
@@ -16,7 +16,7 @@ Three ways an agent can join, from least to most effort:
    "Remote agents" section for the exact contract and examples.
 
 Registry entries live under `~/.maestro/agents/<name>.toml`. Register from the
-CLI with `maestro agents add <name> --kind generic …`, or drop a TOML file in
+CLI with `maestro agents add --name <name> --kind generic …`, or drop a TOML file in
 place. Preflight checks the binary + version before any delegation, so a wrong
 entry fails fast instead of silently misbehaving.
 
