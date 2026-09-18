@@ -1,5 +1,16 @@
 from __future__ import annotations
 import sys, types
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _pin_discovery_to_loopback(monkeypatch):
+    """Daemons start UDP presence by default; keep test traffic on loopback."""
+    monkeypatch.setenv("MAESTRO_DISCOVERY_TTL", "0")
+    monkeypatch.setenv("MAESTRO_DISCOVERY_IF", "127.0.0.1")
+
+
 class FakeFastMCP:
     def __init__(self, name): self.name=name; self.tools={}
     def tool(self):

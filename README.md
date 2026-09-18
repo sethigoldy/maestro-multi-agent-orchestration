@@ -1,806 +1,537 @@
 # Maestro
 
-**Claude supervises. Codex implements. Maestro keeps the work durable.**
+**Delegate coding work to any agent — and keep track of it all.**
 
-Maestro is a local multi-agent orchestration layer designed to run behind [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Maestro is a local orchestration layer that runs coding agents (Codex, Claude
+Code, the GitHub Copilot CLI, Cursor, OpenHands, …) on your behalf. It gives you:
 
-You normally talk only to Claude:
+- **Durable tasks** — every delegation is recorded with its full history
+  (attempts, output, cost, errors) and survives restarts.
+- **Any agent as a target** — first-class adapters for the major CLIs, plus a
+  generic spec for anything else, REST task servers, and even *another Maestro*
+  on another machine.
+- **Automatic fallback** — if an agent fails or isn't available, Maestro tries
+  your fallback chain instead of dying.
+- **Live visibility** — a web console, a terminal dashboard, and live-tail
+  commands, all event-driven (no polling).
+- **Cost tracking and budget caps** — usage is recorded per attempt; optional
+  per-agent and daily USD caps block new work when the budget is spent.
 
-```text
-You
- │
- ▼
-Claude Code
- │
- │ understands request
- │ creates compact design
- │
- ▼
-Maestro
- │
- │ persists task state
- │ starts Codex
- │
- ▼
-Codex
- │
- │ implements
- │ runs focused checks
- │
- ▼
-Maestro
- │
- │ deterministic verification
- │
- ▼
-Claude Code
- │
- ├── approve → complete
- │
- └── reject → Codex follow-up/fix → verify → review
-```
+You can use Maestro two ways:
 
-Claude is the supervisor and reviewer. Codex owns implementation, testing, debugging, refactoring, and mechanical changes. Maestro provides the durable task lifecycle and the bridge between them.
+| Path | Who it's for | How |
+|---|---|---|
+| **Through Claude Code** | You want an agent to supervise agents | Claude calls Maestro over MCP; you just talk to Claude |
+| **Directly** | You want to drive it yourself (CI, ops, no supervisor) | Start the daemon, use the `maestro` CLI or the web console |
 
-You normally **do not need to run Maestro manually**.
+Both paths share the same daemon, state, and commands. This guide covers both,
+starting with the direct path since it's the foundation.
 
 ---
 
-## 1. What you need
+## Quickstart (5 minutes)
 
-Before installing Maestro, make sure you have:
+### 1. Install
 
-* Python **3.11 or newer**
-* [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
-* [Codex CLI](https://github.com/openai/codex)
-
-Check that Claude and Codex are available:
+Requirements: **Python 3.11+**, and at least one coding-agent CLI you want to
+use (e.g. `codex`, `claude`, `copilot`) installed and authenticated with its
+normal setup flow.
 
 ```bash
-claude --version
-codex --version
-```
-
-Authenticate both CLIs using their normal setup flow.
-
----
-
-## 2. Install Maestro
-
-Clone the repository and enter it:
-
-```bash
-git clone https://github.com/sethigoldy/multi-agent-orchestration.git
-cd multi-agent-orchestration
-```
-
-Create a virtual environment:
-
-```bash
+git clone https://github.com/sethigoldy/maestro-multi-agent-orchestration.git
+cd maestro-multi-agent-orchestration
 python3.11 -m venv .venv
-source .venv/bin/activate
-```
-
-On Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-Upgrade packaging tools and install Maestro:
-
-```bash
+source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install -e .
+maestro --version                  # sanity check
 ```
 
-Verify the installation:
+### 2. See which agents you can use
 
 ```bash
-maestro --version
+maestro agents discover            # scans your PATH for known agent CLIs
+maestro agents list                # shows what's registered
 ```
+
+Registration is per-user and lives in `~/.maestro`. Built-in kinds can be used
+as `--target` directly without any registration — the daemon resolves them to
+their default binary. Register an agent when you want a custom name or settings:
+
+```bash
+# A CLI with a first-class adapter, under your own name (e.g. custom binary/model):
+maestro agents add my-copilot --kind copilot
+
+# Any other CLI, via the generic spec (see "Onboarding any CLI"):
+maestro agents add openclaw --kind generic \
+  --command "openclaw agent exec --json --message-file -" \
+  --input-mode stdin --output-format jsonl
+```
+
+`maestro agents status <name>` shows whether an agent is ready (binary found,
+version checked) before you delegate to it.
+
+### 3. Start the daemon
+
+The daemon is the local broker: it runs tasks, streams events, and serves the
+web console.
+
+```bash
+maestro-daemon                     # prints its port; writes ~/.maestro/daemon.json
+```
+
+Leave it running in a terminal (or a service manager). `--port 0` picks a free
+port; `--state-dir DIR` points it at an alternate state directory.
+
+### 4. Delegate your first task
+
+```bash
+maestro delegate \
+  --title "Fix the failing test" \
+  --request "Find and fix the failing unit test in tests/, then rerun the suite." \
+  --target codex \
+  --fallback copilot \
+  --workspace /path/to/your/repo
+```
+
+This blocks and streams the agent's output live. Add `--no-wait` to return
+immediately with the task id, or point at a handoff file instead of flags:
+
+```bash
+maestro delegate --file handoff.toml --workspace /path/to/your/repo
+```
+
+### 5. Watch it work
+
+While a task runs (or after it finishes):
+
+```bash
+# Terminal dashboard — full-screen, live (j/k move, q quits)
+maestro dashboard
+
+# Live-tail one task's output stream (or --all for everything)
+maestro task tail <task-id>
+
+# The durable record: attempts, usage/cost, errors, result files
+maestro task audit <task-id>
+```
+
+And in a browser: **`http://127.0.0.1:<port>/`** — the web console shows all
+tasks, live output, costs, and per-attempt detail (see the port printed by
+`maestro-daemon`).
+
+That's the whole loop: **register agents → start daemon → delegate → watch.**
 
 ---
 
-## 3. Configure Claude Code
+## Core concepts (plain terms)
 
-Maestro is exposed to Claude Code through the project's `.mcp.json`.
-
-The repository should contain:
-
-```json
-{
-  "mcpServers": {
-    "maestro": {
-      "command": "scripts/maestro-mcp"
-    }
-  }
-}
-```
-
-The launcher uses the repository's virtual environment:
-
-```text
-<maestro-repository>/.venv/bin/python
-```
-
-so Claude Code and your local Maestro CLI use the same Python environment.
-
-Make sure the launcher is executable:
-
-```bash
-chmod +x scripts/maestro-mcp
-```
-
-You can verify it exists:
-
-```bash
-ls -l scripts/maestro-mcp
-```
-
-The project also contains `.claude/settings.json` with permission for Maestro's MCP tools.
-
-Start Claude Code from the repository/project where you want to use Maestro. Approve the project MCP server when Claude Code asks.
+- **Daemon** — one long-running process (`maestro-daemon`) that owns a state
+  directory and an HTTP API. Everything else talks to it. One daemon per
+  machine is the norm; several can coexist with different `--state-dir`s.
+- **Handoff** — the work order: title, request, optional design, target agent,
+  fallback chain, verification policy. You create one via CLI flags, a TOML/JSON
+  file, or (in the MCP path) Claude creates it for you.
+- **Task lifecycle** — each handoff becomes a task that moves through
+  `submitted → working → completed` (or `failed` / `canceled`). One active task
+  per workspace; extra work queues FIFO and starts when the slot frees.
+- **Fallback chain** — `--target codex --fallback copilot --fallback hermes`
+  means: try Codex; if it fails or isn't available, try Copilot; then Hermes.
+  Each attempt is recorded, including its cost (failed work still costs money).
+- **Verification** — after an agent finishes, Maestro runs a deterministic check
+  (your `[verification]` command, or an auto-detected test suite) and records
+  the result. See "Deterministic verification" below.
+- **Usage/cost** — adapters extract usage from each run (tokens, cost where the
+  CLI reports it). Costs accumulate on the task and per agent, which is what
+  budget caps enforce against.
 
 ---
 
-## 4. Configure Codex defaults
+## Watching work
 
-Project defaults belong in:
+| Tool | What it's for |
+|---|---|
+| **Web console** — `http://127.0.0.1:<port>/` | Full picture: all tasks, live SSE output, costs, per-attempt detail. React app served by the daemon itself. |
+| **`maestro dashboard`** | Terminal full-screen view of the same data. Keys: `j`/down and `k`/up to move, `q`/Esc/Ctrl-C to quit. Pure event-streaming — it never polls. |
+| **`maestro task tail <id>`** | Follow one task's output stream in your terminal. `--all` follows everything. |
+| **`maestro task audit <id>`** | The durable record: every attempt (agent, exit code, duration, usage, error), the final state, and result files. Works after restarts. |
+| **`maestro gc`** | Delete finished tasks older than a TTL (default 90 days). Manual only — `--dry-run` previews. |
 
-```text
-.maestro/config.toml
+---
+
+## Agents
+
+### First-class adapters
+
+Each kind knows how to launch its CLI, stream output, and parse usage. Use the
+kind name directly as `--target` (the binary must be on your `PATH` and
+authenticated); register a named entry with `maestro agents add <name> --kind
+<kind>` when you want an alias or per-agent settings. `maestro agents discover`
+finds whatever is installed, and `maestro agents status <name>` shows exactly
+what preflight will see before you delegate.
+
+| Kind | Binary | Notes |
+|---|---|---|
+| `codex` | `codex` | OpenAI Codex CLI; autonomy flags auto-detected from `--help` |
+| `claude_code` | `claude` | Anthropic Claude Code, headless mode |
+| `copilot` | `copilot` | GitHub Copilot CLI (`-p … --output-format json --yolo`); usage read from its `--usage-output-file` JSON after the run |
+| `cursor` | `cursor-agent` | Cursor agent print mode |
+| `hermes` | `hermes` | Hermes Agent |
+| `pi` | `pi` | Pi (rpc mode) |
+| `cline` | `cline` | Cline CLI |
+| `openhands` | `openhands` | OpenHands CLI |
+| `a2a_remote` | *(URL, not a binary)* | Another Maestro daemon — see below |
+
+### Onboarding any CLI (generic spec)
+
+Anything that can run non-interactively from a shell works as `kind = "generic"`
+— no code, just a registry entry:
+
+```bash
+maestro agents add mytool --kind generic \
+  --command "mytool run --json {prompt}"     # or pipe the prompt instead:
+  --input-mode arg                          #   --input-mode stdin
+  --output-format jsonl                     # text | jsonl | rpc
 ```
 
-A typical configuration is:
+- `{prompt}` in the command inserts the work order; `input_mode = "stdin"`
+  pipes it on stdin instead (better for long prompts).
+- `output_format = "jsonl"` makes Maestro parse `cost_usd` / usage hints from
+  JSON lines automatically.
+- Preflight checks the binary + version before any delegation, so a wrong entry
+  fails fast with a clear error.
+
+Full recipes and a verification checklist for new agents:
+[docs/agent-onboarding.md](docs/agent-onboarding.md).
+
+### Remote agents
+
+**Another Maestro daemon (`a2a_remote`).** Daemons can delegate to each other
+over the A2A protocol — this is how you build a small agent cluster. The full
+handoff document travels with the request, so routing survives the hop:
+
+```bash
+# On machine A, register machine B's daemon (note: it's a URL, not a binary):
+maestro agents add remote-b --kind a2a_remote --command http://10.0.0.5:8790
+maestro delegate --title "…" --request "…" --target remote-b --workspace /path/to/repo
+```
+
+Maestro checks the remote's agent card before delegating, streams its output
+and usage live, and forwards cancellation. If the remote daemon has no free
+workspace slot it queues the task — Maestro reports that as a clear error rather
+than hanging.
+
+**REST task servers (`api` mode).** A generic agent whose command is an `http(s)`
+URL switches to API mode automatically: Maestro submits, polls for status, and
+reports output/costs against this small contract (no push channel needed):
+
+```text
+POST /tasks            {"task_id", "prompt", "workspace"}        → 202 {"id": …}
+GET  /tasks/{id}       → {"state", "output", "usage", "error"}   (polled ~1/s)
+POST /tasks/{id}/cancel
+```
+
+`state` is `working` until it reaches a terminal state: `completed`, `failed`,
+or `canceled`. The base URL can also come from per-agent settings
+(`api_base_url`) instead of the command.
+
+---
+
+## P2P discovery
+
+When daemons share a network, they find each other automatically. In plain
+terms: every daemon periodically gives a small "I'm here!" shout (UDP multicast
+on port 9786) carrying its name and HTTP port; every other daemon that hears it
+records the peer in `~/.maestro/peers.json`. Peers heard recently are **live**;
+a peer silent for ~15 seconds is marked **stale**.
+
+```bash
+maestro peers list                 # discovered + manually added peers, with status
+maestro peers add --name lab --url http://10.0.0.5:8790   # manual registration
+maestro peers remove lab
+```
+
+**When you need `peers add` instead of auto-discovery:**
+
+- The network blocks multicast/broadcast (many corporate networks, some Wi-Fi,
+  VPNs) — the shout never travels.
+- You want a stable name for a long-lived remote daemon.
+- A machine runs several daemons and you want explicit control.
+
+Manually added peers keep their URL forever and never go stale; discovered
+peers refresh automatically. To tune or disable discovery:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAESTRO_DISCOVERY` | `1` | Set `0` to turn discovery off entirely |
+| `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only) |
+| `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
+| `MAESTRO_NODE_NAME` | `maestro-node` | The name this daemon announces under |
+
+---
+
+## Budget caps
+
+Cap how much Maestro can spend so a runaway task chain doesn't drain your
+account. Caps are per-daemon (set them in the environment where you start the
+daemon):
+
+```bash
+export MAESTRO_BUDGET_PER_AGENT_USD=25     # cumulative cap per agent name
+export MAESTRO_BUDGET_DAILY_USD=100        # cap across all agents, resets at UTC midnight
+maestro-daemon
+```
+
+How it behaves:
+
+- Enforcement is **at launch time only**: when a budget is exhausted, new
+  delegations to that agent (or any agent, for the daily cap) are refused with
+  a clear error. **Running tasks always finish.**
+- Spend counts what actually ran — each attempt's usage, including failed
+  attempts (failed work still costs money).
+- Check where you stand anytime:
+
+```bash
+maestro budgets
+# per-agent cap: $25.0000
+#   codex: $3.4120
+# daily cap: $100.0000 — spent today (UTC): $7.8834
+```
+
+Agents with no cost reporting (most CLIs don't emit USD) simply contribute $0;
+caps still work for the agents that do report costs (Codex, Claude Code, …).
+
+---
+
+## CLI reference
+
+Global options: `--workspace DIR` or `--project DIR` scope task commands to a
+location (default: `$MAESTRO_WORKSPACE` or the current directory).
+
+| Command | What it does |
+|---|---|
+| `maestro-daemon [--port N] [--state-dir DIR]` | Start the local broker daemon |
+| `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--no-wait` returns immediately |
+| `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
+| `maestro task list [--project DIR]` | List tasks (number or id) |
+| `maestro task status <id\|n>` | Show one task's current state (`task show`, `status`, and bare `task <n>` are aliases) |
+| `maestro task tail <id> [--all]` | Live-tail a task's event stream |
+| `maestro task audit <id>` | Durable record: attempts, usage, errors, result files |
+| `maestro agents list \| add \| remove \| discover \| status <name>` | Manage registered agents |
+| `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
+| `maestro budgets` | Show budget caps and current spend |
+| `maestro handoff --title … --request … --design-file F [--model M] [--effort E]` | Create + launch a Codex handoff directly (no daemon) |
+| `maestro codex-followup <id> "instruction"` | Send a follow-up to the task's Codex run |
+| `maestro run <id>` | Launch implementation for an existing task |
+| `maestro config` | Show effective Codex defaults |
+| `maestro storage …` | Manage storage backends |
+| `maestro gc [--days N] [--dry-run]` | Delete terminal tasks older than the TTL (manual only) |
+
+Handoff files are TOML or JSON with the same fields as the flags: `title`,
+`request`, `design`, `target_agent`, `fallback` (list), `commit_policy`
+(`branch` default — requires a git repo; use `no-commit` otherwise),
+`sensitive`, `budget_hint`.
+
+---
+
+## Configuration
+
+### Project config: `.maestro/config.toml`
+
+Precedence (most specific wins): `~/.maestro/config.toml` →
+`<project-root>/.maestro/config.toml` → `<active-worktree>/.maestro/config.toml`.
 
 ```toml
 [codex]
 model = "gpt-5.6-luna"
-effort = "max"
+effort = "max"            # low | medium | high | xhigh | max
+
+[verification]
+command = ["make", "check"]   # run this after each agent finishes (optional)
 
 [storage]
-backend = "filesystem"
+backend = "filesystem"    # filesystem (default) | memvara
 ```
 
-Supported reasoning effort values are:
+### Environment variables
 
-```text
-low
-medium
-high
-xhigh
-max
-```
-
-You can also configure deterministic verification:
-
-```toml
-[verification]
-command = ["make", "check"]
-```
-
-Configuration precedence is:
-
-```text
-~/.maestro/config.toml
-        ↓
-<project-root>/.maestro/config.toml
-        ↓
-<active-worktree>/.maestro/config.toml
-```
-
-More specific configuration overrides less specific configuration.
+| Variable | Default | What it does |
+|---|---|---|
+| `MAESTRO_HOME` | `~/.maestro` | State directory (registry, tasks, claims, peers, daemon marker) |
+| `MAESTRO_WORKSPACE` | cwd | Default workspace for task commands |
+| `MAESTRO_DAEMON_URL` | from `daemon.json` | Point CLI commands at a specific daemon (e.g. another machine's) |
+| `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before falling back |
+| `MAESTRO_BACKOFF_S` | `1.0` | Seconds between retries |
+| `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP server waits for a delegated task |
+| `MAESTRO_BUDGET_PER_AGENT_USD` | off | Cumulative USD cap per agent (see Budget caps) |
+| `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap, all agents, UTC day |
+| `MAESTRO_DISCOVERY` / `_PORT` / `_IF` / `_TTL` | on/9786/default/1 | P2P discovery tuning (see P2P discovery) |
+| `MAESTRO_NODE_NAME` | `maestro-node` | Announced name for discovery |
+| `MAESTRO_STORAGE` | — | Override storage backend for the shell |
+| `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Override Codex model/effort for the shell |
 
 ---
 
-## 5. Your first Maestro task
+## Where Maestro stores state
 
-Start Claude Code in the project you want to modify.
-
-Then ask Claude for normal implementation work, for example:
+Authoritative runtime state lives at the **user level**, not inside each
+project or worktree:
 
 ```text
-Implement semantic search for the existing document API.
-
-First inspect the repository and understand the current architecture.
-Create a compact implementation design, then delegate the implementation
-to Maestro/Codex. Run the relevant tests and review the resulting diff.
+~/.maestro/                      (or $MAESTRO_HOME)
+├── registry.json                # registered agents
+├── state.jsonl                  # durable claim journal (task history)
+├── daemon.json                  # which daemon is running (port, pid)
+├── peers.json                   # discovered/registered peers
+├── config.toml                  # user-level config
+└── tasks/<task-id>/             # per-task artifacts (logs, results)
 ```
 
-Claude will:
+Project-level files are configuration only: `<project>/.maestro/config.toml`
+(and optionally the same inside a worktree). Task state survives worktree
+creation, switching, and deletion; each task records exactly which workspace it
+ran in.
 
-1. Inspect the target project.
-2. Create a compact implementation handoff.
-3. Call Maestro through MCP.
-4. Maestro creates a durable task.
-5. Codex runs in the active workspace.
-6. Maestro performs deterministic verification.
-7. Claude reviews the implementation.
-8. Claude can send additional work to Codex through `codex_followup`.
-9. Claude makes the final approval decision.
-
-You do not need to manually copy prompts between Claude and Codex.
+**Worktrees:** if you work in Git worktrees (e.g. Claude Code's), pass the
+*active worktree path* as `--workspace` — never rely on the current directory
+of whatever process is calling Maestro. The task records both the workspace and
+the project root.
 
 ---
 
-## 6. How worktrees are handled
+## Deterministic verification
 
-Claude Code can work in Git worktrees such as:
+After an agent finishes, Maestro runs a deterministic check before reporting
+completion. Selection order:
 
-```text
-project/
-└── .claude/
-    └── worktrees/
-        └── feature-search/
-```
-
-Maestro preserves the active worktree explicitly.
-
-A task records both:
-
-```text
-workspace
-project_root
-```
-
-For example:
-
-```text
-workspace   = /path/to/project/.claude/worktrees/feature-search
-project_root = /path/to/project
-```
-
-Codex runs in the task's `workspace`.
-
-Maestro does **not** use the MCP server's own current working directory as the task workspace.
-
-Claude should pass the active absolute worktree path as the `workspace` argument on every Maestro MCP call.
-
----
-
-## 7. Where Maestro stores state
-
-Maestro keeps its authoritative runtime state at the **user level**, not in every Claude worktree.
-
-Default locations:
-
-```text
-macOS / Linux:
-~/.maestro/
-
-Windows:
-%LOCALAPPDATA%\Maestro\
-```
-
-You can override this location:
-
-```bash
-export MAESTRO_HOME=/path/to/maestro-state
-```
-
-The user-level directory contains:
-
-```text
-~/.maestro/
-├── registry.json
-├── state.jsonl
-├── registry.lock
-├── config.toml
-├── designs/
-├── staged/
-├── tasks/
-└── migrations/
-```
-
-The important distinction is:
-
-```text
-~/.maestro/
-    persistent Maestro runtime state and task artifacts
-
-<project>/.maestro/config.toml
-    project configuration
-
-<active-worktree>/.maestro/config.toml
-    optional worktree-specific configuration
-```
-
-Runtime task state and artifacts are **not recreated inside every worktree**.
-
-The task record still remembers which worktree was used so Codex can continue working in the correct location.
-
----
-
-## 8. Task listing and recovery
-
-Task identity is stored in the user-level Maestro registry, so task lookup does not depend on keeping a separate registry inside every worktree.
-
-List all tasks available to the current user:
-
-```bash
-maestro task list
-```
-
-List tasks for a project:
-
-```bash
-maestro task list --project /path/to/project
-```
-
-List tasks using a specific workspace:
-
-```bash
-maestro task list --workspace /path/to/project/.claude/worktrees/feature-search
-```
-
-You can also use:
-
-```bash
-export MAESTRO_WORKSPACE=/path/to/project
-maestro task list
-```
-
-A task can be referenced by either its human-friendly number or task ID:
-
-```bash
-maestro task status 10
-```
-
-```bash
-maestro task status task-20260917-120000-a1b2c3
-```
-
-These are equivalent aliases:
-
-```bash
-maestro task show 10
-maestro status 10
-```
-
-The shorthand below is also supported:
-
-```bash
-maestro task 10
-```
-
----
-
-## 9. Optional CLI usage
-
-The normal workflow is Claude → Maestro MCP → Codex, but the CLI is useful for debugging, CI, and operators.
-
-### List tasks
-
-```bash
-maestro task list
-```
-
-### Show a task
-
-```bash
-maestro task status 10
-```
-
-### Run an implementation task
-
-```bash
-maestro run 10
-```
-
-### Send a follow-up directly to Codex
-
-```bash
-maestro codex-followup 10 "Fix the failing integration test and rerun the relevant checks."
-```
-
-### Show effective Codex configuration
-
-```bash
-maestro config
-```
-
-### Create a manual handoff
-
-```bash
-maestro handoff \
-  --title "Add semantic search" \
-  --request "Implement semantic search for the document API" \
-  --design-file path/to/design.md
-```
-
-The CLI is optional. Claude normally handles this through MCP.
-
----
-
-## 10. Deterministic verification
-
-After Codex finishes, Maestro performs deterministic verification.
-
-The selection order is:
-
-1. An explicit `[verification]` command in `.maestro/config.toml`.
+1. `[verification] command` in `.maestro/config.toml`, if set.
 2. `make check` when a `Makefile` exists.
-3. Node projects with a `test` script using npm, pnpm, or yarn according to the lockfile.
-4. Go projects using `go test ./...`.
-5. Rust projects using `cargo test`.
-6. Python projects using the selected Python environment and pytest when pytest is installed.
-7. Otherwise Maestro falls back to `git diff --check`.
+3. Node projects with a `test` script (npm/pnpm/yarn per lockfile).
+4. Go → `go test ./...`; Rust → `cargo test`.
+5. Python → pytest, when installed.
+6. Fallback: `git diff --check`.
 
-Example:
-
-```toml
-[verification]
-command = ["make", "check"]
-```
-
-Maestro does **not** install dependencies, repair the environment, or silently change the project's tooling.
-
-A real non-zero result from the selected verification command is recorded as a verification failure.
+Maestro never installs dependencies or changes your tooling; a real non-zero
+result is recorded as a verification failure in the task record.
 
 ---
 
-## 11. Codex follow-ups and reviews
+## Using Maestro through Claude Code (MCP)
 
-Claude uses `codex_followup` for additional implementation work such as:
+The most common setup: you talk to Claude, and Claude delegates implementation
+to Maestro's agents. Setup:
 
-* fixing failed tests
-* debugging
-* refactoring
-* implementing review findings
-* making mechanical changes
+1. **Expose Maestro as an MCP server** in your project's `.mcp.json`:
 
-Claude remains responsible for the final review.
+   ```json
+   {
+     "mcpServers": {
+       "maestro": { "command": "scripts/maestro-mcp" }
+     }
+   }
+   ```
 
-The intended loop is:
+   `chmod +x scripts/maestro-mcp` — the launcher pins the repository's
+   `.venv` so Claude and your CLI share one Python environment. Approve the
+   server when Claude Code asks; `.claude/settings.json` in this repo grants
+   the tool permissions.
 
-```text
-Codex implementation
-        ↓
-verification
-        ↓
-Claude review
-        ↓
-approved ───────────→ complete
+2. **Give Claude the supervisor rules.** This repo ships `CLAUDE.md` (Claude's
+   routing rules) and `AGENTS.md` (implementation-agent rules). Copy or adapt
+   them into projects where you want the same division of labor: *Claude decides
+   what to build and reviews; the implementation agent does the work.*
 
-rejected
-        ↓
-codex_followup
-        ↓
-verification
-        ↓
-Claude review again
-```
+3. **Just ask Claude** for normal implementation work:
 
-Maestro does not automatically decide that a verification failure requires an implementation change. Verification is evidence; Claude makes the review decision.
+   ```text
+   Implement semantic search for the existing document API.
+   Inspect the repository first, create a compact design, then delegate the
+   implementation through Maestro. Run the tests and review the diff.
+   ```
 
----
+Claude creates a compact handoff, calls Maestro's `delegate` tool (which goes
+through the same daemon as the CLI), waits on the event stream, reviews the
+result, and can send follow-ups (`codex_followup`) until it approves. You never
+copy prompts between tools by hand.
 
-## 12. Optional Memvara backend
-
-Filesystem storage is the default and requires no additional memory service.
-
-Memvara is optional.
-
-### Install the extra
-
-```bash
-python -m pip install -e ".[memvara]"
-```
-
-### Select Memvara
-
-In `.maestro/config.toml`:
-
-```toml
-[storage]
-backend = "memvara"
-```
-
-Or temporarily for the current shell:
-
-```bash
-export MAESTRO_STORAGE=memvara
-```
-
-Supported values are:
-
-```text
-filesystem
-memvara
-```
-
-Filesystem remains the default.
-
-The Maestro Memvara backend and the Memvara MCP server are separate concepts:
-
-```text
-Maestro Memvara backend
-    → stores Maestro's own task state
-
-Memvara MCP server
-    → optionally gives Claude direct access to broader semantic memory
-```
-
-You do not need the Memvara MCP server to use Maestro.
+The MCP tools mirror the CLI: `delegate`, `task_wait`, `task_status`,
+`followup`, … — everything the CLI can do, Claude can do.
 
 ---
 
-## 13. Migrating from older Maestro releases
+## Troubleshooting
 
-Maestro can migrate legacy project-level task state into the user-level state directory.
+**"no daemon reachable — start one with 'maestro-daemon'"**
+No running daemon was found (or its marker is stale). Start one, or point at a
+specific one: `export MAESTRO_DAEMON_URL=http://host:port`.
 
-Older project journals such as:
+**A task shows the target agent "not implemented" / preflight failed**
+The agent's binary isn't on your PATH or isn't authenticated. Check with
+`maestro agents status <name>` — it shows exactly what preflight found. Register
+it (`maestro agents add …`) if it was never registered.
 
-```text
-.maestro/project-state.jsonl
-```
+**Delegation refused: "Budget cap exceeded"**
+A cap is exhausted (see `maestro budgets`). Raise the cap or wait for the daily
+reset; already-running tasks are unaffected.
 
-can be imported into:
+**`peers list` is empty on a LAN**
+The network likely blocks multicast — use `maestro peers add --name … --url …`.
+Verify your daemon is announcing at all: set `MAESTRO_DISCOVERY_TTL=0` and
+`MAESTRO_DISCOVERY_IF=127.0.0.1` to confirm loopback discovery works before
+debugging the network.
 
-```text
-~/.maestro/
-```
+**Two daemons on one machine don't see each other**
+Discovery relies on shared-UDP-port semantics that are verified on macOS; on
+other systems, register peers manually instead.
 
-Migration is designed to be idempotent.
+**The web console shows nothing / 404**
+The daemon serves the console from its bundled `web_dist/`. Check the daemon is
+the version you expect (`maestro --version`) and that `daemon.json` points at
+the port you're browsing.
 
-Legacy Memvara task state can also be imported into the selected filesystem backend when applicable.
+**Wrong Python picked up by the MCP server**
+Always launch through `scripts/maestro-mcp`; verify with
+`.venv/bin/python -c 'import maestro; print(maestro.__file__)'`.
 
-New installations should use the current user-level state model and do not need to create old project-local task registries.
-
----
-
-## 14. Repository configuration files
-
-The repository uses these files for its orchestration setup:
-
-```text
-.maestro/config.toml
-    Project/worktree Maestro configuration
-
-.mcp.json
-    Claude Code MCP configuration
-
-.claude/settings.json
-    Claude Code MCP permissions
-
-.claude/skills/maestro/SKILL.md
-    Claude's Maestro routing instructions
-
-CLAUDE.md
-    Claude supervisor rules
-
-AGENTS.md
-    Codex implementation rules
-```
-
-Maestro's source code is under:
-
-```text
-maestro/
-```
-
-and the optional MCP launcher is:
-
-```text
-scripts/maestro-mcp
-```
+**A task can't be found after a restart**
+Tasks are durable per state directory — make sure you're using the same
+`MAESTRO_HOME` as when the daemon ran, then `maestro task list`.
 
 ---
 
-## 15. Architecture
-
-The core components are:
-
-```text
-maestro/core.py
-    Task identity, numbering, persistence, configuration,
-    delegation, lifecycle, review, and migration.
-
-maestro/worker.py
-    Background Codex execution and deterministic verification.
-
-maestro/mcp_server.py
-    MCP tools used by Claude Code.
-
-maestro/cli.py
-    Optional human/operator CLI.
-
-scripts/maestro-mcp
-    Selects the repository Python environment and starts the MCP server.
-
-.claude/skills/maestro/SKILL.md
-    Minimal Claude routing contract.
-
-CLAUDE.md
-    Supervisor behavior.
-
-AGENTS.md
-    Implementation-agent rules.
-```
-
-Conceptually:
-
-```text
-                   ┌─────────────────┐
-                   │   Claude Code   │
-                   │   Supervisor    │
-                   └────────┬────────┘
-                            │ MCP
-                            ▼
-                   ┌─────────────────┐
-                   │     Maestro     │
-                   │ Task lifecycle  │
-                   │ Durable state   │
-                   │ Verification    │
-                   └────────┬────────┘
-                            │ subprocess
-                            ▼
-                   ┌─────────────────┐
-                   │      Codex      │
-                   │  Implementation │
-                   │ Tests/debugging │
-                   └────────┬────────┘
-                            │
-                            ▼
-                   ┌─────────────────┐
-                   │ Active Git      │
-                   │ Worktree        │
-                   └─────────────────┘
-
-                   Persistent state:
-                   ~/.maestro/
-```
-
-There is one supervisor (Claude), one primary implementation agent (Codex), deterministic verification, and one durable Maestro state layer.
-
----
-
-## 16. Troubleshooting
-
-### Claude cannot start Maestro MCP
-
-Check:
-
-```bash
-ls -l scripts/maestro-mcp
-```
-
-Make it executable:
-
-```bash
-chmod +x scripts/maestro-mcp
-```
-
-Make sure the virtual environment exists:
-
-```bash
-ls -l .venv/bin/python
-```
-
-If it does not:
-
-```bash
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e .
-```
-
-### Maestro is using the wrong Python
-
-Verify:
-
-```bash
-.venv/bin/python -c 'import sys, maestro; print(sys.executable); print(maestro.__file__)'
-```
-
-The MCP server should be launched through:
-
-```text
-scripts/maestro-mcp
-```
-
-rather than a globally installed `python3` environment.
-
-### Codex is not available
-
-Check:
-
-```bash
-codex --version
-```
-
-and authenticate Codex using its normal CLI setup.
-
-Maestro does not install Codex for you.
-
-### A task cannot be found
-
-Check the global registry:
-
-```bash
-maestro task list
-```
-
-You can also inspect:
-
-```text
-~/.maestro/
-```
-
-or set an explicit state directory:
-
-```bash
-export MAESTRO_HOME=/path/to/maestro-state
-```
-
-### Check the active workspace
-
-```bash
-git rev-parse --show-toplevel
-```
-
-Claude should pass the actual active worktree path to Maestro MCP.
-
----
-
-## 17. Development
-
-Install development dependencies:
+## Development
 
 ```bash
 python -m pip install -e .
 python -m pip install pytest coverage
-```
-
-Run the tests:
-
-```bash
-python -m pytest -q
-```
-
-Run tests with branch coverage:
-
-```bash
 python -m coverage run --branch -m pytest -q
-python -m coverage report --fail-under=100
+python -m coverage report --fail-under=100     # CI enforces 100% line+branch
 ```
 
-The project CI enforces 100% line and branch coverage.
+The web console's built artifacts are committed in `maestro/web_dist/`, so
+Node is **not** needed to use Maestro. To rebuild the console after changing
+`web/src/`:
 
-Generated files such as these should not be committed:
-
-```text
-build/
-dist/
-*.egg-info/
-.venv/
-.pytest_cache/
-.coverage
-.DS_Store
+```bash
+cd web && npm install && npm run build   # rewrites maestro/web_dist/
 ```
+
+The flagship end-to-end demo (full role swap, one command) is
+`examples/full-swap.sh`. Design rationale and the milestone history live in
+[docs/architecture-proposal.md](docs/architecture-proposal.md); agent onboarding
+recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
 ---
 
-## 18. Design principles
+## Design principles
 
-Maestro follows a few simple rules:
-
-**Claude decides what should be built.**
-
-**Codex owns implementation.**
-
-**Maestro owns task lifecycle and durable orchestration state.**
-
-**Verification is deterministic.**
-
-**Claude owns the final review and approval.**
-
-**Maestro never commits code.**
-
-**Maestro never installs project dependencies.**
-
-**The active worktree is explicit.**
-
-**Task state survives worktree creation, switching, and deletion.**
+- **The supervisor decides what to build; implementation agents do the work.**
+  (With direct use, *you* are the supervisor.)
+- **Maestro owns task lifecycle and durable state** — nothing important lives
+  in a terminal buffer.
+- **Reactive, not polling**: events flow over SSE everywhere; dashboards and
+  waits subscribe instead of spinning.
+- **Verification is deterministic.** Evidence, not vibes.
+- **Maestro never commits code and never installs dependencies.**
+- **The workspace is always explicit** — passed in, recorded, never guessed.

@@ -1,4 +1,8 @@
 from pathlib import Path
+import json
+import stat
+import sys
+
 from maestro import cli
 
 def test_version(): assert cli.VERSION=='0.8.4'
@@ -70,3 +74,57 @@ def test_task_workspace_falls_back_to_cwd(monkeypatch, tmp_path):
     monkeypatch.delenv("MAESTRO_WORKSPACE", raising=False)
     monkeypatch.chdir(tmp_path)
     assert cli._task_workspace(None) == tmp_path.resolve()
+
+
+def _fake_executable(path: Path, body: str = "echo 'codex 9.9.9'") -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+
+def test_agents_cli_lifecycle(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _fake_executable(bindir / "codex")
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.setenv("PATH", str(bindir))
+
+    def run(*argv: str) -> int:
+        monkeypatch.setattr(sys, "argv", ["maestro", *argv])
+        return cli.main()
+
+    assert run("agents", "add", "--name", "codex", "--kind", "codex",
+               "--display-name", "Codex CLI", "--skill", "implementation") == 0
+    added = json.loads(capsys.readouterr().out)
+    assert added["name"] == "codex" and added["kind"] == "codex"
+    assert added["skills"] == ["implementation"] and added["display_name"] == "Codex CLI"
+
+    assert run("agents", "list") == 0
+    items = json.loads(capsys.readouterr().out)
+    assert [i["name"] for i in items] == ["codex"]
+
+    assert run("agents", "discover") == 0
+    found = {c["name"]: c for c in json.loads(capsys.readouterr().out)}
+    assert found["codex"]["found"] is True and found["claude_code"]["found"] is False
+
+    assert run("agents", "status", "codex") == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["registered"] is True and status["found"] is True
+    assert status["version"] == "codex 9.9.9"
+
+    assert run("agents", "status", "ghost") == 0
+    assert json.loads(capsys.readouterr().out) == {"name": "ghost", "registered": False}
+
+    assert run("agents", "add", "--name", "mycli", "--kind", "generic",
+               "--command", "mycli --run {prompt}", "--input-mode", "stdin",
+               "--output-format", "jsonl", "--workspace-policy", "flag") == 0
+    generic = json.loads(capsys.readouterr().out)
+    assert generic["kind"] == "generic" and generic["input_mode"] == "stdin"
+    assert generic["output_format"] == "jsonl" and generic["workspace_policy"] == "flag"
+
+    assert run("agents", "remove", "mycli") == 0
+    assert json.loads(capsys.readouterr().out) == {"name": "mycli", "removed": True}
+
+    assert run("agents", "remove", "ghost") == 2
+    assert "not registered" in capsys.readouterr().err

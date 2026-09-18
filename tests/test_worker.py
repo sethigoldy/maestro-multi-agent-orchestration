@@ -40,7 +40,7 @@ def test_run_codex_uses_model_effort_and_followup(monkeypatch, tmp_path: Path):
             "fix it",
         ) == 1
 
-        cmd = calls[0]
+        cmd = calls[-1]  # calls[0] is the flag-surface probe
 
         assert "--model" in cmd
         assert "gpt-5.6-luna" in cmd

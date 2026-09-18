@@ -644,7 +644,9 @@ def test_codex_worker_uses_persisted_model_and_effort(tmp_path, monkeypatch):
     monkeypatch.setattr(worker.subprocess, 'run', run)
     monkeypatch.setattr(worker, 'verify', lambda *a: True)
     assert worker.run_codex(m, task['task_id'], 'implement', None) == 0
-    assert captured['cmd'][0:3] == ['codex', 'exec', '--full-auto']
+    # the fake run() also answers the flag probe with empty help -> current surface
+    assert captured['cmd'][0:2] == ['codex', 'exec']
+    assert '--approve-for-me' in captured['cmd'] or '--full-auto' in captured['cmd']
     assert '--model' in captured['cmd']
     assert captured['cmd'][captured['cmd'].index('--model') + 1] == 'gpt-5.6-luna'
     assert 'model_reasoning_effort="max"' in captured['cmd']
