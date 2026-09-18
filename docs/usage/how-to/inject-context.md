@@ -46,6 +46,9 @@ Pick the kind that matches what you have:
 Field semantics, size caps, and how each kind reaches the agent are in the
 [configuration reference](../reference/configuration.md#context--standing-context-entries).
 
+The daemon reads config at startup — if you edited the file while a daemon was
+already running, restart it first or new entries will not reach tasks.
+
 Verify what Maestro sees:
 
 ```bash
@@ -88,7 +91,8 @@ the task record — no hidden prompt assembly:
 
 ```bash
 maestro task audit <task-id>
-# → "doc": { …, "context": [ {"label": "style", "source": "project config", …}, … ] }
+# → "context": [ {"label": "style", "source": "user config", …},
+#                {"label": "spec", "source": "handoff", …} ]
 ```
 
 For Claude Code targets you can also inspect the staged artifacts under

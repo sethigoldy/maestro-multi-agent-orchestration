@@ -252,6 +252,7 @@ def _cmd_task_audit(args: argparse.Namespace) -> int:
             "origin_agent": claims.get("task_origin_agent"),
             "target_agent": claims.get("task_target_agent"),
             "attempts": runtime.get("attempts") or [],
+            "context": (runtime.get("doc") or {}).get("context") or [],
             "usage": runtime.get("usage"),
             "error": runtime.get("error"),
             "results": results,
