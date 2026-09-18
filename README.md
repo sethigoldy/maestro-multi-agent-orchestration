@@ -38,8 +38,8 @@ use (e.g. `codex`, `claude`, `copilot`) installed and authenticated with its
 normal setup flow.
 
 ```bash
-git clone https://github.com/sethigoldy/multi-agent-orchestration.git
-cd multi-agent-orchestration
+git clone https://github.com/sethigoldy/maestro-multi-agent-orchestration.git
+cd maestro-multi-agent-orchestration
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
