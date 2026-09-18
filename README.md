@@ -139,8 +139,9 @@ That's the whole loop: **register agents → start daemon → delegate → watch
   means: try Codex; if it fails or isn't available, try Copilot; then Hermes.
   Each attempt is recorded, including its cost (failed work still costs money).
 - **Verification** — after an agent finishes, Maestro runs a deterministic check
-  (your `[verification]` command, or an auto-detected test suite) and records
-  the result. See "Deterministic verification" below.
+  (an auto-detected test suite, or an explicit command set on the handoff's
+  `verification` field) and records the result. See "Deterministic verification"
+  below.
 - **Usage/cost** — adapters extract usage from each run (tokens, cost where the
   CLI reports it). Costs accumulate on the task and per agent, which is what
   budget caps enforce against.
@@ -358,13 +359,16 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
 | `maestro budgets` | Show budget caps and current spend |
 | `maestro config` | Show effective Codex defaults |
-| `maestro storage …` | Manage storage backends |
+| `maestro storage migrate-memvara` | Import legacy Memvara state into the current backend |
 | `maestro gc [--days N] [--dry-run]` | Delete terminal tasks older than the TTL (manual only) |
 
-Handoff files are TOML or JSON with the same fields as the flags: `title`,
-`request`, `design`, `target_agent`, `fallback` (list), `commit_policy`
-(`branch` default — requires a git repo; use `no-commit` otherwise),
-`sensitive`, `budget_hint`.
+Handoff files are TOML or JSON in the 4-section format — `[handoff]` (title,
+request, design, context), `[routing]` (target_agent, fallback, origin_agent),
+`[expectations]` (artifacts, verification, commit_policy, budget_hint),
+`[constraints]` (sensitive, max_depth_remaining) plus optional `agent_settings`
+(per-task model/effort). Legacy 0.8.x JSON files are converted automatically.
+Full field reference:
+[docs/usage/reference/handoff-format.md](docs/usage/reference/handoff-format.md).
 
 ---
 
@@ -380,12 +384,14 @@ Precedence (most specific wins): `~/.maestro/config.toml` →
 model = "gpt-5.6-luna"
 effort = "max"            # low | medium | high | xhigh | max
 
-[verification]
-command = ["make", "check"]   # run this after each agent finishes (optional)
-
 [storage]
 backend = "filesystem"    # filesystem (default) | memvara
 ```
+
+Verification is not configured here — it is set per handoff (`verification =
+"auto" | "command" | "none"`) and auto-detected per workspace; see
+"Deterministic verification" below. A `[verification]` table in this file is
+accepted for forward compatibility but not run by the daemon.
 
 ### Environment variables
 
@@ -395,15 +401,16 @@ backend = "filesystem"    # filesystem (default) | memvara
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for task commands |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Point CLI commands at a specific daemon (e.g. another machine's) |
 | `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that daemon; also the token a daemon uses when it generates one on a non-loopback bind |
-| `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before falling back |
-| `MAESTRO_BACKOFF_S` | `1.0` | Seconds between retries |
+| `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before falling back (1 + N total) |
+| `MAESTRO_BACKOFF_S` | `1.0` | Base seconds for retry backoff (linear: base × attempt number) |
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP server waits for a delegated task |
 | `MAESTRO_BUDGET_PER_AGENT_USD` | off | Cumulative USD cap per agent (see Budget caps) |
 | `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap, all agents, UTC day |
 | `MAESTRO_DISCOVERY` / `_PORT` / `_IF` / `_TTL` | on/9786/default/1 | P2P discovery tuning (see P2P discovery) |
 | `MAESTRO_NODE_NAME` | `maestro-node` | Announced name for discovery |
-| `MAESTRO_STORAGE` | — | Override storage backend for the shell |
-| `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Override Codex model/effort for the shell |
+| `MAESTRO_PYTHON` | — | Interpreter used for verification's pytest probe (must be a file) |
+| `MAESTRO_STORAGE` | — | Storage backend when no config file sets it (file values win) |
+| `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort when no config file sets them (file values win) |
 
 ---
 
@@ -489,8 +496,10 @@ or needs input), reviews the returned result and diff itself, and can send
 follow-ups (`followup`) until it approves. You never copy prompts between tools
 by hand.
 
-The MCP tools mirror the CLI: `delegate`, `task_wait`, `task_status`,
-`followup`, … — everything the CLI can do, Claude can do.
+The MCP surface is task-oriented: `delegate`, `followup`, `task_wait`,
+`task_status`, `list_tasks`, `agents_list`, `cancel_task`,
+`answer_task_question` — exact signatures and return shapes in the
+[MCP tools reference](docs/usage/reference/mcp-tools.md).
 
 ---
 
