@@ -145,6 +145,15 @@ with the unresolved issues listed; answer it, follow up, or cancel. Per-phase
 cost shows up in `maestro task audit <id>` (each attempt names its agent) and
 in `maestro budgets`.
 
+## Attach context to a task
+
+If your task needs context a supervisor may not add — "use this skill", "follow
+these conventions", "review against this checklist" — attach it with the
+`[[context]]` entries of the handoff (or `--context` / `--context-file` /
+`--skill` flags). Entries are composed with standing `[context.<label>]` config
+entries, phase-scoped, and recorded on the task. Full walkthrough:
+[Inject context into tasks](inject-context.md).
+
 ## Choose the commit policy
 
 - `branch` (default) — Maestro creates and checks out branch

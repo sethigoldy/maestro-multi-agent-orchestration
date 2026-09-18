@@ -467,3 +467,34 @@ close it with preset-driven per-phase routing:
 
 Design spec: [docs/design-work-modes.md](design-work-modes.md). User guide:
 [Configure work modes](usage/how-to/configure-work-modes.md).
+
+## 13. Addendum — context injection (post-M6)
+
+Work modes answered *which agent* runs each phase; context injection answers
+*what context the user controls* in those turns. Handoffs had always carried
+`design`/`context_notes`/`context_files`, but those were advisory, unattributed,
+and invisible to gate turns. Context injection makes the channel first-class:
+
+- **Typed entries** — `text` (inline instruction), `file` (path; inlined when
+  ≤8KB, artifact-referenced when larger), and `skill` (an [Agent Skills
+  open-standard](https://agentskills.io/) directory with a `SKILL.md`, staged
+  into the task). Each entry carries a label and an optional phase scope
+  (`implementer`/`verifier`/`reviewer`; fix bounces and follow-ups are
+  implementer-phase turns).
+- **Layered sources** — standing `[context.<label>]` config tables (user file,
+  then project/worktree files; later wins per label) plus per-task `[[context]]`
+  handoff entries or CLI flags (`--context`, `--context-file`, `--skill`).
+  Composition happens once at delegate time and the merged list is stored on
+  the task record, so audits show exactly what each turn received.
+- **Adapter-aware channels** — for Claude Code targets, standing entries ride
+  in the system prompt (`--append-system-prompt-file`) and staged skills are
+  passed via `--add-dir`; every other adapter receives everything as a labeled
+  block in the prompt. Same data, different channel.
+- Invariants: context is data — Maestro stages and references files but never
+  executes context content; overflow degrades to artifact references or a
+  visible dropped-labels note (8KB per entry, 32KB total), never an error;
+  skill paths are validated at delegate time; a task with no entries anywhere
+  produces byte-identical prompts to the pre-feature shape.
+
+Design spec: [docs/design-context-injection.md](design-context-injection.md).
+User guide: [Inject context into tasks](usage/how-to/inject-context.md).

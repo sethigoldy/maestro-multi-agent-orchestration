@@ -9,6 +9,7 @@ delegation. It has four sections plus an optional per-task settings table:
                                    work modes: mode, review_agent, verify_agent, fix_agent, max_bounces)
 [expectations]  what done looks like (artifacts, verification, commit_policy, budget_hint)
 [constraints]   guardrails        (sensitive, max_depth_remaining)
+[[context]]     user-controlled context entries (label + text|path, kind, phases)
 agent_settings  per-task overrides for the target agent (model, effort, …)
 ```
 
@@ -63,6 +64,23 @@ gate fields behaves exactly as before (deterministic verification only). See
 | `sensitive` | boolean | `false` | no | When true, the task pauses in `input-required` with an approval question before any agent runs |
 | `max_depth_remaining` | integer | `3` | no | Must be ≥ 0. Refuses nesting at/below 0; each follow-up decrements by one |
 
+### `[[context]]` (array of tables)
+
+User-controlled context entries (see [Context injection in the README](../../../README.md#context-injection)). Each entry is one labeled unit of context injected into the agent's prompt at delegate time:
+
+| Field | Type | Default | Required | Notes |
+|---|---|---|---|---|
+| `label` | string | — | yes | Non-empty; identifies the entry and is the merge key against standing `[context.<label>]` config entries (handoff wins per label) |
+| `kind` | string | inferred | no | One of `text`, `file`, `skill`. Inferred: `text` when only `text` is set, else `file` |
+| `text` | string | — | for `text` kind | Inline instruction; exactly one of `text`/`path` must be set |
+| `path` | string | — | for `file`/`skill` kind | For `file`: a path inlined when ≤8KB, otherwise copied to the task dir and referenced. For `skill`: a directory containing a `SKILL.md`, staged into the task (Claude Code discovers it via `--add-dir`; other agents get a prompt reference) |
+| `phases` | list of strings | all three | no | Subset of `implementer`, `verifier`, `reviewer`. Fix bounces and follow-ups count as `implementer`. Lets an entry target only gate turns (e.g. a reviewer checklist) |
+
+The composed list (standing config entries + these, handoff overriding by
+label) is stored on the task record, so `task audit` shows exactly what each
+turn received. Skill entries are validated at delegate time: a missing
+directory or `SKILL.md` fails delegation before any agent runs.
+
 ### `agent_settings` (top-level table)
 
 | Field | Type | Notes |
@@ -85,6 +103,7 @@ A handoff is rejected with a `ValueError` when any of these holds:
 - `budget_hint` is set and ≤ 0
 - any `fallback` entry is empty
 - `max_bounces` is set but not an integer ≥ 0 (booleans are rejected)
+- a `[[context]]` entry is not a table, has no non-empty `label`, sets both or neither of `text`/`path`, names an unknown `kind`, or carries a `phases` list with unknown/empty values
 
 Additional refusals happen at delegation time (see
 [Delegate a task — rules](../how-to/delegate-a-task.md#rules-that-will-refuse-your-delegation)):
@@ -99,8 +118,8 @@ fields (the error lists the registered agents), and `review_agent == target_agen
 `load_handoff_file(path)` (used by `maestro delegate --file` and the MCP
 `delegate` tool) accepts:
 
-1. **JSON object containing any of the four section keys** (`handoff`,
-   `routing`, `expectations`, `constraints`) → parsed as the 4-section document.
+1. **JSON object containing any of the section keys** (`handoff`, `routing`,
+   `expectations`, `constraints`, `context`) → parsed as the 4-section document.
 2. **JSON object with `title` and `request` but no section keys** → parsed as a
    legacy 0.8.x handoff (below).
 3. **Anything else that is not valid JSON** → parsed as TOML (4-section shape).

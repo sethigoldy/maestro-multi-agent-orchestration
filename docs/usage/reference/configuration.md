@@ -82,6 +82,38 @@ delegate time (presets are config, registries are state). Precedence follows
 the config chain: a project's `[modes.<name>]` table wins over the user-level
 one for that preset name. `maestro config` prints every defined preset.
 
+### `[context]` — standing context entries
+
+```toml
+[context.style]
+text = "Follow docs/STYLE.md; error shapes live in src/api/errors.py."
+
+[context.pdf-skill]
+kind   = "skill"                 # text (default) | file | skill
+path   = "~/skills/pdf-processing"  # directory containing SKILL.md
+phases = ["implementer"]         # optional — default: all phases
+```
+
+Each `[context.<label>]` table is one standing context entry, keyed by label
+(see [Context injection in the README](../../../README.md#context-injection)).
+The table key is the label; an explicit conflicting `label` field inside the
+table is an error. Entry keys:
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `text` | string | — | Required for `kind = "text"`; exactly one of `text`/`path` |
+| `path` | string | — | Required for `file`/`skill`; relative paths resolve against the workspace, `~` expands |
+| `kind` | string | inferred | `text` when only `text` is set, else `file`; explicit `"skill"` requires a directory with a `SKILL.md` |
+| `phases` | list of strings | all three | Subset of `implementer`, `verifier`, `reviewer` |
+
+Standing entries are composed into every task at delegate time; per-task
+`[[context]]` handoff entries override them by label. Skill paths are checked
+at delegate time (missing directory or `SKILL.md` fails the delegation).
+Precedence follows the config chain: a project's `[context.<label>]` table
+wins over the user-level one for that label. Validation at load is strict —
+invalid entries raise, like `[modes]`. `maestro config` lists every defined
+entry with its source.
+
 ## Verification auto-detection
 
 With handoff `verification = "auto"` (the default), the check command is

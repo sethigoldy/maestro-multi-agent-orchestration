@@ -27,6 +27,7 @@ moment you open a document:
 | [Register and configure agents](how-to/register-an-agent.md) | make any CLI, REST server, or remote daemon available as a delegation target |
 | [Delegate a task](how-to/delegate-a-task.md) | author a handoff (flags or file), pick target/fallback/settings, launch it |
 | [Configure work modes](how-to/configure-work-modes.md) | register model tiers as agents, define presets that pin agents to each phase of the task cycle, delegate with them, read per-phase cost, handle parked tasks |
+| [Inject context into tasks](how-to/inject-context.md) | write standing context in config (text, file, skill entries), attach per-task context via handoff or CLI flags, scope entries to phases, verify what each turn received |
 | [Manage in-flight tasks](how-to/manage-in-flight-tasks.md) | answer agent questions, send follow-ups, cancel work, block on completion |
 | [Inspect tasks and artifacts](how-to/inspect-tasks-and-artifacts.md) | read status, audits, live streams, dashboards; find branches, results, verification reports; clean up old tasks |
 | [Run Maestro across machines](how-to/run-cross-machine.md) | expose a daemon to the network with token auth and delegate to it from another machine |
@@ -44,7 +45,7 @@ moment you open a document:
 
 | Document | What it covers |
 |---|---|
-| [How delegation works](explanation/how-delegation-works.md) | the daemon architecture, task lifecycle states, role-agnostic routing, durable state, verification, work-mode gates and bounces, retries and budgets |
+| [How delegation works](explanation/how-delegation-works.md) | the daemon architecture, task lifecycle states, role-agnostic routing, durable state, verification, work-mode gates and bounces, context injection, retries and budgets |
 
 ## Related documents outside this section
 

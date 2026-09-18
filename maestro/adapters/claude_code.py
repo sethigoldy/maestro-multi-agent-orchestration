@@ -19,6 +19,17 @@ class ClaudeCodeAdapter(BaseAdapter):
         model = settings.get("model") or (self.spec.model if self.spec else None)
         if model:
             command.extend(["--model", str(model)])
+        # Reserved key from the daemon's context injection (see maestro/context.py):
+        # standing context rides in the system prompt, staged skills are discovered
+        # from <skills_root>/.claude/skills/<label>/.
+        context = settings.get("maestro_context")
+        if isinstance(context, dict):
+            system_file = context.get("system_file")
+            if system_file and Path(system_file).is_file():
+                command.extend(["--append-system-prompt-file", str(system_file)])
+            skills_root = context.get("skills_root")
+            if skills_root and Path(skills_root).is_dir():
+                command.extend(["--add-dir", str(skills_root)])
         return command  # prompt arrives on stdin
 
     def parse_line(self, line: str) -> dict[str, Any] | None:

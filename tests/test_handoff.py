@@ -29,9 +29,9 @@ def test_default_document_is_valid():
     assert doc.max_depth_remaining == 3 and doc.sensitive is False
 
 
-def test_to_dict_has_four_sections_plus_settings():
+def test_to_dict_has_sections_plus_context_and_settings():
     data = _doc(fallback=["claude_code"], budget_hint=2.5, agent_settings={"model": "m"}).to_dict()
-    assert set(data) == {"handoff", "routing", "expectations", "constraints", "agent_settings"}
+    assert set(data) == {"handoff", "routing", "expectations", "constraints", "context", "agent_settings"}
     assert data["routing"]["target_agent"] == "codex" and data["routing"]["fallback"] == ["claude_code"]
     assert data["expectations"]["budget_hint"] == 2.5
     assert data["agent_settings"] == {"model": "m"}
@@ -176,3 +176,71 @@ def test_max_bounces_validation():
     with pytest.raises(ValueError, match="max_bounces"):
         validate_handoff(_doc(max_bounces=True))  # bool is not an int here
     assert validate_handoff(_doc(max_bounces=0)).max_bounces == 0
+
+
+# ------------------------------------------------------------------ context entries
+def test_context_entries_round_trip_dict():
+    doc = _doc(context_entries=[
+        {"label": "style", "kind": "text", "text": "Follow docs/STYLE.md"},
+        {"label": "spec", "kind": "file", "path": "docs/spec.md"},
+        {"label": "pdf", "kind": "skill", "path": "~/skills/pdf", "phases": ["implementer"]},
+    ])
+    data = doc.to_dict()
+    assert data["context"][0] == {"label": "style", "kind": "text", "text": "Follow docs/STYLE.md"}
+    restored = from_dict(data)
+    assert restored.context_entries == doc.context_entries
+
+
+def test_context_entries_absent_default_empty():
+    doc = from_dict({"handoff": {"title": "t", "request": "r"}, "routing": {}, "expectations": {}, "constraints": {}})
+    assert doc.context_entries == []
+    assert "context" in doc.to_dict() and doc.to_dict()["context"] == []
+
+
+def test_context_entries_toml_round_trip():
+    doc = _doc(context_entries=[
+        {"label": "style", "kind": "text", "text": "Line one\nline two"},
+        {"label": "checklist", "kind": "text", "text": "Review carefully", "phases": ["reviewer"]},
+    ])
+    text = to_toml(doc)
+    assert "[[context]]" in text
+    restored = from_toml(text)
+    assert restored.context_entries == doc.context_entries
+
+
+def test_context_entry_validation_errors():
+    bad_entries = [
+        "not a table",
+        {},  # missing label
+        {"label": ""},
+        {"label": "x"},  # no text or path
+        {"label": "x", "kind": "magic", "text": "t"},
+        {"label": "x", "kind": "skill"},  # skill without path
+        {"label": "x", "kind": "file", "path": "p", "text": "t"},  # both set
+        {"label": "x", "kind": "text", "text": " ", "path": None},  # blank text
+        {"label": "x", "kind": "text", "text": "t", "phases": ["supervisor"]},
+        {"label": "x", "kind": "text", "text": "t", "phases": []},
+        {"label": "x", "kind": "text", "text": "t", "phases": "implementer"},
+    ]
+    for bad in bad_entries:
+        with pytest.raises(ValueError):
+            validate_handoff(_doc(context_entries=[bad]))
+
+
+def test_context_entry_defaults_in_validation():
+    doc = validate_handoff(_doc(context_entries=[{"label": "n", "text": "t"}]))
+    assert doc.context_entries == [{"label": "n", "text": "t"}]
+
+
+def test_load_handoff_file_with_context_section(tmp_path):
+    p = tmp_path / "h.json"
+    payload = _doc().to_dict()
+    payload["context"] = [{"label": "style", "kind": "text", "text": "be brief"}]
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    doc = load_handoff_file(p)
+    assert doc.context_entries == [{"label": "style", "kind": "text", "text": "be brief"}]
+
+
+def test_context_section_must_be_list_of_tables():
+    with pytest.raises(ValueError, match="context entries"):
+        from_dict({"handoff": {"title": "t", "request": "r"}, "routing": {}, "expectations": {}, "constraints": {}, "context": {"label": "x"}})

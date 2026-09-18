@@ -60,6 +60,11 @@ A handoff file may carry `[routing] mode = "NAME"` (or the explicit
 under a work-mode preset — see [Configure work modes](../how-to/configure-work-modes.md).
 Signature unchanged: the routing lives in the file.
 
+A handoff file may also carry `[[context]]` entries (label + `text` or `path`,
+optional `kind` and `phases`) to inject user-controlled context into the agent
+turns — see [Context injection in the README](../../../README.md#context-injection).
+Signature unchanged: the context lives in the file.
+
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
 - If the workspace already has an active task, returns immediately with

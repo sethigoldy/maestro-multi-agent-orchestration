@@ -54,8 +54,11 @@ def delegate(workspace: str, handoff_file: str) -> str:
     The handoff file may be the 4-section Maestro document (JSON or TOML) or a
     legacy 0.8.x staged handoff. A [routing] mode name selects a work-mode preset
     from config that pins implementer/reviewer/verifier/fixer agents to the task's
-    phases; explicit routing fields in the file win over the preset. Returns the
-    final A2A task object (state, artifacts, workspace/branch metadata)."""
+    phases; explicit routing fields in the file win over the preset. Optional
+    [[context]] entries (label + text or path, kind text/file/skill, optional
+    phases) inject user-controlled context into the agent turns and are composed
+    with standing [context] config entries at delegate time. Returns the final A2A
+    task object (state, artifacts, workspace/branch metadata)."""
     d = get_daemon()
     try:
         doc = load_handoff_file(handoff_file)

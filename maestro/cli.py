@@ -190,6 +190,17 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
             target_agent=args.target or "codex", fallback=list(args.fallback),
             mode=args.mode, explicit_target=args.target is not None,
         )
+    flag_entries: list[dict[str, Any]] = []
+    for text in args.context:
+        flag_entries.append({"label": f"context-{len(flag_entries) + 1}", "kind": "text", "text": text})
+    for file_path in args.context_file:
+        stem = Path(file_path).expanduser().stem or "file"
+        flag_entries.append({"label": stem, "kind": "file", "path": str(Path(file_path).expanduser())})
+    for skill_path in args.skill:
+        name = Path(skill_path).expanduser().name or "skill"
+        flag_entries.append({"label": name, "kind": "skill", "path": str(Path(skill_path).expanduser())})
+    if flag_entries:
+        doc.context_entries = [*doc.context_entries, *flag_entries]
     url, token = _daemon_endpoint()
     result = _post_jsonrpc(url, "message/send", {"message": {
         "kind": "message", "role": "user",
@@ -394,6 +405,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--mode", default=None, help="Work-mode preset name from config [modes] (pins implementer/reviewer/verifier/fixer)")
     d.add_argument("--fallback", action="append", default=[], help="Fallback agent (repeatable)")
     d.add_argument("--design-file", default=None, help="Design text file to attach")
+    d.add_argument("--context", action="append", default=[], metavar="TEXT",
+                   help="Context entry text injected into the agent's prompt (repeatable; label auto-numbered)")
+    d.add_argument("--context-file", action="append", default=[], metavar="PATH",
+                   help="Context file inlined (or artifact-referenced) for the task (repeatable; label = file stem)")
+    d.add_argument("--skill", action="append", default=[], metavar="PATH",
+                   help="Agent Skills directory containing SKILL.md, staged for the task (repeatable; label = directory name)")
     d.add_argument("--no-wait", action="store_true", help="Return immediately after enqueueing")
     _add_target_args(d)
 
@@ -531,7 +548,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(m.status(args.task_id), indent=2)); return 0
             if args.cmd == "config":
                 modes = {name: preset.to_dict() for name, preset in (m.config.get("modes") or {}).items()}
-                print(json.dumps({**m.codex_defaults(), "modes": modes}, indent=2)); return 0
+                context = {label: entry.to_dict() for label, entry in (m.config.get("context") or {}).items()}
+                print(json.dumps({**m.codex_defaults(), "modes": modes, "context": context}, indent=2)); return 0
             raise AssertionError("unhandled command")  # pragma: no cover
         finally:
             m.close()

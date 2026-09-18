@@ -9,6 +9,10 @@ Every delegation between agents — human or machine — is normalized to this s
     [expectations]  what done looks like (artifacts, verification, commit_policy, budget_hint)
     [constraints]   guardrails inherited from config (sensitive, max_depth_remaining)
 
+Plus an optional ``[[context]]`` array of typed context entries (see
+maestro/context.py) — user-controlled context composed with standing config entries
+at delegate time.
+
 The document is carried as structured data in A2A message parts and stored with the
 task. Legacy 0.8.x staged handoffs (JSON: title/request/design_file/model/effort)
 are converted via :func:`from_legacy`.
@@ -22,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .context import parse_entry
+
 COMMIT_POLICIES = ("no-commit", "branch", "pr")
 VERIFICATION_MODES = ("auto", "command", "none")
 
@@ -34,6 +40,10 @@ class HandoffDoc:
     design: str = ""
     context_files: list[str] = field(default_factory=list)
     context_notes: str = ""
+    # [[context]] — typed context entries (label + text|path, optional kind/phases).
+    # Stored as plain dicts; composed with standing config entries at delegate time
+    # and replaced by the merged list so the task record is self-contained (C2).
+    context_entries: list[dict[str, Any]] = field(default_factory=list)
     # [routing]
     target_agent: str = "codex"
     fallback: list[str] = field(default_factory=list)
@@ -90,6 +100,7 @@ class HandoffDoc:
                 "sensitive": self.sensitive,
                 "max_depth_remaining": self.max_depth_remaining,
             },
+            "context": [dict(e) for e in self.context_entries],
             "agent_settings": dict(self.agent_settings),
         }
 
@@ -114,6 +125,8 @@ def validate_handoff(doc: HandoffDoc) -> HandoffDoc:
     for agent in doc.fallback:
         if not str(agent).strip():
             raise ValueError("Fallback agents must be non-empty strings")
+    for entry in doc.context_entries:
+        parse_entry(entry, source="handoff")
     return doc
 
 
@@ -138,6 +151,7 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         design=str(handoff.get("design", "")),
         context_files=[str(x) for x in handoff.get("context_files", [])],
         context_notes=str(handoff.get("context_notes", "")),
+        context_entries=list(data.get("context", [])),
         target_agent=str(routing.get("target_agent") or "codex"),
         fallback=[str(x) for x in routing.get("fallback", [])],
         origin_agent=str(routing.get("origin_agent") or "human"),
@@ -176,6 +190,8 @@ def to_toml(doc: HandoffDoc) -> str:
         section: {k: v for k, v in data[section].items() if v is not None}
         for section in ("handoff", "routing", "expectations", "constraints", "agent_settings")
     }
+    if doc.context_entries:
+        flat["context"] = [{k: v for k, v in entry.items() if v is not None} for entry in doc.context_entries]
     # 'request'/'design' may be multi-line strings — the minimal writer escapes \n.
     return _dump_toml(flat)
 
@@ -228,7 +244,7 @@ def load_handoff_file(path: "str | Path") -> HandoffDoc:
         return from_toml(text)
     if not isinstance(payload, dict):
         raise ValueError("Handoff file must contain an object")
-    if any(section in payload for section in ("handoff", "routing", "expectations", "constraints")):
+    if any(section in payload for section in ("handoff", "routing", "expectations", "constraints", "context")):
         return from_dict(payload)
     if payload.get("title") and payload.get("request"):
         return from_legacy(payload)

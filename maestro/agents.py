@@ -169,8 +169,18 @@ def _dump_toml(data: dict[str, Any]) -> str:
         elif isinstance(value, list):
             if all(isinstance(item, str) for item in value):
                 lines.append(f"{key} = [{', '.join(_toml_scalar(item) for item in value)}]")
+            elif all(isinstance(item, dict) for item in value):
+                # Array of tables: [[key]] blocks (e.g. the handoff's [[context]]).
+                for item in value:
+                    lines.append("")
+                    lines.append(f"[[{key}]]")
+                    for sub_key, sub_value in item.items():
+                        if isinstance(sub_value, list):
+                            lines.append(f"{sub_key} = [{', '.join(_toml_scalar(x) for x in sub_value)}]")
+                        else:
+                            lines.append(f"{sub_key} = {_toml_scalar(sub_value)}")
             else:
-                raise TypeError(f"List {key!r} must contain only strings")
+                raise TypeError(f"List {key!r} must contain only strings or tables")
         else:
             lines.append(f"{key} = {_toml_scalar(value)}")
     for key, table in nested.items():

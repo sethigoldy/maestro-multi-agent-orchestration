@@ -219,6 +219,47 @@ independent signal — the same epistemic rule as no-self-delegation), and a
 preset's agents are checked against the live registry when the task starts, so
 a stale preset fails fast with the registered list rather than mid-cycle.
 
+## Context injection
+
+The design question context injection answers: how does the user inject their
+own context into agent turns when the supervising agent may not think to add it?
+Handoffs have always carried `design`, `context_notes`, and `context_files` —
+but those were advisory, unattributed, and invisible to gate turns. Context
+entries make the channel first-class: typed, labeled, layered, and recorded.
+
+The layering follows the same specificity order as everything else in Maestro
+(config → handoff):
+
+- **Standing context is config.** `[context.<label>]` tables in the user or
+  project config reach every task in that scope — repo conventions, shared
+  skills — written once instead of repeated per delegation. This is the
+  "the supervisor may not add it" channel: it does not depend on any agent's
+  judgment about what to include.
+- **Per-task context is handoff.** `[[context]]` entries override standing
+  entries by label and are composed at delegate time; the merged list is stored
+  on the task record, so what each turn received is inspectable (`task audit`)
+  rather than hidden in prompt assembly.
+- **Phases are scope.** Entries can target `implementer`, `verifier`, or
+  `reviewer` turns — the same phase vocabulary as work modes — so a reviewer's
+  checklist never bloats the implementer's prompt, and vice versa.
+
+Two invariants keep it safe:
+
+- **Context is data, not code.** Maestro stages skill directories and copies
+  oversized files into the task dir; it never executes context content. The
+  trust level equals config: entries point at paths the user manages, and a
+  skill is treated like installing software.
+- **Bounded by degradation.** Inlined files are capped (8KB) and the rendered
+  block is capped (32KB); overflow degrades to artifact references or a visible
+  dropped-labels note — context can bloat a prompt, but it cannot break a task.
+
+The one adapter-specific detail: for Claude Code targets, standing entries ride
+in the system prompt (`--append-system-prompt-file`) instead of the task
+message, and staged skills are passed via `--add-dir` (the discovery mechanism
+of the [Agent Skills open standard](https://agentskills.io/)). Every other
+adapter receives everything as a labeled block in the prompt — same data,
+different channel.
+
 ## Retries, fallbacks, and money
 
 Each agent in the target→fallback chain gets `1 + MAESTRO_MAX_RETRIES`
