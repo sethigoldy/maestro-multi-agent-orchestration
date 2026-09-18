@@ -522,6 +522,30 @@ def test_kill_group_sigkill_lookup_error_swallowed(monkeypatch, tmp_path):
     assert result.ok is False and signal.SIGKILL in seen
 
 
+def test_kill_group_term_lookup_error_swallowed(monkeypatch):
+    # The group may already be gone by the time we send SIGTERM (race on slow
+    # teardown); the lookup error must be swallowed, not raised. Deterministic
+    # across OSes — no real process involved.
+    import maestro.adapters.base as base_mod
+
+    class _Proc:
+        pid = 987654
+
+        def wait(self, timeout=None):
+            return 0
+
+    seen: list[int] = []
+
+    def _killpg(pgid, sig):
+        seen.append(sig)
+        raise ProcessLookupError("group already gone")
+
+    monkeypatch.setattr(base_mod.os, "getpgid", lambda pid: 12345)
+    monkeypatch.setattr(base_mod.os, "killpg", _killpg)
+    base_mod._kill_group(_Proc())  # must not raise
+    assert seen == [signal.SIGTERM]
+
+
 def test_spawn_streaming_oserror(monkeypatch, tmp_path):
     import maestro.adapters.base as base_mod
 
