@@ -15,15 +15,15 @@ def test_claude_rules_are_zero_discovery_and_codex_first():
     assert "Do not read Maestro source code" in text
     assert "delegate to Maestro/Codex" in text
     assert "Do not use Claude subagents for implementation" in text
-    assert "codex_followup" in text
+    assert "followup" in text
 
 
 def test_maestro_skill_is_minimal_routing_contract():
     text = (ROOT / ".claude/skills/maestro/SKILL.md").read_text()
     assert "Do not open Maestro source/docs" in text
-    assert "delegate_to_codex" in text
-    assert "codex_followup" in text
-    assert "review_task" in text
+    assert "delegate" in text
+    assert "followup" in text
+    assert "task_wait" in text
 
 
 def test_agent_rules_keep_codex_as_implementation_owner():

@@ -357,9 +357,6 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro agents list \| add \| remove \| discover \| status <name>` | Manage registered agents |
 | `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
 | `maestro budgets` | Show budget caps and current spend |
-| `maestro handoff --title … --request … --design-file F [--model M] [--effort E]` | Create + launch a Codex handoff directly (no daemon) |
-| `maestro codex-followup <id> "instruction"` | Send a follow-up to the task's Codex run |
-| `maestro run <id>` | Launch implementation for an existing task |
 | `maestro config` | Show effective Codex defaults |
 | `maestro storage …` | Manage storage backends |
 | `maestro gc [--days N] [--dry-run]` | Delete terminal tasks older than the TTL (manual only) |
@@ -488,9 +485,10 @@ to Maestro's agents. Setup:
    ```
 
 Claude creates a compact handoff, calls Maestro's `delegate` tool (which goes
-through the same daemon as the CLI), waits on the event stream, reviews the
-result, and can send follow-ups (`codex_followup`) until it approves. You never
-copy prompts between tools by hand.
+through the same daemon as the CLI and blocks until the work completes, fails,
+or needs input), reviews the returned result and diff itself, and can send
+follow-ups (`followup`) until it approves. You never copy prompts between tools
+by hand.
 
 The MCP tools mirror the CLI: `delegate`, `task_wait`, `task_status`,
 `followup`, … — everything the CLI can do, Claude can do.

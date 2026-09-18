@@ -361,7 +361,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="maestro", description="Claude-supervised orchestration with user-level task state")
+    p = argparse.ArgumentParser(prog="maestro", description="Multi-agent orchestration broker with durable user-level task state")
     p.add_argument("--version", action="version", version=VERSION)
     _add_target_args(p)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -409,20 +409,6 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("budgets", help="Show budget caps and current spend (MAESTRO_BUDGET_*_USD)")
 
-    h = sub.add_parser("handoff", help="Manually create and launch a Codex handoff")
-    h.add_argument("--title", required=True)
-    h.add_argument("--request", required=True)
-    h.add_argument("--design-file", required=True)
-    h.add_argument("--model")
-    h.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
-    _add_target_args(h)
-    follow = sub.add_parser("codex-followup", help="Delegate a follow-up directly to Codex")
-    follow.add_argument("task_id")
-    follow.add_argument("instruction")
-    _add_target_args(follow)
-    r = sub.add_parser("run", help="Launch implementation for a task")
-    r.add_argument("task_id")
-    _add_target_args(r)
     s = sub.add_parser("status", help="Show task status")
     s.add_argument("task_id")
     _add_target_args(s)
@@ -536,18 +522,6 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.cmd == "task" and args.task_cmd in {"status", "show"}:
                 print(json.dumps(m.status(args.task_id), indent=2)); return 0
-            if args.cmd == "handoff":
-                try:
-                    design = Path(args.design_file).read_text(encoding="utf-8")
-                except OSError as exc:
-                    raise ValueError(f"Unable to read design file: {exc}") from exc
-                task_data = m.create_handoff(args.title, args.request, design, model=args.model, effort=args.effort)
-                launch = m.implement_async(task_data["task_id"])
-                print(json.dumps({"task": task_data, "launch": launch}, indent=2)); return 0
-            if args.cmd == "codex-followup":
-                print(json.dumps(m.codex_followup(args.task_id, args.instruction), indent=2)); return 0
-            if args.cmd == "run":
-                print(json.dumps(m.implement_async(args.task_id), indent=2)); return 0
             if args.cmd == "status":
                 print(json.dumps(m.status(args.task_id), indent=2)); return 0
             if args.cmd == "config":
