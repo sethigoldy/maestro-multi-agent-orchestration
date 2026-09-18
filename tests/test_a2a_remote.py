@@ -790,8 +790,12 @@ def test_a2a_remote_observer_exception_and_postloop_timeout(tmp_path):
     finally:
         srv.close()
 
-    # launch alone exceeds the tiny deadline: the pre-get check reports the timeout
-    quick = _JsonRpcServer(tmp_path)  # empty sse_body -> immediate close, no terminal state
+    # Hold the stream open (no events, no close) so the only way out before
+    # the tiny deadline is the timeout path itself — deterministic on any OS:
+    # either the pre-get check fires or queue.get() times out, both report
+    # "timed out after 0.001s". An immediately-closing stream would race the
+    # deadline and sometimes win with "stream closed before a terminal state".
+    quick = _JsonRpcServer(tmp_path, hold_sse=True)
     try:
         adapter = A2ARemoteAdapter(AgentSpec(name="x", kind="a2a_remote", command=quick.url))
         result = adapter.run("p", Path(tmp_path), "t8", timeout=0.001)
