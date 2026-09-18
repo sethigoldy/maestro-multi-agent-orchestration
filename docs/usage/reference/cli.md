@@ -53,8 +53,9 @@ when authentication is enabled.
 
 ```text
 maestro delegate (--file FILE | --title T --request R (--target A | --mode NAME))
-                 [--fallback A …] [--design-file FILE] [--no-wait]
-                 [--workspace DIR | --project DIR]
+                 [--fallback A …] [--design-file FILE]
+                 [--context TEXT …] [--context-file PATH …] [--skill DIR …]
+                 [--no-wait] [--workspace DIR | --project DIR]
 ```
 
 Submits a handoff to the daemon and, by default, blocks while streaming the
@@ -67,6 +68,9 @@ task's event stream.
 | `--mode NAME` | Apply the work-mode preset of that name (a `[modes.NAME]` config table) — it pins the implementer/verifier/reviewer/fixer agents for this task. With `--file`, a flag value overrides the file's `[routing] mode` |
 | `--fallback A` | Fallback agent, tried in order after the target fails or is unavailable. Repeatable |
 | `--design-file FILE` | File whose text becomes the handoff's authoritative design |
+| `--context TEXT` | Add a `text` context entry to the handoff. Repeatable; labels are auto-numbered (`context-1`, …) |
+| `--context-file PATH` | Add a `file` context entry for that path (inlined when ≤8KB, otherwise artifact-referenced). Repeatable; label = file stem |
+| `--skill DIR` | Add a `skill` context entry: an [Agent Skills](https://agentskills.io/) directory containing a `SKILL.md`, staged for the task. Repeatable; label = directory name |
 | `--no-wait` | Return immediately after enqueueing; prints the daemon's response (task id or queued notice) and exits 0 |
 
 Output while waiting: a `[task] <id> — target=… workspace=…` line (`mode=…`
@@ -159,11 +163,14 @@ cap. Prints a notice when no caps are configured (`MAESTRO_BUDGET_PER_AGENT_USD`
 maestro config [--workspace DIR | --project DIR]
 ```
 
-Prints the effective Codex defaults and work-mode presets for the resolved
-scope as JSON: `{"model": …, "effort": …, "modes": {NAME: {"implementer": …,
-"verifier": …, "reviewer": …, "fixer": …, "max_bounces": N}}}` — `model`/
-`effort` may be `null`, and `modes` is `{}` when no presets are defined. See
-[Configuration reference](configuration.md).
+Prints the effective Codex defaults, work-mode presets, and standing context
+entries for the resolved scope as JSON: `{"model": …, "effort": …, "modes":
+{NAME: {"implementer": …, "verifier": …, "reviewer": …, "fixer": …,
+"max_bounces": N}}, "context": {LABEL: {"label": …, "kind": …, "text"|"path":
+…, "phases": […]}}}` — `model`/`effort` may be `null`, `modes` is `{}` when no
+presets are defined, and `context` is `{}` when no entries are. Entries carry
+their source (`user config` / `project config`) after the config chain merges
+them. See [Configuration reference](configuration.md).
 
 ## storage
 

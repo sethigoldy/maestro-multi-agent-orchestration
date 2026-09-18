@@ -164,6 +164,29 @@ def test_claude_command_and_usage_parsing(tmp_path):
     assert adapter.parse_line("{broken json") is None
 
 
+def test_claude_command_context_flags(tmp_path):
+    adapter = ClaudeCodeAdapter(_spec("cc", kind="claude_code"))
+    system_file = tmp_path / "context-system.md"
+    system_file.write_text("standing", encoding="utf-8")
+    skills_root = tmp_path / "skills"
+    skills_root.mkdir()
+    cmd = adapter.build_command("p", tmp_path, "t", {
+        "maestro_context": {"system_file": str(system_file), "skills_root": str(skills_root)},
+    })
+    assert f"--append-system-prompt-file {system_file}" in " ".join(cmd)
+    assert f"--add-dir {skills_root}" in " ".join(cmd)
+
+    # Missing file/dir: the flags are skipped, never passed with a dead path.
+    cmd = adapter.build_command("p", tmp_path, "t", {
+        "maestro_context": {"system_file": str(tmp_path / "missing.md"), "skills_root": str(tmp_path / "nope")},
+    })
+    assert "--append-system-prompt-file" not in cmd and "--add-dir" not in cmd
+
+    # A non-dict maestro_context value is ignored.
+    cmd = adapter.build_command("p", tmp_path, "t", {"maestro_context": "bogus"})
+    assert "--append-system-prompt-file" not in cmd and "--add-dir" not in cmd
+
+
 def test_codex_usage_parsing():
     adapter = CodexAdapter(_spec("codex"))
     parsed = adapter.parse_line(json.dumps({"type": "turn.completed", "total_cost_usd": 1.5, "tokens_used": 99}))

@@ -1793,3 +1793,155 @@ def test_work_mode_status_partial_gates_claims(daemon, tmp_path):
     daemon.maestro._write_claim(tid2, "task_gates", json.dumps({"verdicts": {"review": {"agent": "r", "ok": True, "issues": []}}}))
     s2 = daemon.maestro.status(tid2)
     assert s2["gates"]["review"] == {"agent": "r", "ok": True, "issue_count": 0} and "bounces" not in s2
+
+
+
+# ------------------------------------------------------------------ context injection
+def _prompt_dumping(daemon, binpath, name, dump_file, extra=""):
+    """Register a generic arg-mode agent whose prompt is argv element 2.
+
+    Arg-mode prompts travel through the command template ({prompt}), so the
+    registered command carries the placeholder explicitly.
+    """
+    body = f'[ "$1" = "--go" ] || exit 0\nprintf \'%s\' "${{2:-}}" > {dump_file}\n{extra}exit 0'
+    _fake_bin(binpath, name, body)
+    daemon.registry.save(AgentSpec(name=name, kind="generic", command=f"{name} --go {{prompt}}"))
+
+
+def test_context_entries_reach_prompt_and_record(daemon, tmp_path, binpath):
+    _prompt_dumping(daemon, binpath, "impl", ".impl-prompt")
+    ws = _git_repo(tmp_path)
+    (ws / "spec.md").write_text("The spec body.", encoding="utf-8")
+    doc = _doc(target_agent="impl", context_entries=[
+        {"label": "style", "kind": "text", "text": "Be terse."},
+        {"label": "spec", "kind": "file", "path": "spec.md"},
+    ])
+    started = daemon.delegate(doc, ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    prompt = (ws / ".impl-prompt").read_text(encoding="utf-8")
+    assert "CONTEXT (user-provided; follow these along with the request):" in prompt
+    assert "[style] (handoff)\nBe terse." in prompt
+    assert "[spec] (handoff)\nThe spec body." in prompt
+    # C2: the stored record carries the composed entries with sources stamped.
+    record = daemon._tasks[started["task_id"]]
+    assert [e["label"] for e in record["doc"]["context"]] == ["style", "spec"]
+    assert all(e.get("source") == "handoff" for e in record["doc"]["context"])
+
+
+def test_standing_config_context_composed(daemon, tmp_path, binpath):
+    from maestro.context import ContextEntry
+
+    _prompt_dumping(daemon, binpath, "impl", ".impl-prompt")
+    daemon.maestro.config["context"] = {"style": ContextEntry(label="style", kind="text", text="Standing rule.", source="project config")}
+    ws = _git_repo(tmp_path)
+    doc = _doc(target_agent="impl", context_entries=[{"label": "extra", "kind": "text", "text": "Task note."}])
+    started = daemon.delegate(doc, ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    prompt = (ws / ".impl-prompt").read_text(encoding="utf-8")
+    assert "[style] (project config)\nStanding rule." in prompt
+    assert "[extra] (handoff)\nTask note." in prompt
+    record = daemon._tasks[started["task_id"]]
+    composed = {e["label"]: e for e in record["doc"]["context"]}
+    assert [e["label"] for e in record["doc"]["context"]] == ["style", "extra"]
+    assert composed["style"]["source"] == "project config" and composed["extra"]["source"] == "handoff"
+
+
+def test_gate_turns_receive_phase_scoped_context(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _prompt_dumping(daemon, binpath, "impl", ".impl-prompt")
+    _prompt_dumping(daemon, binpath, "rev", ".rev-prompt", extra='echo VERDICT: PASS\n')
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
+    ws = _git_repo(tmp_path)
+    doc = _doc(verification="auto", mode="economy", context_entries=[
+        {"label": "shared", "kind": "text", "text": "Everyone sees this."},
+        {"label": "review-only", "kind": "text", "text": "Reviewer checklist.", "phases": ["reviewer"]},
+    ])
+    started = daemon.delegate(doc, ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    impl_prompt = (ws / ".impl-prompt").read_text(encoding="utf-8")
+    rev_prompt = (ws / ".rev-prompt").read_text(encoding="utf-8")
+    assert "Everyone sees this." in impl_prompt and "Reviewer checklist." not in impl_prompt
+    assert "Everyone sees this." in rev_prompt and "Reviewer checklist." in rev_prompt
+
+
+def test_fix_turn_receives_implementer_context(daemon, tmp_path, binpath):
+    from maestro.modes import parse_modes
+
+    _prompt_dumping(daemon, binpath, "impl", ".impl-prompt")
+    _prompt_dumping(daemon, binpath, "fixer", ".fix-prompt")
+    _register_generic(
+        daemon, binpath, "rev",
+        'if [ -f .reviewed ]; then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; echo "ISSUES:"; echo "- missing tests"; touch .reviewed; fi\nexit 0',
+    )
+    daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev", "fixer": "fixer"}})
+    ws = _git_repo(tmp_path)
+    doc = _doc(verification="auto", mode="economy", context_entries=[
+        {"label": "impl-only", "kind": "text", "text": "Implementer note.", "phases": ["implementer"]},
+        {"label": "review-only", "kind": "text", "text": "Reviewer checklist.", "phases": ["reviewer"]},
+    ])
+    started = daemon.delegate(doc, ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    fix_prompt = (ws / ".fix-prompt").read_text(encoding="utf-8")
+    assert "Implementer note." in fix_prompt and "Reviewer checklist." not in fix_prompt
+
+
+def test_skill_context_missing_dir_fails_delegate(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    doc = _doc(context_entries=[{"label": "ghost", "kind": "skill", "path": "/nonexistent/skill"}])
+    with pytest.raises(ValueError, match="directory not found"):
+        daemon.delegate(doc, ws)
+
+
+def test_skill_context_missing_skill_md_fails_delegate(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    empty = tmp_path / "noskill"
+    empty.mkdir()
+    doc = _doc(context_entries=[{"label": "bare", "kind": "skill", "path": str(empty)}])
+    with pytest.raises(ValueError, match="no SKILL.md"):
+        daemon.delegate(doc, ws)
+
+
+def test_claude_code_context_flags_and_staging(daemon, tmp_path, binpath):
+    from maestro.context import ContextEntry
+
+    _fake_bin(binpath, "claude", '[ "$1" = "-p" ] || exit 0\nprintf \'%s\\n\' "$@" > .claude-argv\ncat > /dev/null\nexit 0')
+    daemon.registry.save(AgentSpec(name="cc", kind="claude_code"))
+    skill = tmp_path / "skills" / "pdf"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: pdf\n---\nDo PDF things.", encoding="utf-8")
+    daemon.maestro.config["context"] = {"style": ContextEntry(label="style", kind="text", text="Standing rule.", source="project config")}
+    ws = _git_repo(tmp_path)
+    doc = _doc(target_agent="cc", context_entries=[{"label": "pdf", "kind": "skill", "path": str(skill)}])
+    started = daemon.delegate(doc, ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    argv = (ws / ".claude-argv").read_text(encoding="utf-8")
+    task_dir = daemon.state_dir / "tasks" / started["task_id"]
+    skills_root = task_dir / "context" / "skills"
+    system_file = task_dir / "context-system.md"
+    # The fake prints one arg per line; join to reconstruct the command.
+    joined = " ".join(argv.split())
+    assert f"--append-system-prompt-file {system_file}" in joined
+    assert f"--add-dir {skills_root}" in joined
+    assert (skills_root / ".claude" / "skills" / "pdf" / "SKILL.md").is_file()
+    assert system_file.read_text(encoding="utf-8") == "[style] (project config)\nStanding rule.\n"
+
+
+def test_build_prompt_context_block_placement(daemon, tmp_path):
+    from maestro.daemon import build_fix_prompt, build_prompt, build_review_prompt, build_verify_prompt
+
+    doc = _doc(design="The design.")
+    ws = tmp_path  # must exist: gate builders run git for the diff excerpt
+    plain = build_prompt(doc, "task-1", ws, [])
+    assert "CONTEXT (user-provided" not in plain  # C6: no context -> unchanged shape
+    with_ctx = build_prompt(doc, "task-1", ws, [], context_block="CTX-BLOCK")
+    assert "The design.\n\nCTX-BLOCK\n\nCONTEXT NOTES:" in with_ctx
+    report = ws / "none.txt"
+    assert "CTX" in build_verify_prompt(doc, "t", ws, True, report, context_block="CTX")
+    assert "CTX" in build_review_prompt(doc, "t", ws, True, report, [], context_block="CTX")
+    assert "CTX" in build_fix_prompt(doc, "t", ws, ["i"], False, context_block="CTX")

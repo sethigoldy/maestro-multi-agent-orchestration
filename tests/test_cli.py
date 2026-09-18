@@ -211,3 +211,40 @@ def test_config_without_modes_key(monkeypatch, tmp_path, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["modes"] == {}
+
+
+def test_delegate_context_flags_in_payload(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    captured = _delegate_capture(monkeypatch)
+    spec_file = tmp_path / "spec.md"
+    spec_file.write_text("s", encoding="utf-8")
+    rc = cli.main([
+        "delegate", "--title", "T", "--request", "R", "--target", "mine",
+        "--context", "Be terse.", "--context", "Second note.",
+        "--context-file", str(spec_file),
+        "--skill", "/home/u/skills/pdf",
+    ])
+    assert rc == 0
+    data = captured["payload"]["message"]["parts"][0]["data"]
+    assert data["context"] == [
+        {"label": "context-1", "kind": "text", "text": "Be terse."},
+        {"label": "context-2", "kind": "text", "text": "Second note."},
+        {"label": "spec", "kind": "file", "path": str(spec_file)},
+        {"label": "pdf", "kind": "skill", "path": "/home/u/skills/pdf"},
+    ]
+
+
+def test_config_lists_context(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    (home / "config.toml").write_text(
+        '[context.style]\ntext = "Be terse."\n\n[context.pdf-skill]\nkind = "skill"\npath = "~/skills/pdf"\nphases = ["implementer"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["config"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["context"]["style"] == {"label": "style", "kind": "text", "text": "Be terse.", "source": "user config"}
+    assert out["context"]["pdf-skill"]["kind"] == "skill" and out["context"]["pdf-skill"]["phases"] == ["implementer"]

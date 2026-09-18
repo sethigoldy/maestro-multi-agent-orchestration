@@ -212,7 +212,8 @@ class Maestro:
             self.root / ".maestro" / "config.toml",
         ]
         seen: set[Path] = set()
-        for path in config_paths:
+        context_layers: list[tuple[str, dict[str, Any]]] = []
+        for idx, path in enumerate(config_paths):
             path = path.resolve()
             if path in seen or not path.exists():
                 continue
@@ -221,6 +222,10 @@ class Maestro:
                 with path.open("rb") as fh:
                     value = tomllib.load(fh)
                 if isinstance(value, dict):
+                    ctx = value.get("context")
+                    if isinstance(ctx, dict):
+                        # Parsed per file (below) so each entry's source is stamped.
+                        context_layers.append(("user config" if idx == 0 else "project config", ctx))
                     for key, item in value.items():
                         if isinstance(item, dict) and isinstance(merged.get(key), dict):
                             merged[key] = {**merged[key], **item}
@@ -244,9 +249,14 @@ class Maestro:
             command = [x for x in command.split() if x]
         elif command is not None and not (isinstance(command, list) and all(isinstance(x, str) for x in command)):
             raise ValueError("Verification command must be a string or list of strings")
+        from .context import parse_context_config
         from .modes import parse_modes
 
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes"))}
+        context: dict[str, Any] = {}
+        for source, table in context_layers:
+            context.update(parse_context_config(table, source))
+
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context}
 
     def codex_defaults(self) -> dict[str, Any]:
         return {"model": self.config.get("model"), "effort": self.config.get("effort")}

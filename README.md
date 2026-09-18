@@ -349,7 +349,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | Command | What it does |
 |---|---|
 | `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | Start the broker daemon. `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
-| `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--no-wait` returns immediately |
+| `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--context TEXT`, `--context-file PATH`, `--skill DIR` add context entries (repeatable, see "Context injection"); `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
 | `maestro task list [--project DIR]` | List tasks (number or id) |
 | `maestro task status <id\|n>` | Show one task's current state (`task show`, `status`, and bare `task <n>` are aliases) |
@@ -408,6 +408,22 @@ max_bounces = 2                # optional → default 2; 0 = no auto-fix, park o
 ```
 
 `maestro config` lists the defined presets with their slots.
+
+**Context entries:** a `[context.<label>]` table defines standing context that
+the user controls — an instruction, a file, or a skill injected into agent turns
+(see "Context injection" below):
+
+```toml
+[context.style]
+text = "Follow docs/STYLE.md; error shapes live in src/api/errors.py."
+
+[context.pdf-skill]
+kind   = "skill"                 # text (default) | file | skill
+path   = "~/skills/pdf-processing"  # directory containing SKILL.md
+phases = ["implementer"]         # optional — default: all phases
+```
+
+`maestro config` lists the defined entries with their sources.
 
 ### Environment variables
 
@@ -505,6 +521,37 @@ own agent, so per-phase cost shows up in `task audit` and budgets.
 Explicit routing fields on the handoff beat the preset for that task; a task
 with no mode behaves exactly as before. Step-by-step setup:
 [docs/usage/how-to/configure-work-modes.md](docs/usage/how-to/configure-work-modes.md).
+
+---
+
+## Context injection
+
+**Context injection** is a first-class channel through which the user — not a
+supervising agent — injects context into implementation and gate turns: standing
+instructions ("use this skill", "follow these conventions", "review against this
+checklist") that a supervisor may not think to add. Entries are typed, labeled,
+and composed from three sources: standing `[context.<label>]` config tables (user
+file, then project/worktree files; later wins per label) plus per-task entries in
+a handoff's `[[context]]` section or on the CLI. The composed list is stored on
+the task record, so `task audit` shows exactly what each turn received.
+
+| Kind | Meaning |
+|---|---|
+| `text` | Inline instruction (default when only `text` is set) |
+| `file` | A path — inlined when ≤8KB, otherwise copied to the task dir and referenced by path |
+| `skill` | An [Agent Skills](https://agentskills.io/) directory containing a `SKILL.md` — staged into the task; Claude Code discovers it via `--add-dir`, every other agent gets a prompt reference |
+
+Each entry can be scoped to phases (`implementer`, `verifier`, `reviewer`; fix
+bounces and follow-ups count as implementer) — e.g. give the reviewer its own
+checklist. The rendered block is capped (8KB per inlined file, 32KB total);
+overflow degrades to artifact references or a visible note listing dropped
+labels. Context is data: Maestro stages and references files but never executes
+context content. For Claude Code targets the standing config entries ride in the
+system prompt (`--append-system-prompt-file`) instead of the task message; every
+other adapter gets everything in the prompt. The existing `design`,
+`context_notes`, and `context_files` handoff fields are unchanged.
+
+Step-by-step: [docs/usage/how-to/inject-context.md](docs/usage/how-to/inject-context.md).
 
 ---
 

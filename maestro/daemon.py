@@ -34,6 +34,7 @@ from .a2a import (
 )
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec
+from .context import RenderedContext, compose_context, entry_from_dict, render_context
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
 from .handoff import HandoffDoc
@@ -66,10 +67,13 @@ _STATE_BY_PHASE = {
 }
 
 
-def build_prompt(doc: HandoffDoc, task_id: str, workspace: Path, transcript: list[dict[str, str]]) -> str:
+def build_prompt(doc: HandoffDoc, task_id: str, workspace: Path, transcript: list[dict[str, str]], context_block: str = "") -> str:
     design = doc.design or "(none — use your judgment within the request's scope)"
     context_files = ", ".join(doc.context_files) if doc.context_files else "(none)"
     qa = "\n".join(f"Q: {t['question']}\nA: {t['answer']}" for t in transcript) or "(first turn)"
+    # Rendered [[context]] entries (see maestro/context.py); empty keeps the
+    # prompt byte-identical to the pre-feature shape (invariant C6).
+    context_section = f"\n\n{context_block}" if context_block else ""
     return f"""You are the implementation agent for a Maestro multi-agent task.
 
 Task ID: {task_id}
@@ -81,7 +85,7 @@ REQUEST:
 {doc.request}
 
 AUTHORITATIVE DESIGN:
-{design}
+{design}{context_section}
 
 CONTEXT NOTES:
 {doc.context_notes or "(none)"}
@@ -136,11 +140,12 @@ def parse_verdict(text: str) -> dict[str, Any] | None:
     return {"ok": ok, "issues": issues}
 
 
-def _gate_context(doc: HandoffDoc, task_id: str, workspace: Path) -> str:
+def _gate_context(doc: HandoffDoc, task_id: str, workspace: Path, context_block: str = "") -> str:
     design = doc.design or "(none — use your judgment within the request's scope)"
+    section = f"\n\n{context_block}" if context_block else ""
     return (
         f"Task ID: {task_id}\nWorkspace: {workspace}\n\nTITLE: {doc.title}\n\nREQUEST:\n{doc.request}\n\n"
-        f"AUTHORITATIVE DESIGN:\n{design}\n"
+        f"AUTHORITATIVE DESIGN:\n{design}{section}\n"
     )
 
 
@@ -162,7 +167,7 @@ def _diff_excerpt(workspace: Path) -> str:
     return _cap_text("\n\n".join(parts))
 
 
-def build_verify_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path) -> str:
+def build_verify_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path, context_block: str = "") -> str:
     status = "PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped (verification disabled for this task)")
     triage = (
         "The deterministic check FAILED. First determine whether the failure is caused by this change; "
@@ -171,7 +176,7 @@ def build_verify_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verifica
     )
     return f"""You are the VERIFIER for a Maestro multi-agent task.
 
-{_gate_context(doc, task_id, workspace)}DETERMINISTIC VERIFICATION: {status}
+{_gate_context(doc, task_id, workspace, context_block)}DETERMINISTIC VERIFICATION: {status}
 
 {_verification_excerpt(report_path)}
 
@@ -184,12 +189,12 @@ VERDICT: PASS   or   VERDICT: FAIL
 On FAIL, follow it with an ISSUES: section listing one bullet per issue (each line starting with "- ")."""
 
 
-def build_review_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path, prior_issues: list[str]) -> str:
+def build_review_prompt(doc: HandoffDoc, task_id: str, workspace: Path, verification_ok: bool | None, report_path: Path, prior_issues: list[str], context_block: str = "") -> str:
     status = "PASSED" if verification_ok else ("FAILED" if verification_ok is False else "skipped (verification disabled for this task)")
     findings = "\n".join(f"- {issue}" for issue in prior_issues) if prior_issues else "(none)"
     return f"""You are the REVIEWER for a Maestro multi-agent task.
 
-{_gate_context(doc, task_id, workspace)}DETERMINISTIC VERIFICATION: {status}
+{_gate_context(doc, task_id, workspace, context_block)}DETERMINISTIC VERIFICATION: {status}
 
 {_verification_excerpt(report_path)}
 
@@ -205,11 +210,11 @@ VERDICT: PASS   or   VERDICT: FAIL
 On FAIL, follow it with an ISSUES: section listing one bullet per issue (each line starting with "- ")."""
 
 
-def build_fix_prompt(doc: HandoffDoc, task_id: str, workspace: Path, issues: list[str], det_failed: bool) -> str:
+def build_fix_prompt(doc: HandoffDoc, task_id: str, workspace: Path, issues: list[str], det_failed: bool, context_block: str = "") -> str:
     issue_text = "\n".join(f"- {issue}" for issue in issues) or "(deterministic verification failed; see the verification report)"
     return f"""You are the FIX agent for a Maestro multi-agent task.
 
-{_gate_context(doc, task_id, workspace)}The previous implementation work for this task is already on the task branch/working tree; build on it rather than redoing it.
+{_gate_context(doc, task_id, workspace, context_block)}The previous implementation work for this task is already on the task branch/working tree; build on it rather than redoing it.
 
 UNRESOLVED ISSUES FROM VERIFICATION AND REVIEW:
 {issue_text}
@@ -380,11 +385,32 @@ class MaestroDaemon:
                 raise ValueError(f"Unknown {role} agent {name!r}. Registered agents: {registered}")
         return doc
 
+    def _apply_context(self, doc: HandoffDoc) -> HandoffDoc:
+        """Compose standing + handoff context entries and validate skill paths.
+
+        The composed list replaces ``doc.context_entries`` so the stored task record
+        is self-contained (invariant C2). Skill entries must exist on disk now (C4):
+        a missing directory or SKILL.md fails delegation before any agent runs.
+        """
+        config_entries = self.maestro.config.get("context") or {}
+        composed = compose_context(config_entries, doc.context_entries)
+        for entry in composed:
+            if entry.kind != "skill":
+                continue
+            path = Path(os.path.expanduser(entry.path or ""))
+            if not path.is_dir():
+                raise ValueError(f"Skill context {entry.label!r}: directory not found: {path}")
+            if not (path / "SKILL.md").is_file():
+                raise ValueError(f"Skill context {entry.label!r}: no SKILL.md in {path}")
+        doc.context_entries = [e.to_dict() for e in composed]
+        return doc
+
     def delegate(self, doc: HandoffDoc, workspace: str | Path) -> dict[str, Any]:
         from .handoff import validate_handoff
 
         doc = validate_handoff(doc)
         doc = self._apply_work_mode(doc)
+        doc = self._apply_context(doc)
         if doc.target_agent == doc.origin_agent:
             raise ValueError(
                 f"Agent {doc.target_agent!r} cannot delegate to itself (no self-review/self-delegation); "
@@ -533,7 +559,9 @@ class MaestroDaemon:
                 continue
             attempts = 1 + max(0, self.max_retries)
             for attempt in range(attempts):
-                prompt = build_prompt(doc, task_id, workspace, record_transcript(self._tasks.get(task_id)))
+                rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
+                prompt = build_prompt(doc, task_id, workspace, record_transcript(self._tasks.get(task_id)), context_block=rendered.block)
+                settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
                 cancel_flag = self._cancel_flags.get(task_id)
 
                 def _on_line(line: str, _task_id: str = task_id) -> None:
@@ -543,7 +571,7 @@ class MaestroDaemon:
                     prompt,
                     workspace,
                     task_id,
-                    settings=self._turn_settings(spec, doc),
+                    settings=settings,
                     timeout=spec.timeout_s,
                     log_dir=self.state_dir / "tasks" / task_id,
                     on_line=_on_line,
@@ -608,6 +636,21 @@ class MaestroDaemon:
             # the full handoff survives daemon-to-daemon hops.
             "maestro_handoff": doc.to_dict(),
         }
+
+    def _rendered_context(self, doc: HandoffDoc, task_id: str, phase: str, adapter_kind: str, workspace: Path) -> RenderedContext:
+        """Render this turn's context block and channel artifacts from the composed entries."""
+        entries = [entry_from_dict(e) for e in doc.context_entries]
+        return render_context(entries, phase, workspace, self.state_dir / "tasks" / task_id, adapter_kind)
+
+    @staticmethod
+    def _with_context_settings(kind: str, settings: dict[str, Any], rendered: RenderedContext) -> dict[str, Any]:
+        """Attach the reserved ``maestro_context`` key for claude_code (D1); other adapters ignore it."""
+        if kind == "claude_code" and (rendered.system_file is not None or rendered.skills_root is not None):
+            settings["maestro_context"] = {
+                "system_file": str(rendered.system_file) if rendered.system_file is not None else None,
+                "skills_root": str(rendered.skills_root) if rendered.skills_root is not None else None,
+            }
+        return settings
 
     def _bookkeep_turn(self, task_id: str, agent_name: str, result: Any, turn: int, attempt: int) -> None:
         """Persist one turn's result file and fold its usage into the task record."""
@@ -789,10 +832,12 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return self._gate_park(agent_name, role, f"agent {agent_name!r} failed preflight: {preflight.error or 'unknown error'}")
+        rendered = self._rendered_context(doc, task_id, role, spec.kind, workspace)
         if role == "verifier":
-            prompt = build_verify_prompt(doc, task_id, workspace, verification_ok, report_path)
+            prompt = build_verify_prompt(doc, task_id, workspace, verification_ok, report_path, context_block=rendered.block)
         else:
-            prompt = build_review_prompt(doc, task_id, workspace, verification_ok, report_path, prior_issues or [])
+            prompt = build_review_prompt(doc, task_id, workspace, verification_ok, report_path, prior_issues or [], context_block=rendered.block)
+        settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
         cancel_flag = self._cancel_flags.get(task_id)
 
         def _on_line(line: str, _task_id: str = task_id) -> None:
@@ -800,7 +845,7 @@ class MaestroDaemon:
 
         result = adapter.run(
             prompt, workspace, task_id,
-            settings=self._turn_settings(spec, doc),
+            settings=settings,
             timeout=spec.timeout_s,
             log_dir=turn_log_dir,
             on_line=_on_line,
@@ -845,7 +890,9 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return "parked", f"Work-mode fixer agent {fix_agent!r} failed preflight:\n{preflight.error or 'unknown error'}\n\nAnswer with instructions to resume on the task branch, or cancel."
-        prompt = build_fix_prompt(doc, task_id, workspace, issues, det_failed)
+        rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
+        prompt = build_fix_prompt(doc, task_id, workspace, issues, det_failed, context_block=rendered.block)
+        settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
         cancel_flag = self._cancel_flags.get(task_id)
 
         def _on_line(line: str, _task_id: str = task_id) -> None:
@@ -853,7 +900,7 @@ class MaestroDaemon:
 
         result = adapter.run(
             prompt, workspace, task_id,
-            settings=self._turn_settings(spec, doc),
+            settings=settings,
             timeout=spec.timeout_s,
             log_dir=turn_log_dir,
             on_line=_on_line,
