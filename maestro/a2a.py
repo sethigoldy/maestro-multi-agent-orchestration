@@ -114,6 +114,15 @@ class A2ADispatcher:
                     request=text,
                     target_agent=str(maestro_meta.get("target_agent") or self.daemon.default_target()),
                 )
+            # Cross-machine hop semantics: the handoff's target_agent names the
+            # *hop* (e.g. machine B's "remote-b" spec), which does not exist on
+            # this machine. When it cannot be resolved locally, re-target to
+            # this daemon's default agent — "delegate to that machine" means
+            # "that machine runs its own default agent with this handoff".
+            from .agents import BUILTIN_ADAPTERS
+
+            if self.daemon.registry.get(doc.target_agent) is None and doc.target_agent not in BUILTIN_ADAPTERS:
+                doc.target_agent = self.daemon.default_target()
             result = self.daemon.delegate(doc, str(workspace))
         except (ValueError, KeyError) as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))

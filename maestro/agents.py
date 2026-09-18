@@ -82,6 +82,9 @@ class AgentSpec:
     model: str | None = None
     effort: str | None = None
     timeout_s: float | None = None
+    # Remote-auth for a2a_remote / api agents (sent as Bearer token). Never
+    # announced over discovery; it lives only in the registry entry.
+    token: str | None = None
     # Generic-kind fields (ignored for builtin kinds):
     command: str | None = None
     input_mode: str = "arg"
@@ -103,6 +106,8 @@ class AgentSpec:
             data["effort"] = self.effort
         if self.timeout_s is not None:
             data["timeout_s"] = self.timeout_s
+        if self.token is not None:
+            data["token"] = self.token
         if self.kind == GENERIC_KIND:
             data.update(
                 {
@@ -112,6 +117,8 @@ class AgentSpec:
                     "workspace_policy": self.workspace_policy,
                 }
             )
+        elif self.kind == "a2a_remote" and self.command is not None:
+            data["command"] = self.command  # the remote base URL
         return data
 
 
@@ -135,6 +142,9 @@ def validate_agent_spec(spec: AgentSpec) -> AgentSpec:
             raise ValueError(f"output_format must be one of {OUTPUT_FORMATS}: {spec.output_format!r}")
         if spec.workspace_policy not in WORKSPACE_POLICIES:
             raise ValueError(f"workspace_policy must be one of {WORKSPACE_POLICIES}: {spec.workspace_policy!r}")
+    if spec.kind == "a2a_remote":
+        if not spec.command or not str(spec.command).startswith(("http://", "https://")):
+            raise ValueError("a2a_remote agents require a command that is an http(s) base URL of the remote daemon")
     return spec
 
 
@@ -175,7 +185,7 @@ def _dump_toml(data: dict[str, Any]) -> str:
 
 
 def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
-    known = {"name", "kind", "display_name", "skills", "enabled", "source", "command", "input_mode", "output_format", "workspace_policy", "model", "effort", "timeout_s"}
+    known = {"name", "kind", "display_name", "skills", "enabled", "source", "command", "input_mode", "output_format", "workspace_policy", "model", "effort", "timeout_s", "token"}
     unknown = set(data) - known
     if unknown:
         raise ValueError(f"Unknown agent spec fields: {', '.join(sorted(unknown))}")
@@ -189,6 +199,7 @@ def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
         model=data.get("model"),
         effort=data.get("effort"),
         timeout_s=float(data["timeout_s"]) if data.get("timeout_s") is not None else None,
+        token=data.get("token"),
         command=data.get("command"),
         input_mode=str(data.get("input_mode", "arg")),
         output_format=str(data.get("output_format", "text")),
@@ -263,6 +274,24 @@ class AgentRegistry:
         spec = self.get(name)
         if spec is None:
             return {"name": name, "registered": False}
+        # URL-based agents (a2a_remote / api mode): no local binary — report
+        # the URL and a live preflight (Agent Card fetch, with the stored token).
+        if spec.command and str(spec.command).startswith(("http://", "https://")):
+            from .adapters import make_adapter
+
+            base = {
+                "name": name,
+                "registered": True,
+                "kind": spec.kind,
+                "display_name": spec.display_name or name,
+                "enabled": spec.enabled,
+                "url": spec.command,
+            }
+            try:
+                preflight = make_adapter(spec).preflight()
+            except Exception as exc:  # malformed spec etc. — surface, don't crash
+                return {**base, "reachable": False, "error": str(exc)}
+            return {**base, "reachable": preflight.ok, "version": preflight.version if preflight.ok else None, "error": None if preflight.ok else preflight.error}
         binary = spec.command.split()[0] if spec.kind == GENERIC_KIND and spec.command else DEFAULT_BINARIES.get(spec.kind)
         path = shutil.which(binary) if binary else None
         version = _probe_version(path)

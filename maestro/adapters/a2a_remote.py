@@ -3,7 +3,9 @@
 Daemon-to-daemon delegation using the same protocol the local daemon serves
 (see :mod:`maestro.a2a`): Agent Card preflight, ``message/send`` for launch,
 then the per-task SSE stream for live output/usage until a terminal state.
-The registry spec's ``command`` field carries the remote base URL.
+The registry spec's ``command`` field carries the remote base URL; an optional
+spec ``token`` is sent as a Bearer credential when the remote daemon requires
+one (non-loopback binds).
 """
 
 from __future__ import annotations
@@ -37,8 +39,9 @@ class A2ARemoteAdapter(BaseAdapter):
         base_url = self.api_base_url({})
         if not base_url:
             return AdapterPreflight(ok=False, error="No remote base URL configured for this a2a_remote agent")
+        token = (self.spec.token if self.spec else None) or None
         try:
-            card = fetch_agent_card(base_url)
+            card = fetch_agent_card(base_url, token=token)
         except ValueError as exc:
             return AdapterPreflight(ok=False, binary=base_url, error=str(exc))
         name = card.get("name") or "remote"
@@ -65,6 +68,7 @@ class A2ARemoteAdapter(BaseAdapter):
         base_url = self.api_base_url(settings)
         if not base_url:
             return AdapterResult(ok=False, error="No remote base URL configured for this a2a_remote agent")
+        token = settings.get("token") or (self.spec.token if self.spec else None) or None
         started = time.monotonic()
 
         # Prefer the full handoff document (injected by the daemon) so routing,
@@ -83,7 +87,7 @@ class A2ARemoteAdapter(BaseAdapter):
             }
         }
         try:
-            result = post_jsonrpc(base_url, "message/send", params)
+            result = post_jsonrpc(base_url, "message/send", params, token=token)
         except ValueError as exc:
             return AdapterResult(ok=False, error=f"A2A message/send failed: {exc}", duration_s=time.monotonic() - started)
         task = (result or {}).get("task") or {}
@@ -109,7 +113,7 @@ class A2ARemoteAdapter(BaseAdapter):
 
         def _reader() -> None:
             try:
-                for item in sse_events(base_url, f"/tasks/{remote_id}/events"):
+                for item in sse_events(base_url, f"/tasks/{remote_id}/events", token=token):
                     event_q.put(item)
             except BaseException as exc:  # surfaced to the main loop below
                 event_q.put(exc)
@@ -136,7 +140,7 @@ class A2ARemoteAdapter(BaseAdapter):
                 data = envelope.get("data") or {}  # TaskEvent.to_dict nests the payload under "data"
                 if should_cancel is not None and should_cancel() and not cancel_sent:
                     try:
-                        post_jsonrpc(base_url, "tasks/cancel", {"id": remote_id, "reason": "canceled by orchestrator"})
+                        post_jsonrpc(base_url, "tasks/cancel", {"id": remote_id, "reason": "canceled by orchestrator"}, token=token)
                         cancel_sent = True
                     except ValueError:
                         pass  # best effort; the stream still reports the outcome

@@ -416,3 +416,59 @@ def test_handle_ignores_garbage_directly(tmp_path):
     server._handle(json.dumps({"kind": "other"}).encode(), ("10.0.0.9", 9))
     server._handle(json.dumps({"kind": "maestro-presence", "name": "x"}).encode(), ("10.0.0.9", 9))
     assert table.load() == {}
+
+
+# ------------------------------------------------------------- http_host awareness
+
+def test_announcement_carries_http_host(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8790, table, name="node-a", port=1, multicast_if="127.0.0.1", ttl=0, http_host="192.0.2.44")
+    payload = json.loads(server._announcement())
+    assert payload["http_host"] == "192.0.2.44" and payload["http_port"] == 8790
+
+
+def test_handle_uses_advertised_host_with_source_fallback(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="127.0.0.1", ttl=0)
+    # newer nodes advertise the host they are reachable on (LAN IP for 0.0.0.0 binds)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "b", "http_port": 8790, "http_host": "192.0.2.44"}).encode(), ("10.0.0.9", 9))
+    peer = table.load()["10.0.0.9:8790"]
+    assert peer["url"] == "http://192.0.2.44:8790" and peer["address"] == "10.0.0.9"
+    # older nodes omit http_host — fall back to the multicast source address
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "c", "http_port": 8791}).encode(), ("10.0.0.9", 9))
+    assert table.load()["10.0.0.9:8791"]["url"] == "http://10.0.0.9:8791"
+    # empty or non-string http_host also falls back
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "d", "http_port": 8792, "http_host": ""}).encode(), ("10.0.0.9", 9))
+    assert table.load()["10.0.0.9:8792"]["url"] == "http://10.0.0.9:8792"
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "e", "http_port": 8793, "http_host": 42}).encode(), ("10.0.0.9", 9))
+    assert table.load()["10.0.0.9:8793"]["url"] == "http://10.0.0.9:8793"
+
+
+def test_pick_lan_ip_falls_back_on_socket_error(monkeypatch):
+    import maestro.discovery as disc
+
+    def boom(*a, **kw):
+        raise OSError("no route")
+
+    monkeypatch.setattr(disc.socket, "socket", boom)
+    assert disc.pick_lan_ip() == "127.0.0.1"
+
+
+def test_pick_lan_ip_success_path(monkeypatch):
+    import maestro.discovery as disc
+
+    class _FakeProbe:
+        def __init__(self, *a, **kw):
+            pass
+
+        def connect(self, addr):
+            self.addr = addr  # UDP "connect" — no packet sent
+
+        def getsockname(self):
+            return ("192.0.2.77", 0)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(disc.socket, "socket", _FakeProbe)
+    assert disc.pick_lan_ip() == "192.0.2.77"

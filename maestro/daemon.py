@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from .a2a import (
     A2ADispatcher,
@@ -101,6 +102,7 @@ class MaestroDaemon:
         *,
         start_http: bool = True,
         port: int = 0,
+        bind: str = "127.0.0.1",
         max_retries: int | None = None,
         backoff_s: float | None = None,
     ) -> None:
@@ -120,6 +122,10 @@ class MaestroDaemon:
         self._cancel_flags: dict[str, threading.Event] = {}
         self._lock = threading.RLock()
         self.port: int | None = None
+        self.bind = bind or "127.0.0.1"
+        self.token: str | None = None  # set in _resolve_bind when auth is required
+        self.advertised_host: str = "127.0.0.1"  # host peers should use to reach us
+        self.local_host: str = "127.0.0.1"  # host the local CLI dials (daemon.json marker)
         self._httpd: ThreadingHTTPServer | None = None
         self._presence: Any | None = None
         self._stopped = False
@@ -128,15 +134,43 @@ class MaestroDaemon:
             self.start_http(port)
 
     # ------------------------------------------------------------------ http
+    def _resolve_bind(self) -> None:
+        """Compute advertised/local host and auth token for ``self.bind``.
+
+        Pure (no sockets) so it is testable for any bind address:
+        - loopback binds need no token and stay reachable at 127.0.0.1;
+        - "0.0.0.0"/"::" means all interfaces — advertise the primary LAN IP,
+          keep the local marker on loopback;
+        - an explicit non-loopback IP is advertised as-is and used locally too.
+        A token is required for every non-loopback bind: an explicit
+        MAESTRO_DAEMON_TOKEN wins (stable across restarts), otherwise one is
+        generated and recorded in daemon.json so the local CLI keeps working.
+        """
+        import secrets
+
+        if self.bind in ("0.0.0.0", "::"):
+            from .discovery import pick_lan_ip
+
+            self.advertised_host = pick_lan_ip()
+            self.local_host = "127.0.0.1"
+        elif self.bind not in ("127.0.0.1", "::1"):
+            self.advertised_host = self.bind
+            self.local_host = self.bind
+        if self.bind not in ("127.0.0.1", "::1"):
+            env_token = os.environ.get("MAESTRO_DAEMON_TOKEN", "").strip()
+            self.token = env_token or secrets.token_urlsafe(24)
+
     def start_http(self, port: int = 0) -> int:
         if self._httpd is not None:
             return self.port or 0
+        self._resolve_bind()
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+        self._httpd = ThreadingHTTPServer((self.bind, port), handler)
         self.port = self._httpd.server_address[1]
-        (self.state_dir / "daemon.json").write_text(
-            json.dumps({"pid": os.getpid(), "port": self.port, "started_at": utcnow_iso()}, indent=2), encoding="utf-8"
-        )
+        marker: dict[str, Any] = {"pid": os.getpid(), "port": self.port, "host": self.local_host, "started_at": utcnow_iso()}
+        if self.token is not None:
+            marker["token"] = self.token
+        (self.state_dir / "daemon.json").write_text(json.dumps(marker, indent=2), encoding="utf-8")
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         thread.start()
         # P2P presence: announce over UDP so other Maestro nodes find us.
@@ -149,6 +183,7 @@ class MaestroDaemon:
                 name=os.environ.get("MAESTRO_NODE_NAME", "maestro-node"),
                 multicast_if=discovery_interface_from_env(),
                 ttl=discovery_ttl_from_env(),
+                http_host=self.advertised_host,
             )
             if presence.start():
                 self._presence = presence
@@ -360,7 +395,7 @@ class MaestroDaemon:
                     workspace,
                     task_id,
                     settings={
-                        **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort"}},
+                        **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort", "token"}},
                         **doc.agent_settings,
                         # Reserved key for api-mode adapters (e.g. a2a_remote) so
                         # the full handoff survives daemon-to-daemon hops.
@@ -708,7 +743,7 @@ class MaestroDaemon:
             {"id": spec.name, "name": spec.display_name or spec.name, "description": f"Delegable agent ({spec.kind})", "tags": list(spec.skills)}
             for spec in self.registry.list()
         ]
-        return agent_card(name="maestro-node", url=f"http://127.0.0.1:{self.port or 0}", skills=skills)
+        return agent_card(name="maestro-node", url=f"http://{self.advertised_host}:{self.port or 0}", skills=skills)
 
 
 def record_transcript(record: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -739,6 +774,23 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
         def log_message(self, *args: Any) -> None:  # keep test output clean
             pass
 
+        def _authorized(self) -> bool:
+            """Bearer-token check for non-loopback binds (``daemon.token``).
+
+            Accepts the ``Authorization: Bearer <token>`` header or a
+            ``?token=`` query parameter — EventSource (used by the web console
+            and terminal dashboards) cannot set custom headers. Static console
+            assets are public; every data/mutation endpoint is gated.
+            """
+            if daemon.token is None:
+                return True
+            expected = daemon.token
+            header = self.headers.get("Authorization", "")
+            if header.startswith("Bearer ") and header[len("Bearer "):].strip() == expected:
+                return True
+            query = parse_qs(urlsplit(self.path).query)
+            return bool(query.get("token")) and query["token"][0] == expected
+
         def _send_json(self, code: int, obj: dict[str, Any]) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
             self.send_response(code)
@@ -748,23 +800,11 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def do_GET(self) -> None:  # noqa: N802
-            if self.path == "/.well-known/agent.json":
-                self._send_json(200, daemon.card())
-                return
-            if self.path == "/tasks":
-                self._send_json(200, {"tasks": daemon.list_tasks()})
-                return
-            if self.path == "/events":
-                self._sse(None)  # global stream: every task, never terminates on its own
-                return
-            if self.path.startswith("/tasks/") and self.path.endswith("/events"):
-                task_id = self.path[len("/tasks/") : -len("/events")]
-                self._sse(task_id)
-                return
-            if self.path in ("/", "/index.html", "/console.js"):
+            path = urlsplit(self.path).path
+            if path in ("/", "/index.html", "/console.js"):
                 from .dashboard import console_asset
 
-                asset = console_asset(self.path)
+                asset = console_asset(path)
                 if asset is None:
                     self._send_json(404, {"error": "not found"})
                     return
@@ -775,11 +815,30 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
+                return
+            if path == "/.well-known/agent.json":
+                self._send_json(200, daemon.card())
+                return
+            if path == "/tasks":
+                self._send_json(200, {"tasks": daemon.list_tasks()})
+                return
+            if path == "/events":
+                self._sse(None)  # global stream: every task, never terminates on its own
+                return
+            if path.startswith("/tasks/") and path.endswith("/events"):
+                task_id = path[len("/tasks/") : -len("/events")]
+                self._sse(task_id)
+                return
             self._send_json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path != "/":
+            if urlsplit(self.path).path != "/":
                 self._send_json(404, {"error": "not found"})
+                return
+            if not self._authorized():
+                self._send_json(401, {"error": "unauthorized"})
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)

@@ -1,6 +1,8 @@
 // SSE + REST glue for the Maestro daemon. Strictly event-driven: one initial
 // fetch for the task list, then a single EventSource for everything else.
 
+import { authHeaders, withToken } from "./auth.js";
+
 export function unwrap(envelope) {
   // TaskEvent.to_dict nests the payload under "data".
   return (envelope && envelope.data) || {};
@@ -25,13 +27,13 @@ export function normalizeTask(record) {
 }
 
 export function loadTasks() {
-  return fetch("/tasks", { headers: { Accept: "application/json" } })
+  return fetch(withToken("/tasks"), { headers: { Accept: "application/json", ...authHeaders() } })
     .then((res) => res.json())
     .then((body) => (body.tasks || []).map(normalizeTask));
 }
 
 export function connectEvents(handlers) {
-  const source = new EventSource("/events");
+  const source = new EventSource(withToken("/events"));
   for (const type of ["state", "output", "usage"]) {
     source.addEventListener(type, (message) => {
       let envelope;

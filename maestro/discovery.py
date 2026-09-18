@@ -8,8 +8,10 @@ stale after three missed heartbeats. Manual registration
 (``maestro peers add``) covers networks without multicast/broadcast.
 
 Design notes:
-- Announcements carry the node's HTTP port, pid, name, and a per-process
-  nonce so a node ignores its own echoes (multicast loops back locally).
+- Announcements carry the node's HTTP port, the host it is reachable on
+  (``http_host`` — its LAN IP when bound to all interfaces), pid, name, and a
+  per-process nonce so a node ignores its own echoes (multicast loops back
+  locally).
 - The group/port are configurable; tests use TTL 0 on loopback so traffic
   never leaves the host. If the shared port cannot be bound at all, the node
   falls back to an ephemeral port (discovery degrades, daemon keeps running).
@@ -53,6 +55,26 @@ def discovery_ttl_from_env() -> int:
         return int(os.environ.get("MAESTRO_DISCOVERY_TTL", 1))
     except ValueError:
         return 1
+
+
+def pick_lan_ip() -> str:
+    """Best-effort primary non-loopback IPv4 of this host.
+
+    Uses the classic connect-UDP-to-a-public-address trick (no packet is
+    actually sent) so the result matches the interface a LAN peer would use
+    to reach us. Falls back to 127.0.0.1 when no route exists (air-gapped,
+    container without default route) — discovery still works on loopback.
+    """
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("8.8.8.8", 80))
+            ip = probe.getsockname()[0]
+        finally:
+            probe.close()
+    except OSError:
+        return "127.0.0.1"
+    return ip or "127.0.0.1"
 
 
 class PeerTable:
@@ -138,6 +160,7 @@ class PresenceServer:
         multicast_if: str = "0.0.0.0",
         ttl: int = 1,
         interval_s: float = ANNOUNCE_INTERVAL_S,
+        http_host: str = "127.0.0.1",
     ) -> None:
         self.http_port = http_port
         self.table = table
@@ -147,6 +170,7 @@ class PresenceServer:
         self.multicast_if = multicast_if
         self.ttl = ttl
         self.interval_s = interval_s
+        self.http_host = http_host
         self.nonce = uuid.uuid4().hex[:12]
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -213,7 +237,15 @@ class PresenceServer:
 
     def _announcement(self) -> bytes:
         return json.dumps(
-            {"kind": "maestro-presence", "name": self.name, "http_port": self.http_port, "pid": os.getpid(), "nonce": self.nonce, "ts": time.time()},
+            {
+                "kind": "maestro-presence",
+                "name": self.name,
+                "http_port": self.http_port,
+                "http_host": self.http_host,
+                "pid": os.getpid(),
+                "nonce": self.nonce,
+                "ts": time.time(),
+            },
             ensure_ascii=False,
         ).encode("utf-8")
 
@@ -254,4 +286,10 @@ class PresenceServer:
         if not isinstance(http_port, int):
             return
         name = str(payload.get("name") or f"node-{addr[0]}:{http_port}")
-        self.table.upsert({"key": f"{addr[0]}:{http_port}", "name": name, "port": http_port, "address": addr[0], "url": f"http://{addr[0]}:{http_port}"})
+        # Newer nodes advertise the host they are reachable on (a daemon bound
+        # to 0.0.0.0 announces its LAN IP); older ones omit it — fall back to
+        # the multicast source address, which is right for same-host peers.
+        host = payload.get("http_host")
+        if not isinstance(host, str) or not host:
+            host = addr[0]
+        self.table.upsert({"key": f"{addr[0]}:{http_port}", "name": name, "port": http_port, "address": addr[0], "url": f"http://{host}:{http_port}"})
