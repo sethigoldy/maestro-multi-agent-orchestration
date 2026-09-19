@@ -1,17 +1,36 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "maestro"
-version = "0.8.4"
-description = "Claude-supervised multi-agent orchestration with user-level task state"
+version = "0.9.0"
+description = "Durable execution for coding agents: route, verify, and audit multi-agent software tasks"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Inderjeet Singh", email = "sethigoldy@gmail.com" }]
+keywords = ["coding-agents", "orchestration", "multi-agent", "task-state", "verification"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Version Control",
+]
 dependencies = ["mcp>=1.0.0,<2"]
 
 [project.optional-dependencies]
 memvara = ["memvara"]
 
+[project.urls]
+Homepage = "https://github.com/sethigoldy/maestro-multi-agent-orchestration"
+Repository = "https://github.com/sethigoldy/maestro-multi-agent-orchestration"
+Issues = "https://github.com/sethigoldy/maestro-multi-agent-orchestration/issues"
 
 [project.scripts]
 maestro = "maestro.cli:main"
@@ -20,6 +39,9 @@ maestro-daemon = "maestro.daemon_main:main"
 
 [tool.setuptools.packages.find]
 include = ["maestro*"]
+
+[tool.setuptools.package-data]
+"maestro.web_dist" = ["*"]
 
 [tool.coverage.run]
 source = ["maestro"]

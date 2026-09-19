@@ -9,10 +9,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import VERSION
 from .agents import AgentRegistry, AgentSpec, BUILTIN_ADAPTERS, GENERIC_KIND
 from .core import Maestro, maestro_user_dir
-
-VERSION = "0.8.4"
 
 
 def _workspace(value: str | None) -> Path:

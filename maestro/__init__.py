@@ -1,3 +1,6 @@
 from .core import Maestro
 
-__all__ = ["Maestro"]
+#: Single source of truth for the release version (CLI, doctor, docs).
+VERSION = "0.9.0"
+
+__all__ = ["Maestro", "VERSION"]
