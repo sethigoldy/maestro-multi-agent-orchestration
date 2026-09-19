@@ -45,6 +45,7 @@ moment you open a document:
 
 | Document | What it covers |
 |---|---|
+| [Core concepts](explanation/concepts.md) | the four objects at the heart of Maestro — Task, Attempt, Agent, Execution Receipt — and how they relate |
 | [How delegation works](explanation/how-delegation-works.md) | the daemon architecture, task lifecycle states, role-agnostic routing, durable state, verification, work-mode gates and bounces, context injection, retries and budgets |
 
 ## Related documents outside this section

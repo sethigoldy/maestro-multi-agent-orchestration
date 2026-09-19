@@ -1,0 +1,27 @@
+# Automatic fallback: try the primary agent; if it fails or isn't available,
+# walk the chain. Every attempt — including failed ones and their cost — is
+# recorded on the task (see `maestro task receipt <id>`).
+#
+# Run it:
+#   maestro delegate --file examples/fallback.toml --workspace /path/to/your/repo
+
+[handoff]
+title = "Add input validation to the public API"
+request = """
+Validate and normalize all request inputs in src/api/: reject malformed
+payloads with the project's standard error shape, and add unit tests for the
+new validation paths.
+"""
+design = ""
+
+[routing]
+target_agent = "codex"
+fallback = ["claude_code", "copilot"]   # tried in order after codex fails
+
+[expectations]
+artifacts = ["code", "tests"]
+verification = "auto"                   # auto-detected test suite + git diff --check
+commit_policy = "branch"                # work on a task branch; you review and commit
+
+[constraints]
+sensitive = false

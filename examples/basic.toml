@@ -1,0 +1,24 @@
+# The smallest complete handoff: one agent, auto-verification, no commits.
+#
+# Run it:
+#   maestro delegate --file examples/basic.toml --workspace /path/to/your/repo
+
+[handoff]
+title = "Fix the failing test"
+request = """
+Find and fix the failing unit test in tests/, then rerun the suite so the
+whole thing is green. Keep the change minimal — no refactors.
+"""
+design = ""            # optional: a compact design; empty = agent's judgment
+
+[routing]
+target_agent = "codex"   # any registered name or built-in kind
+fallback = []            # none: fail rather than try another agent
+
+[expectations]
+artifacts = ["code"]
+verification = "auto"    # auto | command | none (see below)
+commit_policy = "no-commit"  # branch | no-commit — Maestro never commits for you
+
+[constraints]
+sensitive = false

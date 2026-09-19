@@ -47,6 +47,23 @@ def test_project_filter_and_workspace_filter(tmp_path, monkeypatch):
     assert len(b.list_tasks(workspace_filter=str(w2)))==1 and b.list_tasks(workspace_filter=str(w2))[0]['task_id']==t2['task_id']
     assert len(b.list_tasks(project_filter=str(project)))==2; b.close()
 
+def test_daemon_rooted_registry_record_scopes_to_task_project(tmp_path, monkeypatch):
+    # The daemon roots its Maestro at the state directory but registers tasks
+    # for other workspaces: the registry record must carry the TASK workspace's
+    # project root, or `task list --workspace/--project` never matches (regression).
+    env(tmp_path, monkeypatch); project,w1,_=git_repo(tmp_path)
+    home=tmp_path/'home'; home.mkdir()
+    m=Maestro(home)  # root = state dir, exactly like MaestroDaemon
+    try:
+        tid='task-20260101-000000-scoped'
+        m._register_task(tid,'Scoped task',1,project_root=str(Maestro._resolve_project_root(w1)))
+        m._write_claim(tid,'task_workspace',str(w1))
+        assert m.status(tid)['project_root']==str(project)
+        assert len(m.list_tasks(project_filter=str(project)))==1
+        assert len(m.list_tasks(workspace_filter=str(w1)))==1
+    finally:
+        m.close()
+
 def test_unique_numbers_across_worktrees(tmp_path, monkeypatch):
     env(tmp_path, monkeypatch); _,w1,w2=git_repo(tmp_path)
     a=Maestro(w1); n1=_seed(a)['task_number']; a.close(); b=Maestro(w2); n2=_seed(b,'B')['task_number']; b.close(); assert (n1,n2)==(1,2)
@@ -435,7 +452,7 @@ def test_pyproject_optional_dependency_groups_are_arrays():
 def test_pyproject_version_is_release_version():
     import tomllib
     data = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert data["project"]["version"] == "0.8.4"
+    assert data["project"]["version"] == "0.9.0"
 
 
 def test_project_root_codex_config_overrides_user_for_worktree(tmp_path, monkeypatch):

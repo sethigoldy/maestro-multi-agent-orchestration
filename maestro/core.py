@@ -178,7 +178,10 @@ class Maestro:
 
     @staticmethod
     def _resolve_project_root(workspace: Path) -> Path:
-        result = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, capture_output=True, check=False)
+        try:
+            result = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--path-format=absolute", "--git-common-dir"], text=True, capture_output=True, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return workspace  # git unavailable: treat the workspace as its own root
         if result.returncode == 0 and result.stdout.strip():
             common = Path(result.stdout.strip()).resolve()
             if common.name == ".git":
@@ -297,8 +300,8 @@ class Maestro:
                 continue
         return sorted(out.values(), key=lambda x: int(x["number"]))
 
-    def _registry_record(self, task_id: str, number: int, title: str, created_at: str | None = None) -> dict[str, Any]:
-        return {"number": number, "task_id": task_id, "title": title, "created_at": created_at or self._now().isoformat(), "workspace": str(self.root), "project_root": str(self.project_root)}
+    def _registry_record(self, task_id: str, number: int, title: str, created_at: str | None = None, project_root: str | None = None) -> dict[str, Any]:
+        return {"number": number, "task_id": task_id, "title": title, "created_at": created_at or self._now().isoformat(), "workspace": str(self.root), "project_root": str(project_root or self.project_root)}
 
     def _write_registry_record(self, record: dict[str, Any]) -> None:
         if self.config["storage_backend"] == "filesystem":
@@ -391,8 +394,8 @@ class Maestro:
     def _new_task_number(self) -> int:
         return max([int(x.get("number",0)) for x in self._registry_records()] + [0]) + 1
 
-    def _register_task(self, task_id: str, title: str, number: int) -> None:
-        self._write_registry_record(self._registry_record(task_id, number, title))
+    def _register_task(self, task_id: str, title: str, number: int, project_root: str | None = None) -> None:
+        self._write_registry_record(self._registry_record(task_id, number, title, project_root=project_root))
 
     def resolve_task(self, ref: str) -> str:
         ref=str(ref).strip(); items=self._registry_records()

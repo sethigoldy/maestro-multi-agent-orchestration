@@ -1,5 +1,6 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { stateColor } from "../App.jsx";
+import { loadReceipt } from "../lib/events.js";
 
 function Meta({ label, value }) {
   if (value === null || value === undefined || value === "") return null;
@@ -78,6 +79,8 @@ export default function DetailPane({ task }) {
         </div>
       )}
 
+      <ReceiptPanel taskId={task.task_id} />
+
       <pre
         ref={scrollRef}
         style={{
@@ -100,6 +103,85 @@ export default function DetailPane({ task }) {
       </pre>
     </div>
   );
+}
+
+// Durable execution receipt for the selected task (GET /tasks/<id>/receipt):
+// the IMPLEMENT/VERIFY/REVIEW/FIX chain, final verification, and final state.
+function ReceiptPanel({ taskId }) {
+  const [receipt, setReceipt] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReceipt(null);
+    loadReceipt(taskId)
+      .then((data) => {
+        if (!cancelled) setReceipt(data);
+      })
+      .catch(() => {}); // no daemon / unknown task: the panel stays hidden
+    return () => {
+      cancelled = true;
+    };
+  }, [taskId]);
+
+  if (!receipt) return null;
+  const attempts = receipt.attempts || [];
+  const verification = receipt.verification || {};
+  const totals = receipt.totals || {};
+  const finalState = (receipt.state || "unknown").toUpperCase();
+  const verified = receipt.state === "completed" && verification.ran && verification.result === "PASSED";
+
+  return (
+    <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border)" }}>
+      <span style={{ color: "var(--dim)", fontSize: 12 }}>RECEIPT</span>
+      {attempts.map((attempt, index) => (
+        <div key={index} style={{ marginTop: 4, fontSize: 13 }}>
+          <span style={{ color: "var(--accent)", fontWeight: 600 }}>{(attempt.phase || "IMPLEMENT").padEnd(8)}</span>
+          <span>{attempt.agent || "?"}</span>
+          {typeof attempt.duration_s === "number" && (
+            <span style={{ color: "var(--dim)" }}> · {fmtDuration(attempt.duration_s)}</span>
+          )}
+          {typeof attempt.cost_usd === "number" && (
+            <span style={{ color: "var(--dim)" }}> · ${attempt.cost_usd.toFixed(2)}</span>
+          )}
+          <span style={{ color: attempt.ok ? "var(--ok)" : "var(--err)" }}> {attempt.ok ? "✓" : "✗"}</span>
+        </div>
+      ))}
+      <div style={{ marginTop: 6, fontSize: 13 }}>
+        <span style={{ color: "var(--dim)" }}>Final verification: </span>
+        {verification.ran ? (
+          <span style={{ color: verification.result === "PASSED" ? "var(--ok)" : "var(--err)" }}>
+            {verification.result === "PASSED" ? "✓ PASSED" : `✗ ${verification.result}`}
+          </span>
+        ) : (
+          <span style={{ color: "var(--dim)" }}>skipped</span>
+        )}
+      </div>
+      <div style={{ marginTop: 4, fontSize: 13 }}>
+        <span style={{ color: "var(--dim)" }}>Final: </span>
+        <span style={{ fontWeight: 700, color: stateColor(receipt.state || "unknown") }}>{finalState}</span>
+        {verified && (
+          <span style={{ color: "var(--ok)", marginLeft: 8 }}>VERIFIED</span>
+        )}
+        {typeof totals.duration_s === "number" && (
+          <span style={{ color: "var(--dim)" }}> · {fmtDuration(totals.duration_s)}</span>
+        )}
+        {typeof totals.cost_usd === "number" && (
+          <span style={{ color: "var(--dim)" }}> · ${totals.cost_usd.toFixed(2)}</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function fmtDuration(seconds) {
+  const total = Math.round(Number(seconds));
+  if (!Number.isFinite(total) || total < 0) return "—";
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${secs}s`;
+  return `${secs}s`;
 }
 
 function firstLine(text) {

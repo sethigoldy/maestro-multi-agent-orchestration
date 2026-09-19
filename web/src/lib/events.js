@@ -32,6 +32,15 @@ export function loadTasks() {
     .then((body) => (body.tasks || []).map(normalizeTask));
 }
 
+// The execution receipt is a durable projection of the same task state that
+// /tasks serves — one extra fetch per selected task, no second data model.
+export function loadReceipt(taskId) {
+  return fetch(withToken(`/tasks/${encodeURIComponent(taskId)}/receipt`), {
+    headers: { Accept: "application/json", ...authHeaders() },
+  })
+    .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))));
+}
+
 export function connectEvents(handlers) {
   const source = new EventSource(withToken("/events"));
   for (const type of ["state", "output", "usage"]) {

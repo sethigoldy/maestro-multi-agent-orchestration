@@ -1,7 +1,7 @@
 # CLI reference
 
 Complete description of the `maestro` and `maestro-daemon` commands. The CLI is
-version 0.8.4; verify with `maestro --version`.
+version 0.9.0; verify with `maestro --version`.
 
 ## Global options
 
@@ -90,6 +90,7 @@ maestro task status <task-id|number> [--workspace DIR | --project DIR]
 maestro task show <task-id|number>        # alias of status
 maestro task tail <task-id> [--all]
 maestro task audit <task-id>
+maestro task receipt <task-id|number> [--json]
 ```
 
 Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
@@ -101,6 +102,7 @@ Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
 | `status` / `show` | Prints one task's state as JSON (see [Inspect tasks and artifacts](../how-to/inspect-tasks-and-artifacts.md#read-one-tasks-state) for the fields). Accepts a full task id or a numeric task number. Unknown references exit 2 |
 | `tail` | Live-follows one task's event stream over SSE (no polling). `--all` follows the global stream instead of one task; with `--all` the exit code is always 0 (absent Ctrl-C) |
 | `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), the composed context entries (`context`, with their sources), accumulated usage, error, and parsed result files. Works after daemon restarts |
+| `receipt` | Prints the **execution receipt** — a human-readable summary (or stable JSON with `--json`) of what happened on one task: final state; per-attempt phase, agent, duration, cost, and ok/error; the deterministic verification result and command; work-mode gate verdicts and bounce count; and totals (wall-clock or attempt-sum duration, aggregated cost when any attempt reported one). The receipt is a projection of the durable task state — it works for running, completed, failed, and canceled tasks alike, and after daemon restarts. If a daemon is reachable the receipt is served over its API (`GET /tasks/<id>/receipt`); otherwise it is built locally from the state directory. Unknown references exit 2 when no daemon can answer |
 
 ## dashboard
 
@@ -191,3 +193,35 @@ Deletes terminal tasks (phases `COMPLETE`/`FAILED`; canceled tasks land in
 directory or registry record. `--dry-run` lists what would be deleted without
 deleting. Prints a JSON summary (`removed`, `kept`). Manual only — never runs
 automatically.
+
+## doctor
+
+```text
+maestro doctor [--workspace DIR | --project DIR] [--json]
+```
+
+Diagnoses whether this environment can run Maestro. Fast, deterministic, and
+strictly read-only: it never modifies the environment, installs anything, or
+changes `PATH`. The report covers:
+
+- **Maestro / Python / system** — version, interpreter, platform.
+- **State** — the state directory (`$MAESTRO_HOME` or `~/.maestro`): existence,
+  writability, effective config paths, and storage backend; an error line when
+  the configuration is invalid or the directory unusable.
+- **Daemon** — reachability resolved like the CLI (env URL or liveness-checked
+  `daemon.json` marker), with auth status (`none`, `token`, or `missing` on a
+  401). A missing daemon is reported, not failed.
+- **Git** — installed and versioned.
+- **Agents** — every known CLI kind (found/version/status) plus registered
+  agents; missing optional agents are reported, never treated as failures.
+- **Workspace** — the target directory: git root, project type (python/node/go/
+  rust/make), read/write access, and the auto-detected verification command.
+- **Budget** — configured caps and current spend.
+
+`--json` prints the report as stable JSON (top-level keys `maestro`, `python`,
+`system`, `state`, `daemon`, `git`, `agents`, `workspace`, `budget`, plus `ok`
+and, when not ok, `problems`). Exit code: `0` when the environment is usable,
+`1` when a genuinely blocking problem exists (unusable state directory, invalid
+configuration, or an explicitly passed workspace that does not exist). Missing
+optional agents and a missing daemon never affect the exit code. Tokens are
+never printed — only whether authentication applies.

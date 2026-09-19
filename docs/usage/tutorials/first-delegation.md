@@ -40,11 +40,22 @@ maestro --version
 You will see:
 
 ```text
-0.8.4
+0.9.0
 ```
 
 If you do not see a version number, your virtual environment is not active —
 re-run `source .venv/bin/activate` and try again.
+
+Then check that the environment can actually run Maestro:
+
+```bash
+maestro doctor
+```
+
+Doctor is read-only and fast: it reports the state directory, daemon
+reachability, git, the agent CLIs it found (you need `codex`), and the budget
+caps. It exits non-zero only on a genuinely blocking problem — if you get one,
+fix that first; otherwise continue.
 
 ## Step 2 — Prepare the demo repository
 
@@ -194,6 +205,19 @@ it printed. In our demo no project test runner was detected, so you will see a
 note like `no project test runner detected; using git diff --check only` — that
 is expected here and is why the *request itself* told the agent to run
 `check_app.py`.
+
+For the one-command summary of the whole task — attempts with durations and
+costs, the verification result, and the final state — use the execution
+receipt:
+
+```bash
+maestro task receipt task-20250718-143022-a1b2c3          # human-readable
+maestro task receipt task-20250718-143022-a1b2c3 --json   # stable JSON for tooling
+```
+
+The receipt is a projection of the durable state: it works while a task runs,
+after it ends, and even after the daemon restarts. The web console shows the
+same receipt inline on each task's detail pane.
 
 ## Step 6 — Review the fix on its branch
 
