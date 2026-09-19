@@ -36,10 +36,10 @@ environment). An effort outside the five supported values is an error.
 command = ["make", "check"]     # or a string, split on whitespace
 ```
 
-Parsed and validated (string or list of strings). Note: as of 0.8.4 this value
-is stored but **not consumed** by the daemon's verification step — verification
-uses the handoff's `verification` mode plus auto-detection (see below). It is
-kept for forward compatibility.
+Parsed and validated (string or list of strings). Note: this value is stored
+but **not consumed** by the daemon's verification step — verification uses the
+handoff's `verification` mode plus auto-detection (see below). It is kept for
+forward compatibility.
 
 ### `[storage]`
 

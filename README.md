@@ -1,41 +1,109 @@
 # Maestro
 
-**Delegate coding work to any agent — and keep track of it all.**
+**Durable execution for coding agents.**
 
-Maestro is a local orchestration layer that runs coding agents (Codex, Claude
-Code, the GitHub Copilot CLI, Cursor, OpenHands, …) on your behalf. It gives you:
+Maestro is a local-first orchestration broker that runs coding agents (Codex,
+Claude Code, the GitHub Copilot CLI, Cursor, OpenHands, …) on your behalf and
+keeps a durable, auditable record of everything they do. Every delegation
+becomes a **task**: its attempts, live output, usage and cost, deterministic
+verification result, and any review verdicts are journaled to disk as they
+happen — so you can understand exactly what happened to any task at any time,
+even after the daemon (or your machine) restarts.
 
-- **Durable tasks** — every delegation is recorded with its full history
-  (attempts, output, cost, errors) and survives restarts.
-- **Any agent as a target** — first-class adapters for the major CLIs, plus a
-  generic spec for anything else, REST task servers, and even *another Maestro*
-  on another machine.
-- **Automatic fallback** — if an agent fails or isn't available, Maestro tries
-  your fallback chain instead of dying.
-- **Live visibility** — a web console, a terminal dashboard, and live-tail
-  commands, all event-driven (no polling).
-- **Cost tracking and budget caps** — usage is recorded per attempt; optional
-  per-agent and daily USD caps block new work when the budget is spent.
+## Why Maestro
 
-You can use Maestro two ways:
+Raw agent CLIs give you an answer and a scrollback buffer. Maestro adds the
+execution layer around them:
 
-| Path | Who it's for | How |
-|---|---|---|
-| **Through Claude Code** | You want an agent to supervise agents | Claude calls Maestro over MCP; you just talk to Claude |
-| **Directly** | You want to drive it yourself (CI, ops, no supervisor) | Start the daemon, use the `maestro` CLI or the web console |
+| Without Maestro | With Maestro |
+|---|---|
+| Task state lives in a terminal; closed it, lost it | Every task is journaled durably under `~/.maestro` and survives restarts |
+| One agent per run; if it fails or isn't installed, you find out mid-run | Fallback chains: try the next agent automatically; each attempt (and its cost) is recorded |
+| "Did it actually work?" is vibes | Deterministic verification runs after every implementation (auto-detected test suite + `git diff --check`), and an LLM verdict can never override a failed check |
+| Cost appears only in the agent's own UI | Usage/cost is captured per attempt, aggregated per task and per agent, with optional USD budget caps that block new work when spent |
+| No audit trail for review or CI | A one-command **execution receipt** (`maestro task receipt <id>`) — human-readable or `--json` — plus a full `task audit` record |
 
-Both paths share the same daemon, state, and commands. This guide covers both,
-starting with the direct path since it's the foundation.
+And it stays local: one small daemon, no cloud dependency, no framework to
+adopt. Daemons can also delegate to each other over the A2A protocol when you
+want more than one machine.
 
----
+## How a task flows
+
+```text
+  you / Claude Code (MCP)              Maestro daemon                    coding agent
+        │                                    │                                │
+        │  delegate(handoff)                 │                                │
+        ├───────────────────────────────────►│  submitted                     │
+        │                                    ├───────────────────────────────►│ working
+        │   ◄── SSE events: live output,    │◄───────────────────────────────┤ (attempts,
+        │       attempts, cost, verdicts    │                                │  usage, errors)
+        │                                    │  deterministic verification    │
+        │                                    │  optional LLM gates            │
+        │                                    │  completed / failed / canceled │
+        ▼                                    ▼                                ▼
+      ~/.maestro — claim journal + registry + per-task artifacts
+      (durable: every state change, attempt, and cost is journaled as it happens)
+```
+
+States follow the A2A vocabulary: `submitted → working → completed`, with
+`failed`, `canceled`, and `input-required` (parked for you to answer or fix)
+along the way. One active task per workspace; extra work queues FIFO.
+
+## The execution receipt
+
+When a task ends — or while it runs — one command summarizes what happened:
+who worked on it, how long, what it cost, whether verification passed, and any
+gate verdicts. (Example output; your numbers will differ.)
+
+```text
+$ maestro task receipt 42
+Maestro Execution Receipt
+----------------------------------------
+
+Task #42
+Fix the failing test in tests/api/
+
+Status      COMPLETED
+Workspace   /home/dev/acme-api
+Branch      maestro/task-42
+Duration    6m 12s
+Cost        $0.83
+Attempts    4
+
+Attempts
+1  IMPLEMENT codex
+   4m 05s   $0.51     ✓
+2  VERIFY    codex-mini
+   28s      —         ✓
+3  FIX       codex-mini
+   1m 39s   $0.32     ✓
+4  REVIEW    codex
+   51s      —         ✓
+
+Verification
+✓ PASSED (pytest -q), 2 runs
+
+Gates
+  verify: PASS (codex-mini)
+  review: PASS (codex), 1 issue(s)
+  bounces: 1
+
+Final result
+COMPLETED
+```
+
+`maestro task receipt <id> --json` emits the same data as stable JSON for CI
+and tooling. The receipt is a *projection* of the durable task state — it works
+for running, completed, failed, and canceled tasks alike, and after a daemon
+restart. The web console shows the same receipt inline on each task.
 
 ## Quickstart (5 minutes)
-
-### 1. Install
 
 Requirements: **Python 3.11+**, and at least one coding-agent CLI you want to
 use (e.g. `codex`, `claude`, `copilot`) installed and authenticated with its
 normal setup flow.
+
+### 1. Install
 
 ```bash
 git clone https://github.com/sethigoldy/maestro-multi-agent-orchestration.git
@@ -43,11 +111,28 @@ cd maestro-multi-agent-orchestration
 python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
-python -m pip install -e .
-maestro --version                  # sanity check
+python -m pip install .            # or: python -m pip install -e . for development
+maestro --version                  # → 0.9.0
 ```
 
-### 2. See which agents you can use
+> **Note on the name:** `maestro` is already taken on PyPI by an unrelated
+> project (a VLM fine-tuning library). This package is not published to PyPI;
+> install it from this repository (as above) or from a locally built wheel
+> (`python -m build`). The CLI command stays `maestro`.
+
+### 2. Check your environment
+
+```bash
+maestro doctor                     # or: maestro doctor --json
+```
+
+Doctor is fast, read-only, and tells you exactly what's usable: Python, state
+directory, daemon reachability, git, which agent CLIs it found (with versions),
+the workspace it will operate in, and your budget caps. It exits non-zero only
+on a genuinely blocking problem — missing optional agents are reported, not
+failed.
+
+### 3. See which agents you can use
 
 ```bash
 maestro agents discover            # scans your PATH for known agent CLIs
@@ -71,7 +156,7 @@ maestro agents add --name openclaw --kind generic \
 `maestro agents status <name>` shows whether an agent is ready (binary found,
 version checked) before you delegate to it.
 
-### 3. Start the daemon
+### 4. Start the daemon
 
 The daemon is the local broker: it runs tasks, streams events, and serves the
 web console.
@@ -83,7 +168,7 @@ maestro-daemon                     # prints its port; writes ~/.maestro/daemon.j
 Leave it running in a terminal (or a service manager). `--port 0` picks a free
 port; `--state-dir DIR` points it at an alternate state directory.
 
-### 4. Delegate your first task
+### 5. Delegate your first task
 
 ```bash
 maestro delegate \
@@ -101,7 +186,7 @@ immediately with the task id, or point at a handoff file instead of flags:
 maestro delegate --file handoff.toml --workspace /path/to/your/repo
 ```
 
-### 5. Watch it work
+### 6. Watch it work
 
 While a task runs (or after it finishes):
 
@@ -117,10 +202,18 @@ maestro task audit <task-id>
 ```
 
 And in a browser: **`http://127.0.0.1:<port>/`** — the web console shows all
-tasks, live output, costs, and per-attempt detail (see the port printed by
-`maestro-daemon`).
+tasks, live output, costs, per-attempt detail, and the execution receipt for
+each task (see the port printed by `maestro-daemon`).
 
-That's the whole loop: **register agents → start daemon → delegate → watch.**
+### 7. Close the loop with a receipt
+
+```bash
+maestro task receipt <task-id>           # human-readable summary
+maestro task receipt <task-id> --json    # stable JSON for CI / tooling
+```
+
+That's the whole loop: **doctor → discover agents → start daemon → delegate →
+watch → receipt.**
 
 ---
 
@@ -348,6 +441,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 
 | Command | What it does |
 |---|---|
+| `maestro doctor [--json]` | Diagnose the environment: state dir, daemon reachability, git, agent CLIs (with versions), workspace, budget caps. Read-only; exits non-zero only on a blocking problem |
 | `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | Start the broker daemon. `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
 | `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--context TEXT`, `--context-file PATH`, `--skill DIR` add context entries (repeatable, see "Context injection"); `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
@@ -355,6 +449,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro task status <id\|n>` | Show one task's current state (`task show`, `status`, and bare `task <n>` are aliases) |
 | `maestro task tail <id> [--all]` | Live-tail a task's event stream |
 | `maestro task audit <id>` | Durable record: attempts, usage, errors, result files |
+| `maestro task receipt <id\|n> [--json]` | Execution receipt: state, per-attempt phase/duration/cost, verification result, gate verdicts, totals. Works while running and after restart; `--json` for stable machine-readable output |
 | `maestro agents list \| add \| remove \| discover \| status <name>` | Manage registered agents |
 | `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
 | `maestro budgets` | Show budget caps and current spend |
@@ -682,3 +777,10 @@ onboarding recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
 - **Verification is deterministic.** Evidence, not vibes.
 - **Maestro never commits code and never installs dependencies.**
 - **The workspace is always explicit** — passed in, recorded, never guessed.
+
+---
+
+## License
+
+Maestro is licensed under the [Apache License 2.0](LICENSE). See
+[CHANGELOG.md](CHANGELOG.md) for release history.

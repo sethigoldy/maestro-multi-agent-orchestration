@@ -1,0 +1,39 @@
+# Work mode: pin specific agents to each phase of the task cycle so cost and
+# quality are data, not prompt discipline. A cheap model implements and fixes;
+# an expensive model only verifies/reviews the requested changes.
+#
+# Presets live in [modes.<name>] config tables (see docs/usage/how-to/configure-work-modes.md).
+# This example uses a "production" preset AND pins explicit agents, which beat
+# the preset for this task.
+#
+# Run it:
+#   maestro delegate --file examples/work-mode-production.toml --workspace /path/to/your/repo
+
+[handoff]
+title = "Refactor the billing module to be currency-aware"
+request = """
+Make the billing module in src/billing/ handle multiple currencies end to end:
+store amounts as integer minor units, convert at the edge, and keep existing
+callers working. Update the tests accordingly.
+"""
+design = """
+- Amounts are (value: int, currency: str) pairs; value is in minor units.
+- Conversion happens only in src/billing/convert.py using the rates service.
+- No public API changes outside the new currency field.
+"""
+
+[routing]
+target_agent = "codex-mini"      # implementer (cheap)
+mode = "production"              # optional preset name; explicit pins below win
+verify_agent = "codex-mini"      # LLM verification pass after deterministic check
+review_agent = "codex"           # expensive: reviews only the requested changes
+fix_agent = "codex-mini"         # bounces land here
+max_bounces = 2                  # stop and park (input-required) after 2 fix rounds
+
+[expectations]
+artifacts = ["code", "tests"]
+verification = "auto"            # deterministic check always runs first
+commit_policy = "branch"
+
+[constraints]
+sensitive = false

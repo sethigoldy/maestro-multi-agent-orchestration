@@ -1,0 +1,47 @@
+# Context injection: typed, user-controlled context composed into agent turns.
+# Entries come from this handoff's [[context]] array plus any standing
+# [context.<label>] config tables (user file, then project/worktree files).
+# Each entry is recorded on the task, so `maestro task audit <id>` shows
+# exactly what each turn received.
+#
+# Run it:
+#   maestro delegate --file examples/context.toml --workspace /path/to/your/repo
+
+[handoff]
+title = "Implement export-to-CSV for the reports page"
+request = """
+Add a CSV export button to the reports page that streams the current table's
+columns. Respect the existing pagination and permission checks.
+"""
+design = ""
+
+[routing]
+target_agent = "codex"
+fallback = []
+
+[expectations]
+artifacts = ["code"]
+verification = "auto"
+commit_policy = "no-commit"
+
+[constraints]
+sensitive = false
+
+# --- typed context entries (composed with standing config at delegate time) ---
+
+[[context]]
+label = "style"
+kind = "text"                    # text | file | skill
+text = "Follow docs/STYLE.md. Error shapes live in src/api/errors.py; reuse them, don't invent new ones."
+phases = ["implementer"]         # optional — default: all phases
+
+[[context]]
+label = "api-conventions"
+kind = "file"                    # inlined when <=8KB, else staged and referenced by path
+path = "docs/api-conventions.md"
+
+[[context]]
+label = "csv-skill"
+kind = "skill"                   # an Agent Skills directory containing SKILL.md
+path = "~/skills/csv-export"
+phases = ["implementer", "verifier"]
