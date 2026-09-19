@@ -7,8 +7,8 @@ Caps are configured per daemon via environment:
   at UTC midnight.
 
 Spend is computed from task usage claims: each attempt records the usage its
-agent produced (``total_cost_usd``), so per-agent attribution is exact and a
-task's cost survives failed attempts (failed work still costs money).
+agent produced (``cost_usd`` / ``total_cost_usd``), so per-agent attribution is
+exact and a task's cost survives failed attempts (failed work still costs money).
 Enforcement happens only in ``delegate()`` — running tasks always finish; a
 blocked launch raises ``ValueError`` like any other precondition failure.
 """
@@ -48,13 +48,19 @@ class BudgetCaps:
 
 
 def cost_of(usage: Any) -> float:
-    """Extract a USD cost from a usage dict (0.0 when absent/non-numeric)."""
+    """Extract a USD cost from a usage dict (0.0 when absent/non-numeric).
+
+    Adapters report the attempt cost under ``cost_usd``; ``total_cost_usd`` is
+    accepted as well so both spellings attribute spend identically.
+    """
     if not isinstance(usage, dict):
         return 0.0
-    value = usage.get("total_cost_usd")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return 0.0
-    return float(value)
+    for key in ("total_cost_usd", "cost_usd"):
+        value = usage.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        return float(value)
+    return 0.0
 
 
 def _records_from_claims(claims: list[Any]) -> dict[str, dict[str, Any]]:

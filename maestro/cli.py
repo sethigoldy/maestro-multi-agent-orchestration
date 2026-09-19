@@ -41,7 +41,7 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
-    known_task_cmds = {"list", "status", "show", "tail", "audit"}
+    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt"}
     if len(argv) >= 2 and argv[0] == "task":
         subcommand = argv[1]
         if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
@@ -261,6 +261,50 @@ def _cmd_task_audit(args: argparse.Namespace) -> int:
         m.close()
 
 
+def _try_daemon_endpoint() -> tuple[str, str | None] | None:
+    """Like :func:`_daemon_endpoint`, but ``None`` instead of raising (for fallback paths)."""
+    try:
+        return _daemon_endpoint()
+    except ValueError:
+        return None
+
+
+def _cmd_task_receipt(args: argparse.Namespace) -> int:
+    import urllib.error
+    import urllib.request
+
+    from .receipt import build_receipt, format_receipt
+
+    state_dir = maestro_user_dir()
+    m = Maestro(state_dir)
+    try:
+        resolved: str | None = None
+        local_error = ""
+        try:
+            resolved = m.resolve_task(args.task_id)
+        except KeyError as exc:
+            local_error = str(exc.args[0])
+        receipt: dict[str, Any] | None = None
+        endpoint = _try_daemon_endpoint()
+        if endpoint is not None:
+            url, token = endpoint
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            request = urllib.request.Request(url + f"/tasks/{args.task_id}/receipt", headers=headers)
+            try:
+                with urllib.request.urlopen(request, timeout=5) as resp:
+                    receipt = json.loads(resp.read().decode("utf-8"))
+            except (urllib.error.URLError, OSError):
+                receipt = None  # fall back to the durable local state
+        if receipt is None:
+            if resolved is None and endpoint is None:
+                raise ValueError(f"{local_error} (no daemon reachable to check)")
+            receipt = build_receipt(resolved or args.task_id, m)
+        print(json.dumps(receipt, indent=2) if args.as_json else format_receipt(receipt))
+        return 0
+    finally:
+        m.close()
+
+
 def _cmd_budgets() -> int:
     from .budgets import BudgetCaps, daily_spend, spent_by_agent
     from .core import Maestro
@@ -396,6 +440,9 @@ def main(argv: list[str] | None = None) -> int:
     task_tail.add_argument("--all", action="store_true", help="Follow the global stream instead of one task")
     task_audit = task_sub.add_parser("audit", help="Show the durable audit record (attempts, usage, errors)")
     task_audit.add_argument("task_id")
+    task_receipt = task_sub.add_parser("receipt", help="Show the execution receipt (attempts, verification, gates, totals)")
+    task_receipt.add_argument("task_id")
+    task_receipt.add_argument("--json", action="store_true", dest="as_json", help="Machine-readable JSON receipt")
 
     d = sub.add_parser("delegate", help="Delegate a handoff to any registered agent via the local daemon")
     d.add_argument("--file", default=None, help="Handoff document file (TOML or JSON)")
@@ -490,6 +537,8 @@ def main(argv: list[str] | None = None) -> int:
             return _stream_task(url, target_id, token=_daemon_token())
         if args.cmd == "task" and args.task_cmd == "audit":
             return _cmd_task_audit(args)
+        if args.cmd == "task" and args.task_cmd == "receipt":
+            return _cmd_task_receipt(args)
 
         if args.cmd == "storage" and args.storage_cmd == "migrate-memvara":
             m = Maestro(_workspace(getattr(args, "workspace", None)))

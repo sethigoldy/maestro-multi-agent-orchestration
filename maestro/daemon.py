@@ -655,9 +655,15 @@ class MaestroDaemon:
     def _bookkeep_turn(self, task_id: str, agent_name: str, result: Any, turn: int, attempt: int) -> None:
         """Persist one turn's result file and fold its usage into the task record."""
         (self.state_dir / "tasks" / task_id).mkdir(parents=True, exist_ok=True)
-        (self.state_dir / "tasks" / task_id / f"result-{agent_name}-t{turn}-{attempt}.json").write_text(
+        result_file = f"result-{agent_name}-t{turn}-{attempt}.json"
+        (self.state_dir / "tasks" / task_id / result_file).write_text(
             json.dumps(result.to_dict(), indent=2), encoding="utf-8"
         )
+        # _record_attempt always immediately precedes this call: stamp the log
+        # reference onto that attempt so receipts can point at the turn's output.
+        record = self._tasks.get(task_id) or {}
+        if record.get("attempts") and record["attempts"][-1].get("agent") == agent_name:
+            record["attempts"][-1]["result_file"] = result_file
         if result.usage:
             self.bus.publish(TaskEvent(task_id=task_id, type="usage", data={"agent": agent_name, **result.usage}))
             record = self._tasks.get(task_id) or {}
@@ -666,11 +672,11 @@ class MaestroDaemon:
             merged.update(result.usage)
             record["usage"] = merged
 
-    def _record_attempt(self, task_id: str, agent_name: str, result: Any, error: str | None = None) -> None:
+    def _record_attempt(self, task_id: str, agent_name: str, result: Any, error: str | None = None, role: str = "implement") -> None:
         record = self._tasks.get(task_id)
         if record is None:
             return
-        entry = {"agent": agent_name, "ok": bool(result.ok) if result else False}
+        entry = {"agent": agent_name, "ok": bool(result.ok) if result else False, "role": role}
         if result is not None:
             entry["exit_code"] = result.exit_code
             entry["duration_s"] = round(result.duration_s, 3)
@@ -679,6 +685,7 @@ class MaestroDaemon:
                 entry["usage"] = result.usage
         if error:
             entry["error"] = error
+        entry["finished_at"] = utcnow_iso()
         record.setdefault("attempts", []).append(entry)
 
     def _post_complete(self, task_id: str, doc: HandoffDoc, workspace: Path, agent_name: str, result: Any) -> None:
@@ -851,7 +858,7 @@ class MaestroDaemon:
             on_line=_on_line,
             should_cancel=(lambda: cancel_flag.is_set()) if cancel_flag is not None else None,
         )
-        self._record_attempt(task_id, agent_name, result, None if result.ok else (result.error or f"{role} turn failed"))
+        self._record_attempt(task_id, agent_name, result, None if result.ok else (result.error or f"{role} turn failed"), role=role)
         self._bookkeep_turn(task_id, agent_name, result, turn, 0)
         if self._canceled(task_id):
             return {"ok": True, "issues": [], "parked": False}
@@ -906,7 +913,7 @@ class MaestroDaemon:
             on_line=_on_line,
             should_cancel=(lambda: cancel_flag.is_set()) if cancel_flag is not None else None,
         )
-        self._record_attempt(task_id, fix_agent, result, None if result.ok else (result.error or "fix turn failed"))
+        self._record_attempt(task_id, fix_agent, result, None if result.ok else (result.error or "fix turn failed"), role="fix")
         self._bookkeep_turn(task_id, fix_agent, result, turn, 0)
         if self._canceled(task_id):
             return "canceled", None
@@ -1265,6 +1272,25 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/tasks":
                 self._send_json(200, {"tasks": daemon.list_tasks()})
+                return
+            if path.startswith("/tasks/") and path.endswith("/receipt"):
+                from .receipt import build_receipt
+
+                task_id = path[len("/tasks/") : -len("/receipt")]
+                try:
+                    resolved = daemon.resolve(task_id)
+                except KeyError as exc:
+                    self._send_json(404, {"error": str(exc)})
+                    return
+                known = (
+                    resolved in daemon._tasks
+                    or any(str(x.get("task_id")) == resolved for x in daemon.maestro._registry_records())
+                    or bool(daemon.maestro.mem.history(f"maestro:task:{resolved}", "task_status"))
+                )
+                if not known:
+                    self._send_json(404, {"error": f"Unknown task reference {resolved!r}"})
+                    return
+                self._send_json(200, build_receipt(resolved, daemon.maestro, daemon.state_dir))
                 return
             if path == "/events":
                 self._sse(None)  # global stream: every task, never terminates on its own
