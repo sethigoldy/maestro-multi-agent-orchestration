@@ -476,9 +476,12 @@ class MaestroDaemon:
         return task_id, record
 
     def _register_and_claims(self, task_id: str, doc: HandoffDoc, key: str) -> None:
+        # The registry record's project_root is the TASK workspace's project
+        # root (not the daemon's own cwd), so scoped listings
+        # (`task list --workspace/--project`) match tasks by their real project.
         with self.maestro._task_lock():
             number = self.maestro._new_task_number()
-            self.maestro._register_task(task_id, doc.title, number)
+            self.maestro._register_task(task_id, doc.title, number, project_root=str(Maestro._resolve_project_root(Path(key))))
         self.maestro._write_claim(task_id, "task_title", doc.title)
         self.maestro._write_claim(task_id, "task_workspace", key)
         self.maestro._write_claim(task_id, "task_number", str(number))

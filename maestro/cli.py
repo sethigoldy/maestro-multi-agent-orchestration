@@ -305,6 +305,17 @@ def _cmd_task_receipt(args: argparse.Namespace) -> int:
         m.close()
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    from .doctor import format_doctor, run_doctor
+
+    workspace = _workspace(getattr(args, "workspace", None))
+    if getattr(args, "project", None):
+        workspace = _project(args.project)
+    report = run_doctor(workspace=workspace)
+    print(json.dumps(report, indent=2) if args.as_json else format_doctor(report))
+    return 0 if report.get("ok") else 1
+
+
 def _cmd_budgets() -> int:
     from .budgets import BudgetCaps, daily_spend, spent_by_agent
     from .core import Maestro
@@ -478,6 +489,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("budgets", help="Show budget caps and current spend (MAESTRO_BUDGET_*_USD)")
 
+    doctor = sub.add_parser("doctor", help="Diagnose whether this environment can run Maestro (state, daemon, git, agents, workspace)")
+    doctor.add_argument("--json", action="store_true", dest="as_json", help="Machine-readable JSON report")
+    _add_target_args(doctor)
+
     s = sub.add_parser("status", help="Show task status")
     s.add_argument("task_id")
     _add_target_args(s)
@@ -539,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_audit(args)
         if args.cmd == "task" and args.task_cmd == "receipt":
             return _cmd_task_receipt(args)
+        if args.cmd == "doctor":
+            return _cmd_doctor(args)
 
         if args.cmd == "storage" and args.storage_cmd == "migrate-memvara":
             m = Maestro(_workspace(getattr(args, "workspace", None)))
