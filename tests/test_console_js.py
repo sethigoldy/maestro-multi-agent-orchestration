@@ -62,6 +62,35 @@ def test_bundle_has_no_polling():
     assert "maestro_token" in js
 
 
+def test_web_dist_is_in_sync_with_source():
+    """Catch a stale maestro/web_dist/ after web/src edits — no node required.
+
+    The build copies web/index.html verbatim and bundles string literals that
+    survive minification, so these markers prove the checked-in assets were
+    built from the current sources. (CI additionally rebuilds with the pinned
+    esbuild and diffs the output; see .github/workflows/test.yml.)
+    """
+    src_index = REPO_ROOT / "web" / "index.html"
+    dist_index = REPO_ROOT / "maestro" / "web_dist" / "index.html"
+    assert src_index.is_file() and dist_index.is_file(), (
+        "run `node web/build.mjs` to produce maestro/web_dist/"
+    )
+    assert dist_index.read_bytes() == src_index.read_bytes(), (
+        "maestro/web_dist/index.html is stale relative to web/index.html; "
+        "run `node web/build.mjs`"
+    )
+    bundle = REPO_ROOT / "maestro" / "web_dist" / "console.js"
+    assert bundle.is_file() and bundle.stat().st_size > 0
+    js = bundle.read_text(encoding="utf-8")
+    # Each marker comes from the current web/src (DetailPane receipt panel,
+    # events.loadReceipt). If one is missing, the bundle predates a source edit.
+    for marker in ("VERIFIED", "Final verification: ", "Final: ", "/receipt"):
+        assert marker in js, (
+            f"stale bundle: {marker!r} (from web/src) not found in "
+            "maestro/web_dist/console.js; run `node web/build.mjs`"
+        )
+
+
 def test_auth_module_token_flow():
     node = _node()
     if node is None:

@@ -901,9 +901,9 @@ def test_a2a_client_sends_bearer_token(tmp_path):
 def test_a2a_client_401_raises_token_hint(tmp_path):
     srv = _AuthServer(tmp_path, token="sekrit")
     try:
-        with pytest.raises(ValueError, match="agent card request rejected \(HTTP 401"):
+        with pytest.raises(ValueError, match=r"agent card request rejected \(HTTP 401"):
             fetch_agent_card(srv.url)
-        with pytest.raises(ValueError, match="remote rejected the request \(HTTP 401"):
+        with pytest.raises(ValueError, match=r"remote rejected the request \(HTTP 401"):
             post_jsonrpc(srv.url, "message/send", {})
     finally:
         srv.close()
