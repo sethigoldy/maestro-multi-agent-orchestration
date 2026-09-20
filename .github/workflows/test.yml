@@ -1,14 +1,86 @@
 name: test
+
 on:
   push:
+    branches: [main]
   pull_request:
+
 jobs:
   test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project + test dependencies
+        run: |
+          python -m pip install -U pip
+          python -m pip install -e . pytest coverage build
+      - name: Full test suite (with branch coverage)
+        run: python -m coverage run --branch -m pytest -q
+      - name: Enforce 100% branch coverage
+        run: python -m coverage report --fail-under=100
+      - name: Export coverage
+        if: always()
+        run: python -m coverage xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-py${{ matrix.python-version }}
+          path: coverage.xml
+
+  build-and-validate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: python -m pip install -e . pytest
-      - run: pytest -q
+          python-version: "3.11"
+          cache: pip
+      - name: Install build tooling
+        run: |
+          python -m pip install -U pip
+          python -m pip install build
+      - name: Build wheel + sdist
+        run: python -m build
+      - name: Validate clean installs (wheel and sdist, fresh venvs)
+        run: DIST_DIR=dist scripts/validate-package.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install project (editable, for the smoke script's .venv convention)
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -U pip
+          .venv/bin/python -m pip install -e .
+      - name: Hermetic fake-agent smoke test (no real agent CLIs, no network)
+        run: scripts/smoke-fake-agent.sh
+
+  web-build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Rebuild the console bundle (pinned esbuild via package-lock.json)
+        working-directory: web
+        run: npm ci && node build.mjs
+      - name: Fail if checked-in maestro/web_dist/ is stale
+        run: git diff --exit-code -- maestro/web_dist/
