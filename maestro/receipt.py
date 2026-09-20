@@ -245,13 +245,20 @@ def format_receipt(receipt: dict[str, Any]) -> str:
     if task.get("title"):
         lines.append(str(task["title"]))
     lines.append("")
+    # "Runs" is the total number of executions (agent turns + verification
+    # runs); the "Attempts" section below lists the agent turns in detail.
+    total_runs = totals.get("attempts")
+    if total_runs is not None and (totals.get("verification_attempts") or 0) > 0:
+        runs_value = f"{total_runs} ({totals.get('agent_attempts', '?')} agent · {totals['verification_attempts']} verification)"
+    else:
+        runs_value = total_runs
     for label, value in (
         ("Status", str(receipt.get("state") or "unknown").upper()),
         ("Workspace", task.get("workspace")),
         ("Branch", task.get("branch")),
         ("Duration", _fmt_duration(totals.get("duration_s"))),
         ("Cost", _fmt_cost(totals.get("cost_usd"))),
-        ("Attempts", totals.get("attempts")),
+        ("Runs", runs_value),
     ):
         if value not in (None, ""):
             lines.append(f"{label:<12}{value}")
@@ -261,9 +268,11 @@ def format_receipt(receipt: dict[str, Any]) -> str:
         lines.extend(["", "Attempts"])
         for attempt in attempts:
             mark = "✓" if attempt.get("ok") else "✗"
-            lines.append(f"{attempt.get('n', '?')}  {str(attempt.get('phase') or 'IMPLEMENT'):<8} {attempt.get('agent') or '?'}")
-            detail = f"   {_fmt_duration(attempt.get('duration_s')) or '—':<8} {_fmt_cost(attempt.get('cost_usd')) or '—':<7} {mark}"
-            lines.append(detail)
+            phase = str(attempt.get("phase") or "IMPLEMENT")
+            agent = str(attempt.get("agent") or "?")
+            duration = _fmt_duration(attempt.get("duration_s")) or "—"
+            cost = _fmt_cost(attempt.get("cost_usd")) or "—"
+            lines.append(f"{attempt.get('n', '?')}  {phase:<9} {agent:<14} {duration:<8} {cost:<7} {mark}")
             if not attempt.get("ok") and attempt.get("error"):
                 first = str(attempt["error"]).splitlines()[0]
                 lines.append(f"        {first}")
