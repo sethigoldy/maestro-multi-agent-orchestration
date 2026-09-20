@@ -89,6 +89,11 @@ class HandoffDoc:
                 "verify_agent": self.verify_agent,
                 "fix_agent": self.fix_agent,
                 "max_bounces": self.max_bounces,
+                # Whether the target was named by the user (True) or is just a
+                # default awaiting work-mode expansion (False). Must cross the
+                # wire: without it, from_dict's legacy heuristic treats the
+                # default as explicit and mode presets never pin the implementer.
+                "explicit_target": self.explicit_target,
             },
             "expectations": {
                 "artifacts": list(self.artifacts),
@@ -161,7 +166,9 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         verify_agent=routing.get("verify_agent"),
         fix_agent=routing.get("fix_agent"),
         max_bounces=routing.get("max_bounces"),
-        explicit_target="target_agent" in routing,
+        # New payloads carry the flag explicitly; old persisted records lack it,
+        # so fall back to the legacy heuristic (a named target counts as explicit).
+        explicit_target=bool(routing.get("explicit_target", "target_agent" in routing)),
         artifacts=[str(x) for x in expectations.get("artifacts", ["code"])],
         verification=str(expectations.get("verification") or "auto"),
         commit_policy=str(expectations.get("commit_policy") or "branch"),

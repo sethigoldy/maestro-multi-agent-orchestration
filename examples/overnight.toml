@@ -1,0 +1,49 @@
+# Overnight batch: submit several independent tasks before you go offline,
+# inspect them in the morning.
+#
+# The pattern (no scheduler, no cron — just Maestro's durability):
+#   1. Give each task its OWN workspace (a separate clone or worktree). The
+#      daemon runs one active task per workspace, but different workspaces run
+#      in parallel, so a batch of N tasks in N workspaces proceeds concurrently.
+#   2. Submit them all with `maestro delegate --file ... --workspace ...`.
+#      Each call blocks until THAT task finishes; to submit the whole batch and
+#      walk away, either background each call or use --no-wait (the task is
+#      queued and starts as soon as its workspace is free).
+#   3. Close the laptop. State lives in $MAESTRO_HOME on disk — a daemon
+#      restart (or machine sleep/wake) does not lose anything.
+#   4. In the morning: `maestro task list` per workspace, then
+#      `maestro task receipt <id>` for each task you care about. Every attempt,
+#      cost, and verification result is still there — including tasks that
+#      parked in input-required waiting for your answer.
+#
+# This file is one member of such a batch: a self-contained, low-risk cleanup
+# task with auto-verification and branch-only commits (nothing lands until you
+# review it).
+
+[handoff]
+title = "Remove dead code flagged by the linter"
+request = """
+Run the project's linter/type checker. For each warning that points at
+unreachable or unused code, remove it — but only if removing it cannot change
+behavior (no public API removals, no config changes). Leave a one-line comment
+in the commit message listing what was removed and why it was dead.
+"""
+design = """
+- Dead code only: functions/imports/classes with zero references after the
+  linter pass. If a symbol is referenced from tests or docs, skip it.
+- Do not refactor anything that is live, even if ugly.
+- Keep the change reviewable: small diff, no whitespace churn.
+"""
+
+[routing]
+target_agent = "codex"     # the cheap workhorse; swap for any installed agent
+fallback = ["claude"]      # one alternate if the primary is unavailable
+mode = ""                  # empty = plain single-agent task (no work-mode gates)
+
+[expectations]
+artifacts = ["code"]
+verification = "auto"      # detected test runner + `git diff --check`, always
+commit_policy = "branch"   # changes land on maestro/task-<id> for morning review
+
+[constraints]
+sensitive = false

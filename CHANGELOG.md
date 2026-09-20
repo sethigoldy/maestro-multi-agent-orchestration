@@ -66,6 +66,51 @@ auditable end to end.
   `docs/usage/reference/cli.md`, `docs/usage/tutorials/first-delegation.md`,
   `docs/usage/reference/configuration.md`.
 
+### Release readiness
+
+- **CI** — GitHub Actions matrix (Python 3.11/3.12/3.13) runs the full suite
+  with the 100% coverage gate, builds the wheel + sdist, validates a clean
+  install of both artifacts in fresh virtualenvs (`scripts/validate-package.sh`),
+  runs the fake-agent smoke test, and rebuilds the web bundle to prove the
+  checked-in `maestro/web_dist/` is in sync. A release workflow on `v*` tags
+  re-runs all gates, enforces tag == pyproject == `maestro.VERSION`, and
+  publishes artifacts (wheel + sdist) to GitHub Releases — never to PyPI (the
+  name is taken by an unrelated project).
+- **Clean-install verification** — `scripts/validate-package.sh` builds both
+  artifacts and installs each into a throwaway venv, checking `maestro
+  --version/--help/doctor`, the `maestro-mcp`/`maestro-daemon` entry points,
+  and the packaged web assets. Packaging tests in `tests/test_packaging.py`
+  pin version, license, metadata, manifest, and asset presence; a marker test
+  in `tests/test_console_js.py` catches stale console bundles even without node.
+- **Flagship demo** — `scripts/demo-v0.9.sh`: deterministic fake agents drive a
+  full work-mode cycle (implement → failing verification gate → auto-fix bounce
+  → re-verification) and prove the receipt survives daemon shutdown; the
+  90-second storyboard is `docs/demo-v0.9.md`. `examples/overnight.toml`
+  documents multi-task batches (separate workspaces, inspect via receipts — no
+  scheduler).
+- **Contributor & security docs** — `CONTRIBUTING.md` (setup, the test bar,
+  design principles) and `SECURITY.md` (reporting path + threat model: Maestro
+  executes external processes with your privileges; loopback-only daemon by
+  default, token required for any non-loopback bind).
+- **Real-agent validation** — `docs/release/real-agent-validation.md`: the
+  manual, labeled procedure for validating against real agent CLIs (deliberately
+  outside CI); screenshot capture instructions in `docs/assets/README.md`.
+- **Receipt readability** — the human receipt now shows a single scannable line
+  per attempt (phase / agent / duration / cost / ✓-✗) and a `Runs` summary that
+  disambiguates total executions from the attempts list
+  (`6 (4 agent · 2 verification)`). The JSON shape is unchanged.
+- **Coverage gate** — `fail_under = 100` now lives in `.coveragerc` itself, so
+  a plain `coverage report` enforces the gate as well as CI's explicit flag.
+
+### Fixed
+
+- **Work-mode presets over the wire** — `explicit_target` (whether the target
+  agent was named by the user or is just a default) was dropped when handoffs
+  crossed the JSON-RPC boundary, so `maestro delegate --mode <preset>` without
+  `--target` ran the default agent instead of the preset's implementer. The flag
+  is now serialized with the document; legacy persisted records keep the old
+  heuristic.
+
 ## [0.8.x] — prior milestones
 
 Highlights from the 0.8 line (see git history for the full record):

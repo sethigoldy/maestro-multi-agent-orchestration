@@ -434,6 +434,66 @@ def test_format_receipt_minimal_task(plain_state):
     assert "Final result\nUNKNOWN" in text
 
 
+def test_format_receipt_runs_breakdown_and_single_line_attempts(plain_state):
+    """Human format: 'Runs' disambiguates total executions from the Attempts
+    list, and each attempt is one scannable line (phase/agent/duration/cost/mark)."""
+    m, _ = plain_state
+    tid = "task-20260101-000000-fmtfmt"
+    _seed(
+        m, tid,
+        runtime={
+            "state": "completed",
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "attempts": [
+                {"agent": "codex", "role": "implement", "ok": True, "exit_code": 0,
+                 "duration_s": 245.0, "usage": {"cost_usd": 0.51}, "finished_at": "2026-01-01T00:04:05+00:00"},
+                {"agent": "codex-mini", "role": "verifier", "ok": True, "exit_code": 0,
+                 "duration_s": 28.0, "finished_at": "2026-01-01T00:04:33+00:00"},
+                {"agent": "codex-mini", "role": "fix", "ok": False, "exit_code": 1,
+                 "duration_s": 9.0, "error": "fixer exploded\nmore detail",
+                 "finished_at": "2026-01-01T00:04:42+00:00"},
+            ],
+        },
+    )
+    m._write_claim(tid, "task_verification", f"PASSED: {m.state_dir / 'tasks' / tid / 'verification.txt'}")
+    from maestro.receipt import build_receipt, format_receipt
+
+    r = build_receipt(tid, m)
+    text = format_receipt(r)
+    # Total runs include the verification run; breakdown shown when present.
+    assert "Runs        4 (3 agent · 1 verification)" in text
+    # Each attempt is a single line: n, phase, agent, duration, cost, mark.
+    assert "1  IMPLEMENT codex" in text
+    assert "2  VERIFY    codex-mini" in text
+    assert "3  FIX       codex-mini" in text
+    line1 = next(l for l in text.splitlines() if l.startswith("1  IMPLEMENT"))
+    assert "$0.51" in line1 and "✓" in line1  # cost + mark on the same line as the phase
+    # Failed attempt: em dash cost, ✗ mark, first error line indented below.
+    line3 = next(l for l in text.splitlines() if l.startswith("3  FIX"))
+    assert "—" in line3 and "✗" in line3
+    assert "        fixer exploded" in text
+    # The summary no longer uses the ambiguous bare 'Attempts' count line.
+    assert not any(l.startswith("Attempts") and l[8:].strip().isdigit() for l in text.splitlines())
+
+
+def test_format_receipt_runs_without_verification(plain_state):
+    m, _ = plain_state
+    tid = "task-20260101-000000-fmtfmt"
+    _seed(
+        m, tid,
+        runtime={
+            "state": "completed",
+            "attempts": [
+                {"agent": "codex", "role": "implement", "ok": True, "exit_code": 0, "duration_s": 5.0},
+            ],
+        },
+    )
+    from maestro.receipt import build_receipt, format_receipt
+
+    text = format_receipt(build_receipt(tid, m))
+    assert "Runs        1" in text  # no verification runs: bare count, no breakdown
+
+
 # ---------------------------------------------------------------- live daemon
 
 def _run_fake_task(live_daemon, tmp_path, monkeypatch, doc, agent="codex", body=None, ws_name=None):

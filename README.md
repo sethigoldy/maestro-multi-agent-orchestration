@@ -27,6 +27,16 @@ And it stays local: one small daemon, no cloud dependency, no framework to
 adopt. Daemons can also delegate to each other over the A2A protocol when you
 want more than one machine.
 
+### Supported agents
+
+Maestro ships first-class adapters for **Codex**, **Claude Code**, **GitHub
+Copilot CLI**, **Cursor**, Hermes Agent, Pi, Cline, and **OpenHands** — plus a
+**generic spec** that turns *any* non-interactive CLI into an agent with one
+registry entry (no code), and `a2a_remote` for delegating to another Maestro
+daemon on another machine. Anything that can run from a shell works; the full
+table, registration commands, and onboarding recipes are in
+[Agents](#agents).
+
 ## How a task flows
 
 ```text
@@ -68,17 +78,13 @@ Workspace   /home/dev/acme-api
 Branch      maestro/task-42
 Duration    6m 12s
 Cost        $0.83
-Attempts    4
+Runs        6 (4 agent · 2 verification)
 
 Attempts
-1  IMPLEMENT codex
-   4m 05s   $0.51     ✓
-2  VERIFY    codex-mini
-   28s      —         ✓
-3  FIX       codex-mini
-   1m 39s   $0.32     ✓
-4  REVIEW    codex
-   51s      —         ✓
+1  IMPLEMENT codex          4m 5s    $0.51   ✓
+2  VERIFY    codex-mini     28s      —       ✓
+3  FIX       codex-mini     1m 39s   $0.32   ✓
+4  REVIEW    codex          51s      —       ✓
 
 Verification
 ✓ PASSED (pytest -q), 2 runs
@@ -116,8 +122,10 @@ maestro --version                  # → 0.9.0
 ```
 
 > **Note on the name:** `maestro` is already taken on PyPI by an unrelated
-> project (a VLM fine-tuning library). This package is not published to PyPI;
-> install it from this repository (as above) or from a locally built wheel
+> project (a VLM fine-tuning library). This package is **not published to
+> PyPI**; install it from this repository (as above), from a release artifact
+> attached to a [GitHub Release](https://github.com/sethigoldy/maestro-multi-agent-orchestration/releases)
+> (`pip install maestro-0.9.0-py3-none-any.whl`), or from a locally built wheel
 > (`python -m build`). The CLI command stays `maestro`.
 
 ### 2. Check your environment
@@ -747,6 +755,8 @@ python -m pip install -e .
 python -m pip install pytest coverage
 python -m coverage run --branch -m pytest -q
 python -m coverage report --fail-under=100     # CI enforces 100% line+branch
+scripts/smoke-fake-agent.sh                    # end-to-end fake-agent smoke test (no CLIs, no network)
+scripts/validate-package.sh                    # clean-install check: wheel + sdist in fresh venvs
 ```
 
 The web console's built artifacts are committed in `maestro/web_dist/`, so
@@ -754,15 +764,32 @@ Node is **not** needed to use Maestro. To rebuild the console after changing
 `web/src/`:
 
 ```bash
-cd web && npm install && npm run build   # rewrites maestro/web_dist/
+cd web && npm ci && node build.mjs             # rewrites maestro/web_dist/ (byte-reproducible)
 ```
 
-The flagship end-to-end demo (full role swap, one command) is
-`examples/full-swap.sh`. In-depth usage documentation — tutorials, how-to
-guides, reference, and design explanation — lives in
-[docs/usage/](docs/usage/README.md). Design rationale and the milestone history
-live in [docs/architecture-proposal.md](docs/architecture-proposal.md); agent
-onboarding recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
+### Demos and validation
+
+- **90-second flagship demo** — `scripts/demo-v0.9.sh`: deterministic fake
+  agents, one work-mode task with a failing first verification pass, an auto-fix
+  bounce, and a durable receipt after the daemon stops. The storyboard:
+  [docs/demo-v0.9.md](docs/demo-v0.9.md).
+- **Full role-swap demo** — `examples/full-swap.sh` (needs real `claude`/`codex` CLIs).
+- **Real-agent validation** — the manual procedure for proving Maestro drives
+  your actual agent CLIs end to end (not part of CI; spends real money):
+  [docs/release/real-agent-validation.md](docs/release/real-agent-validation.md).
+
+### Project documentation
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — development setup, the test bar, and the
+  design principles that keep Maestro maintainable.
+- [SECURITY.md](SECURITY.md) — how to report vulnerabilities, and an honest
+  threat model (Maestro executes external processes with your privileges).
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
+- In-depth usage documentation — tutorials, how-to guides, reference, and
+  design explanation — lives in [docs/usage/](docs/usage/README.md). Design
+  rationale and the milestone history live in
+  [docs/architecture-proposal.md](docs/architecture-proposal.md); agent
+  onboarding recipes in [docs/agent-onboarding.md](docs/agent-onboarding.md).
 
 ---
 
