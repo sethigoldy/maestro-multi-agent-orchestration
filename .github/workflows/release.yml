@@ -69,22 +69,27 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          # Notes via a file: keeps every line of this YAML block indented.
+          {
+            echo "Maestro ${version} — durable execution for coding agents."
+            echo ""
+            echo 'Install (the name "maestro" is taken on PyPI by an unrelated project, so this package is distributed here, not from PyPI):'
+            echo ""
+            echo '```bash'
+            echo "pip install maestro-${version}-py3-none-any.whl   # attached below"
+            echo "maestro --version   # ${version}"
+            echo "maestro doctor"
+            echo '```'
+            echo ""
+            echo "See the README for the quickstart."
+          } > release-notes.md
           # Re-runnable: replace a pre-existing release for the same tag.
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release delete "$tag" --yes
           fi
           gh release create "$tag" \
             dist/*.whl dist/*.tar.gz \
-            --title "Maestro ${tag#v}" \
-            --notes "Maestro ${tag#v} — durable execution for coding agents.
-
-Install (the name \`maestro\` is taken on PyPI by an unrelated project, so this package is distributed here, not from PyPI):
-
-\`\`\`bash
-pip install <wheel filename from the attachments>
-maestro --version   # ${tag#v}
-maestro doctor
-\`\`\`
-
-See the README for the quickstart." \
+            --title "Maestro ${version}" \
+            --notes-file release-notes.md \
             --latest
