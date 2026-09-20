@@ -96,3 +96,46 @@ def test_expand_fixer_defaults_to_implementer():
     doc = expand(preset, _doc())
     assert doc.fix_agent == "impl" and doc.max_bounces == DEFAULT_MAX_BOUNCES
     assert doc.verify_agent is None and doc.review_agent is None
+
+
+# ------------------------------------------------------- wire round-trip (CLI)
+def test_mode_preset_survives_cli_wire_round_trip():
+    """`maestro delegate --mode m` (no --target) must pin the preset implementer.
+
+    The CLI defaults target_agent to "codex" but sets explicit_target=False;
+    that flag must cross the JSON-RPC wire (to_dict/from_dict), otherwise the
+    legacy heuristic in from_dict treats the default as user-explicit and the
+    preset never replaces it (regression: demo ran the real codex, not the fake).
+    """
+    from maestro.handoff import from_dict
+
+    preset = ModePreset(name="demo", implementer="fake-impl", verifier="fake-ver", reviewer=None, fixer=None, max_bounces=1)
+    doc = _doc(target_agent="codex", mode="demo", explicit_target=False)  # exactly what the CLI sends
+    wire = from_dict(doc.to_dict())
+    assert wire.explicit_target is False, "explicit_target must survive serialization"
+    expanded = expand(preset, wire)
+    assert (expanded.target_agent, expanded.verify_agent, expanded.fix_agent) == ("fake-impl", "fake-ver", "fake-impl")
+
+
+def test_explicit_target_survives_wire_round_trip():
+    from maestro.handoff import from_dict
+
+    preset = ModePreset(name="demo", implementer="fake-impl")
+    doc = _doc(target_agent="mine", mode="demo", explicit_target=True)
+    wire = from_dict(doc.to_dict())
+    assert wire.explicit_target is True
+    expanded = expand(preset, wire)
+    assert expanded.target_agent == "mine"  # user's explicit target wins over the preset
+
+
+def test_from_dict_legacy_record_without_flag_keeps_old_heuristic():
+    """Records persisted before explicit_target was serialized still parse."""
+    from maestro.handoff import from_dict
+
+    data = {
+        "handoff": {"title": "t", "request": "r"},
+        "routing": {"target_agent": "codex", "mode": None},
+        "expectations": {},
+        "constraints": {},
+    }
+    assert from_dict(data).explicit_target is True  # legacy: named target counts as explicit
