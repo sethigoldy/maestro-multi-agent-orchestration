@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -22,10 +24,52 @@ MAESTRO_CONTEXT_ENV = "MAESTRO_AGENT_CONTEXT"
 MAESTRO_TASK_ID_ENV = "MAESTRO_TASK_ID"
 MAESTRO_ROLE_ENV = "MAESTRO_ROLE"
 
+#: Matches a valid environment-variable name (used to parse ``env`` output).
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: One-per-process snapshot of the user's login-shell environment. ``None``
+#: means "not captured yet"; an empty dict means "captured, nothing found".
+_LOGIN_ENV_CACHE: dict[str, str] | None = None
+
+
+def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
+    """Snapshot the user's login-shell environment (profile exports applied).
+
+    The daemon may be started from a context that lacks variables the user's
+    shell profile exports — API keys above all (launchd, a GUI app, an old
+    terminal). We run ``$SHELL -lc env`` once per process so spawned agents see
+    the same defaults as an interactive session. Set ``MAESTRO_LOGIN_ENV=0`` to
+    disable. Any failure (missing shell, timeout, bad output) degrades to the
+    empty dict: the daemon's own environment still flows through unchanged.
+    """
+    global _LOGIN_ENV_CACHE
+    if _LOGIN_ENV_CACHE is not None:
+        return _LOGIN_ENV_CACHE
+    env: dict[str, str] = {}
+    if os.environ.get("MAESTRO_LOGIN_ENV", "1") != "0":
+        shell = (os.environ.get("SHELL") or "").strip() or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
+        try:
+            timeout = timeout_s if timeout_s is not None else float(os.environ.get("MAESTRO_LOGIN_ENV_TIMEOUT_S", "10"))
+            proc = subprocess.run([shell, "-lc", "env"], capture_output=True, text=True, timeout=timeout)
+            for line in (proc.stdout or "").splitlines():
+                key, sep, value = line.partition("=")
+                if sep and _ENV_KEY_RE.match(key):
+                    env[key] = value
+        except (OSError, ValueError, subprocess.SubprocessError):
+            env = {}
+    _LOGIN_ENV_CACHE = env
+    return env
+
 
 def worker_environment(task_id: str) -> dict[str, str]:
-    """Environment for a spawned implementation agent (recursion guard)."""
-    env = os.environ.copy()
+    """Environment for a spawned implementation agent.
+
+    Layered bottom-to-top: login-shell defaults (profile exports such as API
+    keys), then the daemon's own environment (explicit values win on conflict),
+    then the recursion-guard markers (always authoritative).
+    """
+    env = dict(capture_login_env())
+    env.update(os.environ)
     env[MAESTRO_CONTEXT_ENV] = "1"
     env[MAESTRO_TASK_ID_ENV] = task_id
     env[MAESTRO_ROLE_ENV] = "implementation"

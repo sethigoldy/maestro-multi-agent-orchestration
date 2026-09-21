@@ -180,6 +180,8 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_NODE_NAME` | `maestro-node` | Name this daemon announces under discovery |
 | `MAESTRO_STORAGE` | — | Storage backend fallback when no config file sets it |
 | `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort fallbacks when no config file sets them |
+| `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc env`) to spawned agents |
+| `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment |
 | `MAESTRO_PYTHON` | — | Interpreter for verification's pytest probe (must be a file) |
 
 Misconfigured budget values (non-numeric, negative) are ignored rather than

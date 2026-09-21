@@ -86,6 +86,13 @@ the existing one without starting a duplicate. After starting, re-check with
 one start attempt, go to **Fallback**. For a full diagnosis (state dir, git,
 agents, workspace) run `maestro doctor`.
 
+**Agent environment.** Every agent inherits the daemon's full environment plus
+a snapshot of your login shell (`$SHELL -lc env`) taken once per daemon
+process — so profile exports such as API keys reach the agent even when the
+daemon was started from a GUI, launchd, or an older terminal. If you add a new
+environment variable that an agent needs, restart the daemon
+(`maestro daemon restart`). Set `MAESTRO_LOGIN_ENV=0` to disable the snapshot.
+
 ## 3. Routing: how Maestro picks an agent (and when it asks you)
 
 You never pick the implementation agent yourself — unless the user explicitly
@@ -342,7 +349,8 @@ Relevant environment variables: `MAESTRO_HOME`, `MAESTRO_WORKSPACE`,
 `MAESTRO_STORAGE`, `MAESTRO_CODEX_MODEL`, `MAESTRO_CODEX_EFFORT`,
 `MAESTRO_DELEGATE_TIMEOUT` (seconds, default 3600), `MAESTRO_BUDGET_*_USD`
 (per-agent budget caps), `MAESTRO_DAEMON_URL`, `MAESTRO_DAEMON_TOKEN`,
-`MAESTRO_DAEMON_STOP_GRACE_S`, `MAESTRO_MAX_RETRIES`, `MAESTRO_BACKOFF_S`.
+`MAESTRO_DAEMON_STOP_GRACE_S`, `MAESTRO_MAX_RETRIES`, `MAESTRO_BACKOFF_S`,
+`MAESTRO_LOGIN_ENV` (set `0` to stop passing login-shell env vars to agents).
 
 ## 11. MCP tool contract
 
