@@ -2,7 +2,7 @@
 
 Maestro treats every delegable agent as a first-class citizen: one TOML file per
 registered agent under ``~/.maestro/agents/``. Builtin adapters (codex, claude_code,
-hermes, pi, cline, openhands, cursor, copilot, a2a_remote) are identified by kind;
+hermes, pi, cline, openhands, cursor, copilot, opencode, a2a_remote) are identified by kind;
 the ``generic`` kind is the declarative path that onboards any CLI without Python
 code (launch command + input/output mode + workspace policy).
 """
@@ -27,6 +27,7 @@ BUILTIN_ADAPTERS: tuple[str, ...] = (
     "openhands",
     "cursor",
     "copilot",
+    "opencode",
     "a2a_remote",
 )
 
@@ -49,6 +50,7 @@ DEFAULT_BINARIES: dict[str, str | None] = {
     "openhands": "openhands",
     "cursor": "cursor-agent",
     "copilot": "copilot",
+    "opencode": "opencode",
     "a2a_remote": None,
 }
 
@@ -61,6 +63,7 @@ KNOWN_CLIS: tuple[tuple[str, str, str], ...] = (
     ("cline", "cline", "Cline"),
     ("cursor-agent", "cursor", "Cursor"),
     ("copilot", "copilot", "GitHub Copilot CLI"),
+    ("opencode", "opencode", "OpenCode"),
     ("openhands", "openhands", "OpenHands"),
 )
 

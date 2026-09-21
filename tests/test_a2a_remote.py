@@ -386,7 +386,7 @@ def test_a2a_remote_daemon_to_daemon(tmp_path, monkeypatch):
     try:
         remote.registry.save(AgentSpec(name="codex", kind="codex"))
         adapter = A2ARemoteAdapter(AgentSpec(name="remote-node", kind="a2a_remote", command=f"http://127.0.0.1:{remote.port}"))
-        doc = HandoffDoc(title="Remote work", request="Implement it", verification="none", commit_policy="no-commit")
+        doc = HandoffDoc(title="Remote work", request="Implement it", target_agent="codex", explicit_target=True, verification="none", commit_policy="no-commit")
         lines: list[str] = []
         result = adapter.run(
             "prompt text", ws, "local-task-1",

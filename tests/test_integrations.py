@@ -69,7 +69,7 @@ def test_managed_block_helpers():
 
 # ------------------------------------------------------------- block integrations
 
-BLOCK_KINDS = ["codex", "copilot", "hermes", "pi", "cline"]
+BLOCK_KINDS = ["codex", "copilot", "hermes", "pi", "cline", "opencode"]
 
 
 @pytest.mark.parametrize("kind", BLOCK_KINDS)
@@ -608,5 +608,5 @@ def test_manager_default_home_uses_env(monkeypatch, tmp_path):
 
 
 def test_aliases_cover_supported_agents():
-    assert set(INTEGRATIONS) == {"codex", "claude_code", "copilot", "cursor", "hermes", "pi", "cline", "openhands"}
+    assert set(INTEGRATIONS) == {"codex", "claude_code", "copilot", "cursor", "hermes", "pi", "cline", "opencode", "openhands"}
     assert AGENT_ALIASES["claude"] == "claude_code"

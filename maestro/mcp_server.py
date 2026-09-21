@@ -57,8 +57,17 @@ def delegate(workspace: str, handoff_file: str) -> str:
     phases; explicit routing fields in the file win over the preset. Optional
     [[context]] entries (label + text or path, kind text/file/skill, optional
     phases) inject user-controlled context into the agent turns and are composed
-    with standing [context] config entries at delegate time. Returns the final A2A
-    task object (state, artifacts, workspace/branch metadata)."""
+    with standing [context] config entries at delegate time.
+
+    Routing defaults: when the handoff names no target agent, Maestro resolves it
+    from the project's .maestro/config.toml [defaults] table (agent, fallback,
+    model, effort). If neither the handoff nor [defaults] names an agent, the
+    task parks in state 'input-required' with a question listing every available
+    agent — ask the user which agent and model to use, then call
+    answer_task_question with e.g. 'codex' or 'agent=codex model=gpt-5.6-luna'.
+
+    Returns the final A2A task object (state, artifacts, workspace/branch
+    metadata)."""
     d = get_daemon()
     try:
         doc = load_handoff_file(handoff_file)

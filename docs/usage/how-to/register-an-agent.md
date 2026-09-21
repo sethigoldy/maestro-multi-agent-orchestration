@@ -13,7 +13,7 @@ the [CLI reference](../reference/cli.md#agents) for every option of
 
 | You have… | Use |
 |---|---|
-| Codex, Claude Code, Copilot CLI, Cursor, Hermes, Pi, Cline, or OpenHands installed and authenticated | its built-in `kind` — no registration needed to delegate |
+| Codex, Claude Code, Copilot CLI, Cursor, Hermes, Pi, Cline, OpenHands, or OpenCode installed and authenticated | its built-in `kind` — no registration needed to delegate |
 | One of those, but you want a custom name or per-agent model/effort/token | a named entry with that `kind` |
 | Any other CLI that can run non-interactively | `kind = "generic"` with a launch command |
 | A small HTTP service that accepts tasks | `kind = "generic"` whose command is an `http(s)` URL (API mode) |

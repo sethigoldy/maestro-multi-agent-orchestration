@@ -239,6 +239,7 @@ class Maestro:
         codex = merged.get("codex") if isinstance(merged.get("codex"), dict) else {}
         verification = merged.get("verification") if isinstance(merged.get("verification"), dict) else {}
         storage = merged.get("storage") if isinstance(merged.get("storage"), dict) else {}
+        defaults = self._parse_defaults(merged.get("defaults"))
         backend = str(storage.get("backend") or os.environ.get("MAESTRO_STORAGE", "filesystem")).lower()
         if backend not in {"filesystem", "memvara"}:
             raise ValueError(f"Unsupported storage backend: {backend}")
@@ -259,7 +260,44 @@ class Maestro:
         for source, table in context_layers:
             context.update(parse_context_config(table, source))
 
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context}
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults}
+
+    @staticmethod
+    def _parse_defaults(raw: Any) -> dict[str, Any]:
+        """Parse and validate the ``[defaults]`` table from merged config.
+
+        Project-level routing defaults consulted at delegate time when a handoff
+        names no target agent: ``agent`` (default implementer), ``fallback``
+        (list of fallback agents), ``model`` / ``effort`` (applied to the chosen
+        agent when the handoff sets none). Absent table -> empty dict; invalid
+        values raise so misconfiguration fails at daemon start, not mid-delegation.
+        """
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise ValueError("[defaults] must be a table")
+        unknown = set(raw) - {"agent", "fallback", "model", "effort"}
+        if unknown:
+            raise ValueError(f"[defaults] has unknown keys: {', '.join(sorted(unknown))}")
+        out: dict[str, Any] = {}
+        for key in ("agent", "model"):
+            value = raw.get(key)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"[defaults] {key} must be a non-empty string")
+                out[key] = value.strip()
+        fallback = raw.get("fallback")
+        if fallback is not None:
+            if not isinstance(fallback, list) or not all(isinstance(x, str) and x.strip() for x in fallback):
+                raise ValueError("[defaults] fallback must be a list of non-empty agent names")
+            out["fallback"] = [x.strip() for x in fallback]
+        effort = raw.get("effort")
+        if effort is not None:
+            effort = str(effort).lower()
+            if effort not in {"low", "medium", "high", "xhigh", "max"}:
+                raise ValueError(f"Unsupported default reasoning effort: {effort}")
+            out["effort"] = effort
+        return out
 
     def codex_defaults(self) -> dict[str, Any]:
         return {"model": self.config.get("model"), "effort": self.config.get("effort")}

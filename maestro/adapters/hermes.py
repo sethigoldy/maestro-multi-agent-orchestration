@@ -7,7 +7,11 @@ Verified against the installed CLI (Hermes Agent v0.20.x):
   the CWD load as normal.
 - ``--usage-file PATH`` writes a JSON usage report after the run — even when it
   fails — with ``estimated_cost_usd``, token counts, model/provider, and a
-  ``failed`` flag, so spend is always accounted for.
+  ``failed`` flag, so spend is always accounted for. The CLI exits 0 on
+  API-level failures (e.g. ``HTTP 401: Access denied due to missing
+  subscription key``), so the report's ``failed``/``failure`` fields are the
+  authoritative failure signal; this adapter honors them and flips the result
+  to a proper failure instead of reporting COMPLETED for a run that did nothing.
 - ``--yolo`` bypasses dangerous-command approval prompts; autonomous headless
   delegation needs it (sensitive handoffs are gated before any agent runs).
 """
@@ -33,6 +37,14 @@ def _map_usage_report(report: dict[str, Any]) -> dict[str, Any]:
     if isinstance(report.get("model"), str):
         mapped["model"] = report["model"]
     return mapped
+
+
+def _failure_detail(report: dict[str, Any]) -> str:
+    """Human-readable suffix for a failed-run error, from the report's failure field."""
+    failure = report.get("failure")
+    if isinstance(failure, str) and failure.strip():
+        return f": {failure.strip()}"
+    return ""
 
 
 class HermesAdapter(BaseAdapter):
@@ -84,4 +96,11 @@ class HermesAdapter(BaseAdapter):
                     mapped = _map_usage_report(report)
                     if mapped:
                         result.usage = {**(result.usage or {}), **mapped}
+                    # The CLI exits 0 on API-level failures (e.g. a missing
+                    # subscription key), so the report is the authoritative
+                    # failure signal; flip an otherwise-ok result to failed.
+                    if report.get("failed") is True:
+                        detail = _failure_detail(report)
+                        result.ok = False
+                        result.error = f"Agent {self.kind!r} reported a failed run{detail}"
         return result

@@ -10,6 +10,15 @@ verification result, and any review verdicts are journaled to disk as they
 happen — so you can understand exactly what happened to any task at any time,
 even after the daemon (or your machine) restarts.
 
+**See it work** — a 90-second run of the flagship demo: `maestro doctor`, a
+work-mode delegation, an implement → verify → fix bounce driven by a failed
+gate verdict, and the durable receipt that survives the daemon stop. Real
+`maestro` invocations with deterministic fake agents — every number on screen
+is produced by the run itself ([storyboard](docs/demo-v0.10.md),
+[run it yourself](scripts/demo-v0.10.sh)).
+
+![Maestro v0.10 demo: doctor, work-mode delegation, verify-fix bounce, durable receipt](docs/assets/demo-v0.10.gif)
+
 ## Zero-configuration installation
 
 One command installs Maestro, wires up your coding agents, and starts the
@@ -27,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orch
    `maestro-mcp` land in `~/.local/bin`.
 2. **discovers coding agents** — scans your PATH for the supported agent CLIs
    (Codex, Claude Code, GitHub Copilot CLI, Cursor, Hermes, Pi, Cline,
-   OpenHands).
+   OpenHands, OpenCode).
 3. **registers them** with Maestro (`maestro agents register-discovered`).
    Existing registrations are preserved — custom names, models, and tokens are
    never overwritten.
@@ -117,7 +126,8 @@ want more than one machine.
 ### Supported agents
 
 Maestro ships first-class adapters for **Codex**, **Claude Code**, **GitHub
-Copilot CLI**, **Cursor**, Hermes Agent, Pi, Cline, and **OpenHands** — plus a
+Copilot CLI**, **Cursor**, Hermes Agent, Pi, Cline, **OpenHands**, and
+**OpenCode** — plus a
 **generic spec** that turns *any* non-interactive CLI into an agent with one
 registry entry (no code), and `a2a_remote` for delegating to another Maestro
 daemon on another machine. Anything that can run from a shell works; the full
@@ -205,14 +215,14 @@ python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install .            # or: python -m pip install -e . for development
-maestro --version                  # → 0.9.0
+maestro --version                  # → 0.10.0
 ```
 
 > **Note on the name:** `maestro` is already taken on PyPI by an unrelated
 > project (a VLM fine-tuning library). This package is **not published to
 > PyPI**; install it from this repository (as above), from a release artifact
 > attached to a [GitHub Release](https://github.com/sethigoldy/maestro-multi-agent-orchestration/releases)
-> (`pip install maestro-0.9.0-py3-none-any.whl`), or from a locally built wheel
+> (`pip install maestro-0.10.0-py3-none-any.whl`), or from a locally built wheel
 > (`python -m build`). The CLI command stays `maestro`.
 
 ### 2. Check your environment
@@ -375,6 +385,7 @@ what preflight will see before you delegate.
 | `pi` | `pi` | Pi (rpc mode) |
 | `cline` | `cline` | Cline CLI |
 | `openhands` | `openhands` | OpenHands CLI |
+| `opencode` | `opencode` | OpenCode (`run --format json --auto`); usage/cost parsed from the terminal `step_finish` event |
 | `a2a_remote` | *(URL, not a binary)* | Another Maestro daemon — see below |
 
 ### Onboarding any CLI (generic spec)
@@ -583,6 +594,12 @@ changes to take effect (`maestro config` always shows the current files, even if
 a running daemon is still holding older values).
 
 ```toml
+[defaults]                # routing defaults — used when a handoff names no target agent
+agent    = "codex"        # default implementation agent
+fallback = ["claude_code"]  # optional fallback chain
+model    = "gpt-5.6-luna"   # optional; applied when the handoff sets none
+effort   = "max"            # optional: low | medium | high | xhigh | max
+
 [codex]
 model = "gpt-5.6-luna"
 effort = "max"            # low | medium | high | xhigh | max
@@ -590,6 +607,13 @@ effort = "max"            # low | medium | high | xhigh | max
 [storage]
 backend = "filesystem"    # filesystem (default) | memvara
 ```
+
+**Routing defaults:** when a handoff names no target agent, `[defaults].agent`
+becomes the target and `[defaults].model`/`effort` fill in what the handoff left
+unset. If neither the handoff nor `[defaults]` names an agent, Maestro does not
+guess: the task parks in state `input-required` with a question listing every
+available agent, and resumes via MCP `answer_task_question` (a bare agent name,
+`agent=… model=…` pairs, or JSON). Set `[defaults]` to stop being asked.
 
 Verification is not configured here — it is set per handoff (`verification =
 "auto" | "command" | "none"`) and auto-detected per workspace; see
@@ -864,10 +888,10 @@ cd web && npm ci && node build.mjs             # rewrites maestro/web_dist/ (byt
 
 ### Demos and validation
 
-- **90-second flagship demo** — `scripts/demo-v0.9.sh`: deterministic fake
+- **90-second flagship demo** — `scripts/demo-v0.10.sh`: deterministic fake
   agents, one work-mode task with a failing first verification pass, an auto-fix
   bounce, and a durable receipt after the daemon stops. The storyboard:
-  [docs/demo-v0.9.md](docs/demo-v0.9.md).
+  [docs/demo-v0.10.md](docs/demo-v0.10.md).
 - **Full role-swap demo** — `examples/full-swap.sh` (needs real `claude`/`codex` CLIs).
 - **Real-agent validation** — the manual procedure for proving Maestro drives
   your actual agent CLIs end to end (not part of CI; spends real money):

@@ -184,14 +184,16 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
         if args.mode:
             doc.mode = args.mode  # --mode overrides any mode named in the file
     else:
-        if not (args.title and args.request and (args.target or args.mode)):
-            raise ValueError("provide --file or all of --title/--request/(--target or --mode)")
+        if not (args.title and args.request):
+            raise ValueError("provide --file or --title/--request (plus --target or --mode unless [defaults] in .maestro/config.toml names the agent)")
         design = ""
         if args.design_file:
             try:
                 design = Path(args.design_file).read_text(encoding="utf-8")
             except OSError as exc:
                 raise ValueError(f"Unable to read design file: {exc}") from exc
+        # Without --target/--mode the daemon resolves routing from config
+        # [defaults]; if none is configured it parks the task and asks.
         doc = HandoffDoc(
             title=args.title, request=args.request, design=design,
             target_agent=args.target or "codex", fallback=list(args.fallback),
@@ -586,7 +588,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_target_args(s)
     top = sub.add_parser("list", help="List tasks")
     _add_target_args(top)
-    cfg = sub.add_parser("config", help="Show effective Codex defaults")
+    cfg = sub.add_parser("config", help="Show effective config (Codex defaults, routing [defaults], modes, context)")
     _add_target_args(cfg)
     storage = sub.add_parser("storage", help="Manage storage backends")
     storage_sub = storage.add_subparsers(dest="storage_cmd", required=True)
@@ -728,7 +730,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "config":
                 modes = {name: preset.to_dict() for name, preset in (m.config.get("modes") or {}).items()}
                 context = {label: entry.to_dict() for label, entry in (m.config.get("context") or {}).items()}
-                print(json.dumps({**m.codex_defaults(), "modes": modes, "context": context}, indent=2)); return 0
+                print(json.dumps({**m.codex_defaults(), "defaults": m.config.get("defaults") or {}, "modes": modes, "context": context}, indent=2)); return 0
             raise AssertionError("unhandled command")  # pragma: no cover
         finally:
             m.close()

@@ -41,6 +41,11 @@ def _git_repo(tmp_path: Path, name: str = "ws") -> Path:
 
 def _doc(**kw) -> HandoffDoc:
     base = dict(title="Do the thing", request="Implement it", verification="none", commit_policy="no-commit")
+    # Without a work mode, pin an explicit target: since 0.10 a handoff that
+    # names no agent (and has no [defaults]) parks with a routing question.
+    if not kw.get("mode"):
+        base["target_agent"] = "codex"
+        base["explicit_target"] = True
     base.update(kw)
     return HandoffDoc(**base)
 

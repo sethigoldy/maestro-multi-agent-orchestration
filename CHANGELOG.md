@@ -4,9 +4,38 @@ All notable changes to Maestro are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
-## [Unreleased]
+## [0.10.0] — 2026-09-21
 
 ### Added
+
+- **Routing defaults + interactive routing question** — when a handoff names no
+  target agent, Maestro now resolves routing from the project's
+  `.maestro/config.toml` `[defaults]` table (`agent`, `fallback`, `model`,
+  `effort`; later config files win per key). If neither the handoff nor
+  `[defaults]` names an agent, the task parks in `input-required` with a
+  question listing every registered agent (name + version) and resumes via
+  `answer_task_question` / `maestro answer` — answers may be a bare agent name,
+  `agent=… model=…` pairs, or JSON. `maestro delegate` flag form now accepts
+  `--title/--request` without `--target/--mode`, and `maestro config` prints the
+  effective `[defaults]`.
+- **OpenCode adapter** — first-class support for the OpenCode CLI: spawn-mode
+  adapter running `opencode run --format json --auto` (model via `-m
+  provider/model`, effort via `--variant`), usage/cost parsed from the terminal
+  `step_finish` event, registered in discovery and the agent registry, plus a
+  global-rules integration (`~/.config/opencode/AGENTS.md`).
+- **Self-contained skill** — the packaged `maestro-driven-development` skill now
+  carries the full CLI reference, config schema (`[defaults]`, `[modes]`,
+  `[context]`, `[codex]`, `[verification]`, `[storage]`), the MCP tool contract,
+  and the routing/answer flow, so a host agent never has to rediscover Maestro's
+  interface at runtime.
+
+### Changed
+
+- **Skill updates are delete-then-reinstall** — `maestro skill install` (and
+  `install.sh`) now remove the existing installed skill before writing the new
+  one, so stale files from a previous Maestro version never survive an update.
+- **Demo assets renamed** — `demo-v0.9.{sh,gif}` and `docs/demo-v0.9.md` are now
+  `demo-v0.10.*`, matching this release.
 
 - **One-command installation** — `install.sh` (usable via
   `curl -fsSL … | bash`) installs Maestro into `~/.local/share/maestro` with a
@@ -49,6 +78,25 @@ semantic versioning.
 - `maestro-daemon` remains the foreground executable (development/CI/service
   managers); the preferred user-facing command is now `maestro daemon start`.
 - The "no daemon reachable" CLI error now points at `maestro daemon start`.
+
+### Fixed
+
+- **`claude_code` adapter** — emit `--verbose` with `--output-format
+  stream-json`, as current Claude Code releases require it in print mode and
+  reject the combination without it at argument-validation time (every attempt
+  failed identically). If an older CLI rejects `--verbose`, a single bounded
+  retry without it self-heals the version skew.
+- **`codex` adapter** — the `codex exec --help` probe is now only a first
+  guess: when the installed CLI rejects the probed autonomy flag at
+  argument-parse time (`error: unexpected argument … found`, e.g. a CLI that
+  accepts neither `--full-auto` nor `--approve-for-me`), the adapter retries
+  once with the alternate flag set and caches the choice, instead of failing
+  every daemon retry with the same bad flag.
+- **`hermes` adapter** — honor the usage report's `failed`/`failure` fields.
+  The CLI exits 0 on API-level failures (e.g. `HTTP 401: Access denied due to
+  missing subscription key`), which previously produced a silent COMPLETED
+  receipt with `ok: true`; such runs now fail properly with the reported
+  failure reason in the receipt.
 
 ## [0.9.0] — 2026-09-19
 

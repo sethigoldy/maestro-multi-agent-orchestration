@@ -1,5 +1,5 @@
 #!/bin/sh
-# Maestro v0.9 flagship demo — deterministic, no network, no real agent CLIs.
+# Maestro v0.10 flagship demo — deterministic, no network, no real agent CLIs.
 #
 # Reuses the fake-agent infrastructure from smoke-fake-agent.sh to demonstrate
 # the core product story end to end:
@@ -12,7 +12,7 @@
 # drives one auto-fix bounce; the deterministic check then passes and the task
 # completes. Every number shown is produced by this run — nothing is faked.
 #
-# Usage: scripts/demo-v0.9.sh        (from any directory)
+# Usage: scripts/demo-v0.10.sh        (from any directory)
 # Requires: sh, git, and this checkout's .venv (python3.11 -m venv .venv && pip install -e .)
 
 set -eu

@@ -228,6 +228,15 @@ class ClineIntegration(_BlockIntegration):
         return home / ".cline" / "rules.md"
 
 
+class OpencodeIntegration(_BlockIntegration):
+    kind = "opencode"
+    display_name = "OpenCode"
+    mechanism = "global rules block (~/.config/opencode/AGENTS.md)"
+
+    def instructions_path(self, home: Path) -> Path:
+        return home / ".config" / "opencode" / "AGENTS.md"
+
+
 class ClaudeCodeIntegration(AgentIntegration):
     """Claude Code global Agent Skills (``~/.claude/skills/<name>/SKILL.md``)."""
 
@@ -239,7 +248,8 @@ class ClaudeCodeIntegration(AgentIntegration):
         return home / ".claude" / "skills" / SKILL_NAME
 
     def install_skill(self, home: Path, content: str) -> IntegrationResult:
-        target = self.skill_dir(home) / "SKILL.md"
+        target_dir = self.skill_dir(home)
+        target = target_dir / "SKILL.md"
         present = target.is_file()
         try:
             if present:
@@ -249,12 +259,18 @@ class ClaudeCodeIntegration(AgentIntegration):
         except OSError as exc:
             return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot read {target}: {exc}", str(target))
         try:
+            import shutil as _shutil
+
+            # Updates are delete-then-reinstall: wipe the existing skill directory
+            # first so stale files from a previous Maestro version never survive.
+            if target_dir.exists():
+                _shutil.rmtree(target_dir)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
         except OSError as exc:
             return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot write {target}: {exc}", str(target))
         action = "already-installed" if present and existing == content else "installed"
-        return IntegrationResult(self.kind, self.display_name, True, action, "global skill written", str(target))
+        return IntegrationResult(self.kind, self.display_name, True, action, "global skill written (previous copy removed)", str(target))
 
     def uninstall_skill(self, home: Path) -> IntegrationResult:
         target_dir = self.skill_dir(home)
@@ -432,6 +448,7 @@ INTEGRATIONS: dict[str, type[AgentIntegration]] = {
         HermesIntegration,
         PiIntegration,
         ClineIntegration,
+        OpencodeIntegration,
         OpenHandsIntegration,
     )
 }

@@ -108,12 +108,15 @@ def expand(preset: ModePreset, doc) -> object:
 
     Precedence: explicit routing fields on the document win; the preset fills only
     what is unset. The preset's implementer becomes ``target_agent`` unless the
-    document named a target explicitly (``doc.explicit_target``). When the preset has
-    no fixer, the fix slot defaults to the implementer (safe default: no implicit
-    expensive spend).
+    document named a target explicitly (``doc.explicit_target``). Once the preset
+    pins the implementer, the target counts as explicitly chosen (the user
+    configured that mode), so downstream routing resolution must not second-guess
+    it. When the preset has no fixer, the fix slot defaults to the implementer
+    (safe default: no implicit expensive spend).
     """
     if not doc.explicit_target:
         doc.target_agent = preset.implementer
+        doc.explicit_target = True
     if doc.review_agent is None and preset.reviewer is not None:
         doc.review_agent = preset.reviewer
     if doc.verify_agent is None and preset.verifier is not None:

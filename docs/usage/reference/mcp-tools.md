@@ -60,6 +60,15 @@ A handoff file may carry `[routing] mode = "NAME"` (or the explicit
 under a work-mode preset — see [Configure work modes](../how-to/configure-work-modes.md).
 Signature unchanged: the routing lives in the file.
 
+Routing defaults: when the handoff names no target agent, Maestro resolves it
+from the config chain's `[defaults]` table (`agent`, `fallback`, `model`,
+`effort` — see [Configuration reference](configuration.md#defaults--routing-defaults)).
+If neither the handoff nor `[defaults]` names an agent, the call returns a task
+in state `input-required` whose question lists every available agent; ask the
+user which agent and model to use, then call `answer_task_question` (accepted:
+a bare agent name, `agent=… model=…` pairs, or JSON). Sensitive workspaces
+park the same way with an approval question.
+
 A handoff file may also carry `[[context]]` entries (label + `text` or `path`,
 optional `kind` and `phases`) to inject user-controlled context into the agent
 turns — see [Context injection in the README](../../../README.md#context-injection).

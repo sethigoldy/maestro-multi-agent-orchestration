@@ -1,7 +1,7 @@
 # CLI reference
 
 Complete description of the `maestro` and `maestro-daemon` commands. The CLI is
-version 0.9.0; verify with `maestro --version`.
+version 0.10.0; verify with `maestro --version`.
 
 ## Global options
 
@@ -84,8 +84,9 @@ Manages the global **`maestro-driven-development`** skill — the operational
 instructions that make Maestro the default development execution backend for
 supported coding agents. Each agent uses its own global mechanism: Claude Code
 gets a global Agent Skill (`~/.claude/skills/maestro-driven-development/SKILL.md`);
-Codex, GitHub Copilot CLI, Hermes, Pi, and Cline get a managed block in their
-global instructions/rules file; Cursor gets a global user rule
+Codex, GitHub Copilot CLI, Hermes, Pi, Cline, and OpenCode get a managed block
+in their global instructions/rules file (OpenCode's is
+`~/.config/opencode/AGENTS.md`); Cursor gets a global user rule
 (`~/.cursor/rules/maestro-driven-development.mdc`); OpenHands gets the skill
 inside `custom_instructions` of `~/.openhands/agent_settings.json`.
 
@@ -93,13 +94,13 @@ inside `custom_instructions` of `~/.openhands/agent_settings.json`.
 |---|---|
 | `list` | JSON: the managed skill, its source path, and every supported agent |
 | `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed` |
-| `install` | Installs the skill for every **detected** agent by default. `--agent NAME` targets one agent (adapter kind, binary name, or display name; installed even if not yet detected). `--all` installs for every supported agent regardless of detection. Idempotent — reinstalling replaces the managed region instead of duplicating it |
+| `install` | Installs the skill for every **detected** agent by default. `--agent NAME` targets one agent (adapter kind, binary name, or display name; installed even if not yet detected). `--all` installs for every supported agent regardless of detection. Updates are delete-then-reinstall: the existing skill is removed before the new one is written, so stale files from a previous Maestro version never survive |
 | `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed |
 
 ## delegate
 
 ```text
-maestro delegate (--file FILE | --title T --request R (--target A | --mode NAME))
+maestro delegate (--file FILE | --title T --request R [--target A | --mode NAME])
                  [--fallback A …] [--design-file FILE]
                  [--context TEXT …] [--context-file PATH …] [--skill DIR …]
                  [--no-wait] [--workspace DIR | --project DIR]
@@ -111,7 +112,7 @@ task's event stream.
 | Option | Meaning |
 |---|---|
 | `--file FILE` | Handoff document file (TOML or JSON; 4-section or legacy format). Mutually exclusive in effect with the flag form — one of the two forms is required |
-| `--title T` / `--request R` / `--target A` | Minimal handoff from flags. `--title` and `--request` are always required in this form, plus either `--target` or `--mode` |
+| `--title T` / `--request R` / `--target A` | Minimal handoff from flags. `--title` and `--request` are required in this form; `--target`/`--mode` are optional — without them the daemon resolves routing from config `[defaults]`, or parks the task with a question if no default is configured |
 | `--mode NAME` | Apply the work-mode preset of that name (a `[modes.NAME]` config table) — it pins the implementer/verifier/reviewer/fixer agents for this task. With `--file`, a flag value overrides the file's `[routing] mode` |
 | `--fallback A` | Fallback agent, tried in order after the target fails or is unavailable. Repeatable |
 | `--design-file FILE` | File whose text becomes the handoff's authoritative design |
@@ -178,7 +179,7 @@ maestro agents status <name>
 | Subcommand | Behavior |
 |---|---|
 | `list` | JSON array of registered agent specs (user-level, `~/.maestro/registry.json`) |
-| `add` | Registers an agent. `--kind` must be one of: `codex`, `claude_code`, `hermes`, `pi`, `cline`, `openhands`, `cursor`, `copilot`, `a2a_remote`, or `generic`. `--skill` is repeatable. For `generic`: `--command` is required in practice (supports `{prompt}` substitution); `--input-mode stdin` pipes the prompt instead; `--output-format jsonl` enables usage/cost parsing from JSON lines. For `a2a_remote`: `--command` is the daemon URL and `--token` its bearer token |
+| `add` | Registers an agent. `--kind` must be one of: `codex`, `claude_code`, `hermes`, `pi`, `cline`, `openhands`, `cursor`, `copilot`, `opencode`, `a2a_remote`, or `generic`. `--skill` is repeatable. For `generic`: `--command` is required in practice (supports `{prompt}` substitution); `--input-mode stdin` pipes the prompt instead; `--output-format jsonl` enables usage/cost parsing from JSON lines. For `a2a_remote`: `--command` is the daemon URL and `--token` its bearer token |
 | `remove` | Unregisters by name; exits 2 if not registered |
 | `discover` | Scans `PATH` for known agent CLIs and reports findings (does not register) |
 | `register-discovered` | Converts discovery results into registrations programmatically: every found CLI that is not registered yet gets a default spec (`source="discovered"`). **Idempotent and conservative** — existing registrations (custom names, models, tokens, skills) are preserved exactly as-is. `--dry-run` reports what would be registered without writing |
@@ -214,14 +215,16 @@ cap. Prints a notice when no caps are configured (`MAESTRO_BUDGET_PER_AGENT_USD`
 maestro config [--workspace DIR | --project DIR]
 ```
 
-Prints the effective Codex defaults, work-mode presets, and standing context
-entries for the resolved scope as JSON: `{"model": …, "effort": …, "modes":
-{NAME: {"implementer": …, "verifier": …, "reviewer": …, "fixer": …,
-"max_bounces": N}}, "context": {LABEL: {"label": …, "kind": …, "text"|"path":
-…, "phases": […]}}}` — `model`/`effort` may be `null`, `modes` is `{}` when no
-presets are defined, and `context` is `{}` when no entries are. Entries carry
-their source (`user config` / `project config`) after the config chain merges
-them. See [Configuration reference](configuration.md).
+Prints the effective config for the resolved scope as JSON: Codex defaults,
+routing `[defaults]`, work-mode presets, and standing context entries —
+`{"model": …, "effort": …, "defaults": {"agent": …, "fallback": […], "model":
+…, "effort": …}, "modes": {NAME: {"implementer": …, "verifier": …, "reviewer":
+…, "fixer": …, "max_bounces": N}}, "context": {LABEL: {"label": …, "kind": …,
+"text"|"path": …, "phases": […]}}}` — `model`/`effort` may be `null`,
+`defaults` is `{}` when no `[defaults]` table is configured, `modes` is `{}`
+when no presets are defined, and `context` is `{}` when no entries are. Entries
+carry their source (`user config` / `project config`) after the config chain
+merges them. See [Configuration reference](configuration.md).
 
 ## storage
 
