@@ -53,6 +53,14 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     return argv
 
 
+def _add_skill_target_args(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--agent", default=None, metavar="NAME",
+                       help="Target one agent (adapter kind, binary name, or display name)")
+    group.add_argument("--all", action="store_true", dest="all_agents",
+                       help="Act on every supported agent, even ones not detected on PATH")
+
+
 def _scope_for_list(args: argparse.Namespace) -> tuple[Path, str | None]:
     if getattr(args, "project", None):
         project = _project(args.project)
@@ -116,7 +124,7 @@ def _daemon_endpoint() -> tuple[str, str | None]:
         host = str(info.get("host") or "127.0.0.1")
         return f"http://{host}:{int(info['port'])}", info.get("token") or None
     except (OSError, ValueError, KeyError, TypeError):
-        raise ValueError("no daemon reachable — start one with 'maestro-daemon' or set MAESTRO_DAEMON_URL") from None
+        raise ValueError("no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL") from None
 
 
 def _daemon_url() -> str:
@@ -316,6 +324,86 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if report.get("ok") else 1
 
 
+def _format_daemon_info(info, started_verb: str) -> str:
+    lines = [f"Maestro daemon {started_verb}"]
+    if info.pid is not None:
+        lines.append(f"PID: {info.pid}")
+    if info.url:
+        lines.append(f"URL: {info.url}")
+    if info.port is not None and started_verb in {"running", "stopped"}:
+        lines.append(f"Port: {info.port}")
+    if info.state_dir is not None:
+        lines.append(f"State: {info.state_dir}")
+    if info.uptime_s is not None:
+        lines.append(f"Uptime: {int(info.uptime_s)}s")
+    if info.detail and started_verb == "stopped":
+        lines.append(info.detail)
+    return "\n".join(lines)
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    from . import daemonctl
+
+    try:
+        if args.daemon_cmd == "status":
+            info = daemonctl.status()
+            if args.as_json:
+                print(json.dumps(info.to_dict(), indent=2))
+            else:
+                verb = "running" if info.running else "stopped"
+                print(_format_daemon_info(info, verb))
+            return 0 if info.running else 1
+        if args.daemon_cmd == "start":
+            info = daemonctl.start()
+            print(_format_daemon_info(info, "already running" if info.already_running else "started"))
+            return 0
+        if args.daemon_cmd == "stop":
+            info = daemonctl.stop()
+            print(_format_daemon_info(info, "stopped"))
+            return 0
+        # restart
+        info = daemonctl.restart()
+        print(_format_daemon_info(info, "restarted"))
+        return 0
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"maestro: {exc}", file=sys.stderr)
+        return 1
+
+
+def _cmd_skill(args: argparse.Namespace) -> int:
+    from .integrations import SKILL_NAME, SkillManager, skill_source
+
+    manager = SkillManager()
+    if args.skill_cmd == "list":
+        print(json.dumps({
+            "skill": SKILL_NAME,
+            "source": str(skill_source()),
+            "supported_agents": [entry["display_name"] for entry in manager.status()],
+        }, indent=2))
+        return 0
+    if args.skill_cmd == "status":
+        print(json.dumps(manager.status(), indent=2))
+        return 0
+    if args.skill_cmd == "install":
+        results = manager.install(agent=args.agent, all_agents=args.all_agents)
+        for result in results:
+            mark = "✓" if result.ok and result.action not in {"not-detected"} else ("-" if result.action == "not-detected" else "✗")
+            line = f"{mark} {result.display_name:<16} {result.action}"
+            if result.detail:
+                line += f"  ({result.detail})"
+            print(line)
+        return 0 if all(r.ok for r in results) else 1
+    # uninstall
+    results = manager.uninstall(agent=args.agent)
+    for result in results:
+        mark = "✓" if result.ok else "✗"
+        line = f"{mark} {result.display_name:<16} {result.action}"
+        if result.detail:
+            line += f"  ({result.detail})"
+        print(line)
+    return 0 if all(r.ok for r in results) else 1
+
+
 def _cmd_budgets() -> int:
     from .budgets import BudgetCaps, daily_spend, spent_by_agent
     from .core import Maestro
@@ -505,6 +593,23 @@ def main(argv: list[str] | None = None) -> int:
     migrate = storage_sub.add_parser("migrate-memvara", help="Import legacy state")
     _add_target_args(migrate)
 
+    daemon = sub.add_parser("daemon", help="Manage the background daemon (start/stop/status/restart)")
+    daemon_sub = daemon.add_subparsers(dest="daemon_cmd", required=True)
+    daemon_sub.add_parser("start", help="Start the daemon in the background and return immediately (idempotent)")
+    daemon_stop = daemon_sub.add_parser("stop", help="Stop the daemon gracefully: SIGTERM, grace period, SIGKILL if needed (idempotent)")
+    daemon_status = daemon_sub.add_parser("status", help="Show daemon state; exits 0 when running, 1 when stopped")
+    daemon_status.add_argument("--json", action="store_true", dest="as_json", help="Machine-readable JSON status")
+    daemon_sub.add_parser("restart", help="Stop (if running) and start the daemon")
+
+    skill = sub.add_parser("skill", help="Manage the global maestro-driven-development skill across coding agents")
+    skill_sub = skill.add_subparsers(dest="skill_cmd", required=True)
+    skill_sub.add_parser("list", help="List the managed skill and its supported agents")
+    skill_sub.add_parser("status", help="Show per-agent detection/installation status (JSON)")
+    skill_install = skill_sub.add_parser("install", help="Install the skill for detected agents")
+    _add_skill_target_args(skill_install)
+    skill_uninstall = skill_sub.add_parser("uninstall", help="Remove the skill (from one --agent, or everywhere it is installed)")
+    _add_skill_target_args(skill_uninstall)
+
     agents = sub.add_parser("agents", help="Manage registered agents (user-level)")
     agents_sub = agents.add_subparsers(dest="agents_cmd", required=True)
     agents_list = agents_sub.add_parser("list", help="List registered agents")
@@ -521,6 +626,8 @@ def main(argv: list[str] | None = None) -> int:
     agents_remove = agents_sub.add_parser("remove", help="Unregister an agent")
     agents_remove.add_argument("name")
     agents_discover = agents_sub.add_parser("discover", help="Scan PATH for known agent CLIs")
+    agents_register = agents_sub.add_parser("register-discovered", help="Register all discovered agent CLIs that are not registered yet (preserves existing registrations)")
+    agents_register.add_argument("--dry-run", action="store_true", help="Report what would be registered without writing")
     agents_status = agents_sub.add_parser("status", help="Show registration/availability status for one agent")
     agents_status.add_argument("name")
 
@@ -556,6 +663,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_receipt(args)
         if args.cmd == "doctor":
             return _cmd_doctor(args)
+        if args.cmd == "daemon":
+            return _cmd_daemon(args)
+        if args.cmd == "skill":
+            return _cmd_skill(args)
 
         if args.cmd == "storage" and args.storage_cmd == "migrate-memvara":
             m = Maestro(_workspace(getattr(args, "workspace", None)))
@@ -599,6 +710,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"name": args.name, "removed": True}, indent=2)); return 0
             if args.agents_cmd == "discover":
                 print(json.dumps(registry.discover(), indent=2)); return 0
+            if args.agents_cmd == "register-discovered":
+                print(json.dumps(registry.register_discovered(dry_run=args.dry_run), indent=2)); return 0
             if args.agents_cmd == "status":
                 print(json.dumps(registry.status(args.name), indent=2)); return 0
             raise AssertionError("unhandled agents command")  # pragma: no cover

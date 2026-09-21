@@ -4,6 +4,52 @@ All notable changes to Maestro are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- **One-command installation** — `install.sh` (usable via
+  `curl -fsSL … | bash`) installs Maestro into `~/.local/share/maestro` with a
+  private virtualenv, exposes `maestro` / `maestro-daemon` / `maestro-mcp` in
+  `~/.local/bin`, discovers and registers every supported coding-agent CLI on
+  the machine (preserving existing registrations), installs the global skill
+  into each detected agent, and starts/verifies the background daemon — all
+  without root. Rerunning updates in place; `--uninstall` (optionally
+  `--purge-state`) removes it while keeping user state by default.
+- **Background daemon lifecycle** — `maestro daemon start | stop | status
+  [--json] | restart`. `start` detaches the existing daemon executable in its
+  own session (survives shell exit), reuses the `~/.maestro/daemon.json`
+  marker as the single source of truth, refuses to start a duplicate for the
+  same state directory (advisory lock + liveness check), and reports PID/port/URL.
+  `stop` is SIGTERM → grace period (`MAESTRO_DAEMON_STOP_GRACE_S`) → SIGKILL,
+  idempotent, and cleans stale markers; `status` distinguishes "no marker",
+  "marker but dead process", and "live and answering".
+- **Global `maestro-driven-development` skill** — a packaged operational skill
+  (`maestro/skills/maestro-driven-development/SKILL.md`) that makes Maestro the
+  default development execution backend for supported agents: trigger
+  classification, daemon health check and auto-start, handoff/delegation via
+  MCP tools or CLI, review + follow-up loop, agent selection left to Maestro's
+  registry, and a bounded fallback when Maestro is unavailable.
+- **Agent integration layer** — `maestro/integrations.py` defines one
+  `AgentIntegration` per supported agent (Claude Code global skill, Codex /
+  Copilot CLI / Hermes / Pi / Cline managed instruction blocks, Cursor global
+  rule, OpenHands `custom_instructions`) with idempotent install/uninstall and
+  status, driven by the new `maestro skill list | status | install [--agent
+  NAME | --all] | uninstall` commands.
+- **`maestro agents register-discovered [--dry-run]`** — converts discovery
+  results into registrations programmatically; existing registrations (custom
+  names/models/tokens) are preserved untouched.
+- **Recursion protection** — every agent process Maestro launches receives
+  `MAESTRO_AGENT_CONTEXT=1`, `MAESTRO_TASK_ID=<task>`, and
+  `MAESTRO_ROLE=implementation`; the global skill instructs such workers to
+  implement directly and never delegate back to Maestro.
+
+### Changed
+
+- `maestro-daemon` remains the foreground executable (development/CI/service
+  managers); the preferred user-facing command is now `maestro daemon start`.
+- The "no daemon reachable" CLI error now points at `maestro daemon start`.
+
 ## [0.9.0] — 2026-09-19
 
 Productization release: **durable execution for coding agents** becomes the
@@ -87,7 +133,8 @@ auditable end to end.
   → re-verification) and prove the receipt survives daemon shutdown; the
   90-second storyboard is `docs/demo-v0.9.md`. `examples/overnight.toml`
   documents multi-task batches (separate workspaces, inspect via receipts — no
-  scheduler).
+  scheduler). A 90-second terminal recording of a real demo run
+  (`docs/assets/demo-v0.9.gif`, produced with VHS) is embedded in the README.
 - **Contributor & security docs** — `CONTRIBUTING.md` (setup, the test bar,
   design principles) and `SECURITY.md` (reporting path + threat model: Maestro
   executes external processes with your privileges; loopback-only daemon by

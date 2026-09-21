@@ -42,6 +42,7 @@ include = ["maestro*"]
 
 [tool.setuptools.package-data]
 "maestro.web_dist" = ["*"]
+"maestro" = ["skills/maestro-driven-development/*"]
 
 [tool.coverage.run]
 source = ["maestro"]

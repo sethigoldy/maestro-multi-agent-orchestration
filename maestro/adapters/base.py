@@ -14,6 +14,24 @@ from typing import Any, Callable
 from ..agents import AgentSpec, DEFAULT_BINARIES
 
 
+#: Environment marker set on every agent process Maestro launches. The global
+#: maestro-driven-development skill checks it: a worker running under these
+#: variables must perform its assigned implementation directly and must NOT
+#: delegate the work back to Maestro (recursion protection).
+MAESTRO_CONTEXT_ENV = "MAESTRO_AGENT_CONTEXT"
+MAESTRO_TASK_ID_ENV = "MAESTRO_TASK_ID"
+MAESTRO_ROLE_ENV = "MAESTRO_ROLE"
+
+
+def worker_environment(task_id: str) -> dict[str, str]:
+    """Environment for a spawned implementation agent (recursion guard)."""
+    env = os.environ.copy()
+    env[MAESTRO_CONTEXT_ENV] = "1"
+    env[MAESTRO_TASK_ID_ENV] = task_id
+    env[MAESTRO_ROLE_ENV] = "implementation"
+    return env
+
+
 class AdapterNotAvailable(RuntimeError):
     """The adapter kind exists but is not implemented in this release yet."""
 
@@ -174,7 +192,7 @@ class BaseAdapter:
                 stderr=subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
-                env=os.environ.copy(),
+                env=worker_environment(task_id),
             )
         except (OSError, ValueError) as exc:
             return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")
@@ -406,7 +424,7 @@ class BaseAdapter:
                 stderr=subprocess.STDOUT,
                 text=True,
                 start_new_session=True,
-                env=os.environ.copy(),
+                env=worker_environment(task_id),
             )
         except (OSError, ValueError) as exc:
             return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")

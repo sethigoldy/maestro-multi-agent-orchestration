@@ -10,6 +10,93 @@ verification result, and any review verdicts are journaled to disk as they
 happen — so you can understand exactly what happened to any task at any time,
 even after the daemon (or your machine) restarts.
 
+## Zero-configuration installation
+
+One command installs Maestro, wires up your coding agents, and starts the
+background daemon — no manual setup, no root:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orchestration/main/install.sh | bash
+```
+
+(or `git clone` the repository and run `./install.sh`). The installer:
+
+1. **installs Maestro** — clones this repository into `~/.local/share/maestro`,
+   creates a virtualenv there, and installs Maestro into it (your system Python
+   is never touched). Launchers for `maestro`, `maestro-daemon`, and
+   `maestro-mcp` land in `~/.local/bin`.
+2. **discovers coding agents** — scans your PATH for the supported agent CLIs
+   (Codex, Claude Code, GitHub Copilot CLI, Cursor, Hermes, Pi, Cline,
+   OpenHands).
+3. **registers them** with Maestro (`maestro agents register-discovered`).
+   Existing registrations are preserved — custom names, models, and tokens are
+   never overwritten.
+4. **installs the global `maestro-driven-development` skill** into every
+   detected agent, using each agent's own global instruction/skill mechanism
+   (e.g. `~/.claude/skills/…` for Claude Code, a managed block in
+   `~/.codex/instructions.md` for Codex, a global rule for Cursor).
+5. **starts the daemon in the background** (`maestro daemon start`) and
+   verifies it is healthy before printing a summary of what it did.
+
+The result: Maestro becomes your default development execution layer.
+
+```text
+Install once
+    ↓
+Open Claude / Codex / Cursor / …
+    ↓
+Ask it to implement something
+    ↓
+Maestro automatically orchestrates the implementation
+```
+
+You never say "use Maestro" — the installed skill makes any supported agent
+route real development work (features, bug fixes, refactors, tests) through
+the local daemon, and lets Maestro pick the implementation agent. Agents that
+are *running inside* a Maestro task are marked with `MAESTRO_AGENT_CONTEXT=1`
+and never delegate back to Maestro (no recursion). If Maestro is unavailable,
+the agent says so and falls back to its normal behavior.
+
+### Daemon lifecycle
+
+```bash
+maestro daemon start     # start in the background; returns immediately (idempotent)
+maestro daemon status    # running/stopped, PID, port, URL, state dir, uptime
+maestro daemon status --json   # machine-readable health check (exit 0 = running)
+maestro daemon stop      # SIGTERM → grace period → SIGKILL if needed (idempotent)
+maestro daemon restart   # stop + start
+```
+
+The daemon runs detached in its own session, so it survives the shell that
+started it; a new terminal can talk to it immediately. Its state lives in
+`~/.maestro/daemon.json` (plus `daemon.log` for output), and a stale marker from
+a dead process is reported as stopped — never as running.
+
+`maestro-daemon` remains the low-level **foreground** executable for
+development, debugging, service managers, and CI: it starts the same daemon in
+the current terminal and blocks until interrupted.
+
+### The global skill
+
+```bash
+maestro skill list       # the managed skill and every supported agent
+maestro skill status     # per-agent detection + installation state (JSON)
+maestro skill install            # install for all detected agents
+maestro skill install --agent claude   # one specific agent
+maestro skill install --all          # every supported agent, even undetected
+maestro skill uninstall              # remove everywhere it is installed
+maestro skill uninstall --agent codex
+```
+
+To **disable** the global integration without uninstalling Maestro, run
+`maestro skill uninstall` — agents go back to their normal behavior and nothing
+else changes. To remove Maestro entirely: rerun `./install.sh --uninstall`
+(keeps your `~/.maestro` state; add `--purge-state` to delete it too).
+
+Rerunning the installer at any time is safe: it updates Maestro in place,
+preserves state and custom registrations, refreshes the skill, and restarts a
+running daemon so it picks up the new version.
+
 ## Why Maestro
 
 Raw agent CLIs give you an answer and a scrollback buffer. Maestro adds the
@@ -167,14 +254,20 @@ version checked) before you delegate to it.
 ### 4. Start the daemon
 
 The daemon is the local broker: it runs tasks, streams events, and serves the
-web console.
+web console. If you used the one-command installer it is already running in
+the background — `maestro daemon status` will tell you. Otherwise:
 
 ```bash
-maestro-daemon                     # prints its port; writes ~/.maestro/daemon.json
+maestro daemon start               # detached background daemon; returns immediately
+maestro daemon status              # PID, port, URL, state dir, uptime (exit 0 = running)
+maestro daemon stop                # graceful stop (SIGTERM → grace → SIGKILL); idempotent
+maestro daemon restart             # stop + start
 ```
 
-Leave it running in a terminal (or a service manager). `--port 0` picks a free
-port; `--state-dir DIR` points it at an alternate state directory.
+`maestro-daemon` is the same daemon run **in the foreground** of your terminal
+(it prints its port and blocks until interrupted) — useful for development,
+debugging, service managers, and CI. `--port 0` picks a free port;
+`--state-dir DIR` points it at an alternate state directory.
 
 ### 5. Delegate your first task
 
@@ -450,7 +543,9 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | Command | What it does |
 |---|---|
 | `maestro doctor [--json]` | Diagnose the environment: state dir, daemon reachability, git, agent CLIs (with versions), workspace, budget caps. Read-only; exits non-zero only on a blocking problem |
-| `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | Start the broker daemon. `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
+| `maestro daemon start \| stop \| status [--json] \| restart` | Background daemon lifecycle manager. `start` detaches the daemon and returns immediately (idempotent — never starts a duplicate); `stop` is SIGTERM → grace period → SIGKILL, idempotent; `status` exits 0 when running, 1 when stopped, and distinguishes a stale marker from a live process |
+| `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | The same broker daemon in the **foreground** (development/CI/service managers). `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
+| `maestro skill list \| status \| install [--agent NAME \| --all] \| uninstall [--agent NAME]` | Manage the global `maestro-driven-development` skill across supported agents (per-agent global mechanisms, idempotent installs) |
 | `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--context TEXT`, `--context-file PATH`, `--skill DIR` add context entries (repeatable, see "Context injection"); `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
 | `maestro task list [--project DIR]` | List tasks (number or id) |
@@ -458,7 +553,7 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro task tail <id> [--all]` | Live-tail a task's event stream |
 | `maestro task audit <id>` | Durable record: attempts, usage, errors, result files |
 | `maestro task receipt <id\|n> [--json]` | Execution receipt: state, per-attempt phase/duration/cost, verification result, gate verdicts, totals. Works while running and after restart; `--json` for stable machine-readable output |
-| `maestro agents list \| add \| remove \| discover \| status <name>` | Manage registered agents |
+| `maestro agents list \| add \| remove \| discover \| register-discovered [--dry-run] \| status <name>` | Manage registered agents. `register-discovered` turns every discovered CLI into a registration, preserving existing ones (idempotent) |
 | `maestro peers list \| add --name N --url U \| remove NAME` | Discovered/registered peers |
 | `maestro budgets` | Show budget caps and current spend |
 | `maestro config` | Show effective Codex defaults and defined work-mode presets |

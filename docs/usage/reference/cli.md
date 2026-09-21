@@ -16,7 +16,7 @@ version 0.9.0; verify with `maestro --version`.
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | `task tail <id>`: the followed task ended in a non-`completed` terminal state; a daemon connection failure for `dashboard`; or `peers remove` for an unknown peer |
+| `1` | `task tail <id>`: the followed task ended in a non-`completed` terminal state; a daemon connection failure for `dashboard`; `peers remove` for an unknown peer; `daemon status` when the daemon is **stopped**; a failed `daemon start`/`restart` (spawn/readiness failure); or `skill install`/`uninstall` when an agent operation fails |
 | `2` | Usage or runtime error. A message prefixed `maestro:` is printed to stderr (e.g. unknown task, missing daemon, invalid handoff) |
 | `130` | `task tail` interrupted by Ctrl-C |
 
@@ -28,7 +28,7 @@ the endpoint in this order:
 1. `MAESTRO_DAEMON_URL` (optionally with `MAESTRO_DAEMON_TOKEN`).
 2. The `daemon.json` marker written by whichever broker started last. The
    marker's process is liveness-checked; a stale marker yields the error
-   `no daemon reachable — start one with 'maestro-daemon' or set MAESTRO_DAEMON_URL`.
+   `no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL`.
 
 Non-loopback daemons record their auth token in the marker, so local CLI calls
 are authorized automatically.
@@ -48,6 +48,53 @@ when authentication is enabled.
 | `--port N` | `0` | Port to bind; `0` picks a free port |
 | `--bind IF` | `127.0.0.1` | Listen interface. `127.0.0.1` (loopback, no token), `0.0.0.0`/`::` (all interfaces — token auth enabled, primary LAN IP advertised), or an explicit IP (advertised and dialed as-is; token auth enabled) |
 | `--state-dir DIR` | `~/.maestro` or `$MAESTRO_HOME` | State directory for this daemon |
+
+## maestro daemon
+
+```text
+maestro daemon start
+maestro daemon stop
+maestro daemon status [--json]
+maestro daemon restart
+```
+
+The lifecycle manager for the background daemon. It drives the same broker as
+`maestro-daemon`, but detaches it so no terminal needs to stay open:
+
+| Subcommand | Behavior |
+|---|---|
+| `start` | Starts the daemon in a detached session (survives shell exit) and returns immediately. Output goes to `<state-dir>/daemon.log`. **Idempotent**: if a live, answering daemon already exists for this state directory it is reused — never duplicated (an advisory lock serializes concurrent starts). If a process exists but does not answer HTTP, `start` refuses rather than stacking a second daemon |
+| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. **Idempotent**: stopping when nothing is running is not an error |
+| `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
+| `restart` | `stop` + `start` with error handling |
+
+The `daemon.json` marker (written by the daemon itself) is the single source of
+truth; `maestro daemon start` never keeps a second copy.
+
+## skill
+
+```text
+maestro skill list
+maestro skill status
+maestro skill install [--agent NAME | --all]
+maestro skill uninstall [--agent NAME]
+```
+
+Manages the global **`maestro-driven-development`** skill — the operational
+instructions that make Maestro the default development execution backend for
+supported coding agents. Each agent uses its own global mechanism: Claude Code
+gets a global Agent Skill (`~/.claude/skills/maestro-driven-development/SKILL.md`);
+Codex, GitHub Copilot CLI, Hermes, Pi, and Cline get a managed block in their
+global instructions/rules file; Cursor gets a global user rule
+(`~/.cursor/rules/maestro-driven-development.mdc`); OpenHands gets the skill
+inside `custom_instructions` of `~/.openhands/agent_settings.json`.
+
+| Subcommand | Behavior |
+|---|---|
+| `list` | JSON: the managed skill, its source path, and every supported agent |
+| `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed` |
+| `install` | Installs the skill for every **detected** agent by default. `--agent NAME` targets one agent (adapter kind, binary name, or display name; installed even if not yet detected). `--all` installs for every supported agent regardless of detection. Idempotent — reinstalling replaces the managed region instead of duplicating it |
+| `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed |
 
 ## delegate
 
@@ -124,6 +171,7 @@ maestro agents add --name N --kind K [--display-name S] [--skill S …]
                    [--workspace-policy cwd|flag] [--token T]
 maestro agents remove <name>
 maestro agents discover
+maestro agents register-discovered [--dry-run]
 maestro agents status <name>
 ```
 
@@ -133,6 +181,7 @@ maestro agents status <name>
 | `add` | Registers an agent. `--kind` must be one of: `codex`, `claude_code`, `hermes`, `pi`, `cline`, `openhands`, `cursor`, `copilot`, `a2a_remote`, or `generic`. `--skill` is repeatable. For `generic`: `--command` is required in practice (supports `{prompt}` substitution); `--input-mode stdin` pipes the prompt instead; `--output-format jsonl` enables usage/cost parsing from JSON lines. For `a2a_remote`: `--command` is the daemon URL and `--token` its bearer token |
 | `remove` | Unregisters by name; exits 2 if not registered |
 | `discover` | Scans `PATH` for known agent CLIs and reports findings (does not register) |
+| `register-discovered` | Converts discovery results into registrations programmatically: every found CLI that is not registered yet gets a default spec (`source="discovered"`). **Idempotent and conservative** — existing registrations (custom names, models, tokens, skills) are preserved exactly as-is. `--dry-run` reports what would be registered without writing |
 | `status` | Registration + availability check for one agent: binary found, version, (for `a2a_remote`) remote agent card |
 
 ## peers

@@ -112,6 +112,34 @@ check_core() {
         fi
     done
     echo "PASS [$label] web assets packaged: $webdir/{console.js,index.html}"
+
+    # The global skill source ships inside the installed package.
+    skillfile="$("$bin/python" -c 'import maestro, os; print(os.path.join(os.path.dirname(maestro.__file__), "skills", "maestro-driven-development", "SKILL.md"))')"
+    if [ ! -s "$skillfile" ]; then
+        echo "FAIL [$label]: global skill source missing from installed package: $skillfile" >&2; exit 1
+    fi
+    echo "PASS [$label] global skill packaged: $skillfile"
+
+    # Daemon lifecycle CLI against an isolated, empty state dir.
+    dhome="$WORK/${label}-daemon-home"
+    rc=0
+    out="$(MAESTRO_HOME="$dhome" HOME="$dhome" "$bin/maestro" daemon status --json)" || rc=$?
+    if [ $rc -ne 1 ]; then
+        echo "FAIL [$label]: 'maestro daemon status' on an empty state dir should exit 1 (stopped), got $rc" >&2; echo "$out" >&2; exit 1
+    fi
+    running="$(printf '%s' "$out" | "$bin/python" -c 'import json,sys; print("true" if json.load(sys.stdin).get("running") else "false")')"
+    if [ "$running" != "false" ]; then
+        echo "FAIL [$label]: daemon status JSON should report running=false" >&2; exit 1
+    fi
+    echo "PASS [$label] maestro daemon status --json -> stopped (exit 1, running=false)"
+
+    # Skill management CLI enumerates the supported agents.
+    sout="$(HOME="$dhome" "$bin/maestro" skill list)" || { echo "FAIL [$label]: 'maestro skill list' failed" >&2; exit 1; }
+    nsupported="$(printf '%s' "$sout" | "$bin/python" -c 'import json,sys; print(len(json.load(sys.stdin).get("supported_agents", [])))')"
+    if [ "$nsupported" -lt 8 ]; then
+        echo "FAIL [$label]: expected >=8 supported agents in skill list, got $nsupported" >&2; exit 1
+    fi
+    echo "PASS [$label] maestro skill list -> $nsupported supported agents"
 }
 
 check_core wheel "$WV"
