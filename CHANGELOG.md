@@ -4,6 +4,19 @@ All notable changes to Maestro are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- **Agents now inherit login-shell environment variables** — spawned agents
+  previously received only the daemon process's environment, so profile exports
+  (API keys such as `GROVE_API_KEY`) were missing whenever the daemon was
+  started from a GUI, launchd, or an older terminal. `worker_environment` now
+  layers a one-per-process snapshot of `$SHELL -lc env` under the daemon's own
+  environment (explicit daemon values still win on conflict). Disable with
+  `MAESTRO_LOGIN_ENV=0`; tune the snapshot timeout with
+  `MAESTRO_LOGIN_ENV_TIMEOUT_S`. Restart the daemon after adding new variables.
+
 ## [0.10.0] — 2026-09-21
 
 ### Added
