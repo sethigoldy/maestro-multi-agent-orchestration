@@ -23,10 +23,21 @@ INSTALL_SH = REPO_ROOT / "install.sh"
 REAL_PY = sys.executable
 
 
+#: Every interpreter name install.sh's require_python() probes. Fakes must be
+#: provided under ALL of them (PATH puts the fake bindir first, so ours always
+#: wins — a CI runner may have real python3.12/python3.11 in /usr/bin).
+PYTHON_NAMES = ("python3.12", "python3.11", "python3", "python")
+
+
 def _write(path: Path, body: str, executable: bool = True) -> None:
     path.write_text(body, encoding="utf-8")
     if executable:
         path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def _write_python_fakes(bindir: Path, body: str) -> None:
+    for name in PYTHON_NAMES:
+        _write(bindir / name, body)
 
 
 class FakeEnv:
@@ -76,9 +87,10 @@ case "$1 $2" in
 esac
 """,
         )
-        # Fake python3: version handshake + venv creation with real-python shim.
-        _write(
-            self.bindir / "python3",
+        # Fake Python (under every probed name): version handshake + venv
+        # creation with a real-python shim for the installer's inline JSON.
+        _write_python_fakes(
+            self.bindir,
             f"""#!/bin/sh
 case "$1" in
   --version) echo "Python 3.11.9"; exit 0 ;;
@@ -254,8 +266,10 @@ def test_python_too_old_is_a_clear_error(tmp_path):
     home, bindir = tmp_path / "home", tmp_path / "bin"
     home.mkdir()
     bindir.mkdir()
-    _write(
-        bindir / "python3",
+    # All probed names must be too old, or a real system python3.1x (present on
+    # CI runners) would satisfy the check first.
+    _write_python_fakes(
+        bindir,
         """#!/bin/sh
 case "$1" in
   --version) echo "Python 3.9.0"; exit 0 ;;
