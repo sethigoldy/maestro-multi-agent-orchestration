@@ -279,6 +279,33 @@ class AgentRegistry:
             )
         return out
 
+    def register_discovered(self, dry_run: bool = False) -> list[dict[str, Any]]:
+        """Register every discovered agent CLI that is not registered yet.
+
+        Idempotent and conservative: an existing registration (user or previously
+        discovered) is preserved exactly as-is — custom names, models, tokens,
+        skills survive untouched. Only newly found agents receive a default spec
+        with ``source="discovered"``. Returns one report entry per discovered
+        candidate (missing binaries are not reported).
+        """
+        out: list[dict[str, Any]] = []
+        for candidate in self.discover():
+            if not candidate["found"]:
+                continue
+            name = str(candidate["name"])
+            existing = self.get(name)
+            if existing is not None:
+                out.append({"name": name, "action": "preserved", "detail": f"already registered (source={existing.source})"})
+                continue
+            spec = AgentSpec(
+                name=name, kind=str(candidate["kind"]),
+                display_name=str(candidate["display_name"]), source="discovered",
+            )
+            if not dry_run:
+                self.save(spec)
+            out.append({"name": name, "action": "would-register" if dry_run else "registered", "detail": f"kind={candidate['kind']}"})
+        return out
+
     def status(self, name: str) -> dict[str, Any]:
         """Registration + availability status for one agent."""
         spec = self.get(name)

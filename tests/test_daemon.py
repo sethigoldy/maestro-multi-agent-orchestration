@@ -1674,12 +1674,17 @@ def test_work_mode_cancel_during_fix_turn(daemon, tmp_path, binpath):
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(verification="auto", mode="economy"), ws)
     task_id = started["task_id"]
+    # Wait until the fix turn has actually STARTED (the record is flagged with
+    # fixing=True immediately before the fixer runs), so the cancel lands DURING
+    # the fix turn — not in the gap between review and fix. The fixer sleeps 30s,
+    # so it is still running when we cancel.
     deadline = time.time() + 20
     while time.time() < deadline:
         record = daemon._tasks.get(task_id) or {}
-        if [a["agent"] for a in record.get("attempts", [])] == ["impl", "rev"]:
+        if record.get("fixing") is True:
             break
         time.sleep(0.05)
+    assert (daemon._tasks.get(task_id) or {}).get("fixing") is True, "fix turn never started"
     daemon.cancel(task_id, reason="stop the fix")
     final = daemon.wait(task_id, timeout=60)
     assert final["status"]["state"] == "canceled"
