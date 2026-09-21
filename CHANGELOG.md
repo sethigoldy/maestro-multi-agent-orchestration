@@ -17,6 +17,13 @@ semantic versioning.
   `MAESTRO_LOGIN_ENV=0`; tune the snapshot timeout with
   `MAESTRO_LOGIN_ENV_TIMEOUT_S`. Restart the daemon after adding new variables.
 
+- **Flaky 100% coverage gate on the a2a_remote timeout branch** — the SSE wait
+  loop has two equivalent timeout exits (deadline already expired at the top of
+  the loop vs. an empty queue read), and which one fired depended on event
+  timing, so CI occasionally failed the coverage gate. Added a deterministic
+  test that exercises the top-of-loop branch (an early event followed by
+  silence).
+
 ## [0.10.0] — 2026-09-21
 
 ### Added

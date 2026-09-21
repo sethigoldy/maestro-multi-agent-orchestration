@@ -33,6 +33,7 @@ class _JsonRpcServer:
         self.requests: list[tuple[str, bytes]] = []
         self.sse_body = b""
         self.hold_sse = hold_sse
+        self.hold_after_sse = False  # write sse_body first, then keep the stream open
 
         class Handler(BaseHTTPRequestHandler):
             outer = self
@@ -71,6 +72,12 @@ class _JsonRpcServer:
                         self.end_headers()
                         self.wfile.write(self.outer.sse_body)
                         self.wfile.flush()
+                        if self.outer.hold_after_sse:
+                            try:
+                                while True:
+                                    time.sleep(0.5)
+                            except OSError:
+                                pass
                 else:
                     self.send_response(404)
                     self.end_headers()
@@ -614,6 +621,20 @@ def test_a2a_remote_stream_error_and_timeout(tmp_path):
         assert not result.ok and "timed out after 1s" in (result.error or "")
     finally:
         hold_srv.close()
+
+
+def test_a2a_remote_timeout_after_late_event(tmp_path):
+    """An event arriving well before the deadline means the next top-of-loop
+    check sees an already-expired deadline — the other timeout branch."""
+    srv = _JsonRpcServer(tmp_path)
+    srv.sse_body = b'event: ping\ndata: {"task_id": "remote-1", "type": "ping", "data": {}}\n\n'
+    srv.hold_after_sse = True  # stream stays open after the event
+    try:
+        adapter = A2ARemoteAdapter(AgentSpec(name="x", kind="a2a_remote", command=srv.url))
+        result = adapter.run("p", Path(tmp_path), "t7", timeout=2)
+        assert not result.ok and "timed out after 2s" in (result.error or "")
+    finally:
+        srv.close()
 
 
 def test_a2a_remote_cancel_failure_swallowed_and_odd_events(tmp_path):
