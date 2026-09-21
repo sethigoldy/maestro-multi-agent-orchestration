@@ -101,7 +101,7 @@ def test_installed_maestro_mcp_speaks_mcp_over_stdio():
 
 def test_version_is_090_and_single_sourced():
     data = _pyproject()
-    assert data["project"]["version"] == "0.9.0"
+    assert data["project"]["version"] == "0.10.0"
     from maestro import VERSION
 
     assert VERSION == data["project"]["version"], (
@@ -146,7 +146,7 @@ def test_web_console_assets_exist_and_are_nonempty():
 
 
 def test_release_scripts_exist_and_are_executable():
-    for script in ("smoke-fake-agent.sh", "validate-package.sh", "demo-v0.9.sh"):
+    for script in ("smoke-fake-agent.sh", "validate-package.sh", "demo-v0.10.sh"):
         path = REPO_ROOT / "scripts" / script
         assert path.is_file(), f"scripts/{script} missing"
         if sys.platform != "win32":

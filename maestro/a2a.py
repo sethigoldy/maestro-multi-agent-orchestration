@@ -109,10 +109,15 @@ class A2ADispatcher:
             else:
                 if not text:
                     return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "Message carries neither a handoff data part nor text")
+                named_target = maestro_meta.get("target_agent")
                 doc = HandoffDoc(
                     title=str(maestro_meta.get("title") or "A2A delegation"),
                     request=text,
-                    target_agent=str(maestro_meta.get("target_agent") or self.daemon.default_target()),
+                    target_agent=str(named_target or self.daemon.default_target()),
+                    # A caller-named target is an explicit choice; the implicit
+                    # fallback stays open for [defaults] resolution / the
+                    # routing question at delegate time.
+                    explicit_target=bool(named_target),
                 )
             # Cross-machine hop semantics: the handoff's target_agent names the
             # *hop* (e.g. machine B's "remote-b" spec), which does not exist on

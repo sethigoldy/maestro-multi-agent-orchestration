@@ -45,7 +45,7 @@ def test_skill_list(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert data["skill"] == SKILL_NAME
     assert Path(data["source"]).is_file()
-    assert len(data["supported_agents"]) == 8
+    assert len(data["supported_agents"]) == 9
 
 
 def test_skill_status_all_absent(tmp_path, monkeypatch, capsys):
@@ -53,10 +53,10 @@ def test_skill_status_all_absent(tmp_path, monkeypatch, capsys):
     (tmp_path / "bin").mkdir()
     rc, out, _ = runner.run("skill", "status")
     entries = json.loads(out)
-    assert rc == 0 and len(entries) == 8
+    assert rc == 0 and len(entries) == 9
     assert all(e["installed"] is False for e in entries)
     kinds = {e["kind"] for e in entries}
-    assert kinds == {"codex", "claude_code", "copilot", "cursor", "hermes", "pi", "cline", "openhands"}
+    assert kinds == {"codex", "claude_code", "copilot", "cursor", "hermes", "pi", "cline", "opencode", "openhands"}
 
 
 def test_skill_install_agent_flag(tmp_path, monkeypatch, capsys):

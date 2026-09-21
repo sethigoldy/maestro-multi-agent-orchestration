@@ -128,7 +128,7 @@ output — expect it to take minutes and cost real money.
 ## Fallback: validating with two generic agents
 
 Without any built-in CLI, register two small scripts as generic agents (the demo
-script `scripts/demo-v0.9.sh` contains a complete working example) and repeat
+script `scripts/demo-v0.10.sh` contains a complete working example) and repeat
 steps 4–7 with `--target <generic-name>`. This validates the generic adapter,
 usage capture, and receipts — but not a built-in CLI's flags or output format, so
 it does not replace step 8.

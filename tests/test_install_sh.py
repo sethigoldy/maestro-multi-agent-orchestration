@@ -58,7 +58,7 @@ class FakeEnv:
         (self.repo / "maestro").mkdir(parents=True)
         (self.repo / ".git").mkdir()
         (self.repo / "pyproject.toml").write_text(
-            '[project]\nname = "maestro"\nversion = "0.9.0"\n', encoding="utf-8"
+            '[project]\nname = "maestro"\nversion = "0.10.0"\n', encoding="utf-8"
         )
         (self.repo / "maestro" / "cli.py").write_text("# fake cli\n", encoding="utf-8")
 

@@ -1,12 +1,16 @@
-# The 90-second Maestro v0.9 demo
+# The 90-second Maestro v0.10 demo
 
-One script, no network, no real agent CLIs: `scripts/demo-v0.9.sh` runs the whole
+One script, no network, no real agent CLIs: `scripts/demo-v0.10.sh` runs the whole
 product story with deterministic fake agents and prints everything it shows.
 Every number below is produced by the run itself — nothing is scripted output.
 
+A 90-second terminal recording of this exact demo (real CLI invocations, paced
+to this storyboard) is checked in at [assets/demo-v0.10.gif](assets/demo-v0.10.gif)
+and embedded in the README.
+
 ```sh
 python3.11 -m venv .venv && .venv/bin/python -m pip install -e .   # once
-scripts/demo-v0.9.sh
+scripts/demo-v0.10.sh
 ```
 
 The script needs `git` and this checkout's `.venv` (or set `PYTHON=/path/to/python`).

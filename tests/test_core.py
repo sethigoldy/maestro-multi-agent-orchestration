@@ -35,6 +35,82 @@ def test_config_in_project_root(tmp_path):
     try: assert m.codex_defaults()=={'model':'gpt-5.6-luna','effort':'max'}
     finally: m.close()
 
+# ---------------------------------------------------------------- [defaults] routing defaults
+
+def _write_config(root, text):
+    (root / '.maestro').mkdir(exist_ok=True)
+    (root / '.maestro' / 'config.toml').write_text(text, encoding='utf-8')
+
+def test_defaults_absent_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    m = Maestro(tmp_path)
+    try: assert m.config['defaults'] == {}
+    finally: m.close()
+
+def test_defaults_full_table_parsed(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\nagent = "codex"\nfallback = ["claude_code", "opencode"]\nmodel = "gpt-5.6-luna"\neffort = "max"\n')
+    m = Maestro(tmp_path)
+    try: assert m.config['defaults'] == {'agent': 'codex', 'fallback': ['claude_code', 'opencode'], 'model': 'gpt-5.6-luna', 'effort': 'max'}
+    finally: m.close()
+
+def test_defaults_partial_table(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\nagent = "codex"\n')
+    m = Maestro(tmp_path)
+    try: assert m.config['defaults'] == {'agent': 'codex'}
+    finally: m.close()
+
+def test_defaults_not_a_table_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, 'defaults = "codex"\n')
+    with pytest.raises(ValueError, match=r'\[defaults\] must be a table'):
+        Maestro(tmp_path)
+
+def test_defaults_unknown_key_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\nagent = "codex"\nbogus = 1\n')
+    with pytest.raises(ValueError, match='unknown keys: bogus'):
+        Maestro(tmp_path)
+
+def test_defaults_empty_agent_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\nagent = "   "\n')
+    with pytest.raises(ValueError, match='agent must be a non-empty string'):
+        Maestro(tmp_path)
+
+def test_defaults_non_string_model_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\nmodel = 42\n')
+    with pytest.raises(ValueError, match='model must be a non-empty string'):
+        Maestro(tmp_path)
+
+@pytest.mark.parametrize('bad,match', [
+    ('fallback = "codex"', 'fallback must be a list'),
+    ('fallback = ["codex", 1]', 'fallback must be a list'),
+    ('fallback = [""]', 'fallback must be a list'),
+])
+def test_defaults_bad_fallback_rejected(tmp_path, monkeypatch, bad, match):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, f'[defaults]\n{bad}\n')
+    with pytest.raises(ValueError, match=match):
+        Maestro(tmp_path)
+
+def test_defaults_bad_effort_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path / 'home'))
+    _write_config(tmp_path, '[defaults]\neffort = "turbo"\n')
+    with pytest.raises(ValueError, match='Unsupported default reasoning effort'):
+        Maestro(tmp_path)
+
+def test_defaults_later_file_wins_per_key(tmp_path, monkeypatch):
+    home = tmp_path / 'home'; home.mkdir()
+    (home / 'config.toml').write_text('[defaults]\nagent = "codex"\nmodel = "user-model"\n', encoding='utf-8')
+    _write_config(tmp_path, '[defaults]\nagent = "opencode"\n')
+    monkeypatch.setenv('MAESTRO_HOME', str(home))
+    m = Maestro(tmp_path)
+    try: assert m.config['defaults'] == {'agent': 'opencode', 'model': 'user-model'}
+    finally: m.close()
+
 def test_task_state_is_user_level_and_survives_worktree_switch(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

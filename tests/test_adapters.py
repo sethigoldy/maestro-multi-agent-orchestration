@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, GenericAdapter, HermesAdapter, OpenHandsAdapter, PiAdapter, make_adapter
+from maestro.adapters import AdapterNotAvailable, BaseAdapter, ClaudeCodeAdapter, ClineAdapter, CodexAdapter, CopilotAdapter, CursorAdapter, GenericAdapter, HermesAdapter, OpenCodeAdapter, OpenHandsAdapter, PiAdapter, make_adapter
 from maestro.agents import AgentSpec
 
 
@@ -187,6 +187,119 @@ def test_claude_command_context_flags(tmp_path):
     assert "--append-system-prompt-file" not in cmd and "--add-dir" not in cmd
 
 
+# Fake Claude Code CLIs: the modern surface rejects stream-json without
+# --verbose (arg-validation error, no model call); the legacy surface rejects
+# --verbose itself.
+_CLAUDE_FAKE_MODERN = r"""
+args="$*"
+case "$args" in
+  *"stream-json"*"--verbose"*)
+      echo '{"type":"result","subtype":"success","total_cost_usd":0.1,"duration_ms":5}'
+      exit 0 ;;
+  *"stream-json"*)
+      echo "Error: When using --print, --output-format=stream-json requires --verbose" 1>&2
+      exit 1 ;;
+esac
+cat > /dev/null
+exit 0
+"""
+
+_CLAUDE_FAKE_LEGACY = r"""
+echo spawn >> "$(dirname "$0")/.claude_spawns"
+args="$*"
+case "$args" in
+  *"--verbose"*)
+      echo "error: unexpected argument '--verbose' found" 1>&2
+      exit 2 ;;
+esac
+cat > /dev/null
+echo '{"type":"result","subtype":"success","total_cost_usd":0.2,"duration_ms":9}'
+exit 0
+"""
+
+_CLAUDE_FAKE_REJECTS_ALL = r"""
+echo spawn >> "$(dirname "$0")/.claude_spawns"
+echo "error: unexpected argument '--verbose' found" 1>&2
+exit 2
+"""
+
+
+def test_claude_command_includes_verbose(tmp_path):
+    adapter = ClaudeCodeAdapter(_spec("cc", kind="claude_code"))
+    cmd = adapter.build_command("p", tmp_path, "t", {})
+    assert cmd == ["claude", "-p", "--output-format", "stream-json", "--verbose"]
+
+
+def test_claude_modern_cli_stream_json_requires_verbose(tmp_path):
+    # Behavioral regression: Claude Code 2.x rejects stream-json without
+    # --verbose at arg-parse time; the adapter must emit --verbose up front.
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "claude", _CLAUDE_FAKE_MODERN)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = ClaudeCodeAdapter(_spec("cc", kind="claude_code")).run(
+            "p", tmp_path, "t1", timeout=30
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert (result.usage or {}).get("cost_usd") == 0.1
+
+
+def test_claude_legacy_cli_rejects_verbose_falls_back(tmp_path):
+    # Older CLIs reject --verbose; a single retry without it must succeed.
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "claude", _CLAUDE_FAKE_LEGACY)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = ClaudeCodeAdapter(_spec("cc", kind="claude_code")).run(
+            "p", tmp_path, "t2", timeout=30
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and (result.usage or {}).get("cost_usd") == 0.2
+    spawns = (binpath / ".claude_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 2  # exactly one fallback retry
+
+
+def test_claude_cli_rejects_everything_stops_after_one_retry(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "claude", _CLAUDE_FAKE_REJECTS_ALL)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = ClaudeCodeAdapter(_spec("cc", kind="claude_code")).run(
+            "p", tmp_path, "t3", timeout=30
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "unexpected argument '--verbose'" in (result.error or "")
+    spawns = (binpath / ".claude_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 2  # one retry, then it stops — no loop
+
+
+def test_claude_unrelated_failure_does_not_retry(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "claude", 'echo spawn >> "$(dirname "$0")/.claude_spawns"\necho boom 1>&2\nexit 3')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = ClaudeCodeAdapter(_spec("cc", kind="claude_code")).run(
+            "p", tmp_path, "t4", timeout=30
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "boom" in (result.error or "")
+    spawns = (binpath / ".claude_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 1
+
+
 def test_codex_usage_parsing():
     adapter = CodexAdapter(_spec("codex"))
     parsed = adapter.parse_line(json.dumps({"type": "turn.completed", "total_cost_usd": 1.5, "tokens_used": 99}))
@@ -207,6 +320,7 @@ def test_factory_kinds():
     assert isinstance(make_adapter(_spec("cu", kind="cursor")), CursorAdapter)
     assert isinstance(make_adapter(_spec("oh", kind="openhands")), OpenHandsAdapter)
     assert isinstance(make_adapter(_spec("cp", kind="copilot")), CopilotAdapter)
+    assert isinstance(make_adapter(_spec("oc", kind="opencode")), OpenCodeAdapter)
     with pytest.raises(AdapterNotAvailable):
         make_adapter(_spec("xx", kind="carrier-pigeon"))
 
@@ -276,6 +390,125 @@ def test_spawn_failure_captures_tail(tmp_path):
         os.environ["PATH"] = old
     assert result.ok is False and result.exit_code == 3
     assert "code 3" in (result.error or "") and "boom" in (result.error or "")
+
+
+# Fake codex CLIs with version skew between the advertised (help) surface and
+# the runtime surface: the probe picks one autonomy flag set, the runtime only
+# accepts the other.
+_CODEX_FAKE_SKEW_OLD_HELP = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "  --full-auto   autonomous execution (advertised)"
+    exit 0
+fi
+echo spawn >> "$(dirname "$0")/.codex_spawns"
+for a in "$@"; do
+    if [ "$a" = "--full-auto" ]; then
+        echo "error: unexpected argument '--full-auto' found" 1>&2
+        exit 2
+    fi
+done
+cat > /dev/null
+echo '{"type":"turn.completed","total_cost_usd":0.3,"tokens_used":42}'
+exit 0
+"""
+
+_CODEX_FAKE_SKEW_NEW_HELP = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "Usage: codex exec [OPTIONS]"
+    exit 0
+fi
+echo spawn >> "$(dirname "$0")/.codex_spawns"
+for a in "$@"; do
+    if [ "$a" = "--approve-for-me" ]; then
+        echo "error: unexpected argument '--approve-for-me' found" 1>&2
+        exit 2
+    fi
+done
+cat > /dev/null
+echo '{"type":"turn.completed","total_cost_usd":0.3,"tokens_used":42}'
+exit 0
+"""
+
+_CODEX_FAKE_REJECTS_BOTH = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "Usage: codex exec [OPTIONS]"
+    exit 0
+fi
+echo spawn >> "$(dirname "$0")/.codex_spawns"
+for a in "$@"; do
+    case "$a" in
+        --full-auto|--approve-for-me)
+            echo "error: unexpected argument '$a' found" 1>&2
+            exit 2 ;;
+    esac
+done
+cat > /dev/null
+exit 0
+"""
+
+
+def test_codex_flag_skew_retries_with_alternate_surface(tmp_path):
+    # Probe advertises --full-auto (old help surface) but the runtime only
+    # accepts --approve-for-me: one bounded retry with the alternate set.
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "codex", _CODEX_FAKE_SKEW_OLD_HELP)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t1", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and (result.usage or {}).get("cost_usd") == 0.3
+    spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 2
+
+
+def test_codex_flag_skew_new_surface_retries_with_full_auto(tmp_path):
+    # The transcript case: the probe picks --approve-for-me (current default),
+    # the installed CLI rejects it; one retry with --full-auto must succeed.
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "codex", _CODEX_FAKE_SKEW_NEW_HELP)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t2", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and (result.usage or {}).get("cost_usd") == 0.3
+    spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 2
+
+
+def test_codex_cli_rejects_both_flag_sets_stops_after_one_retry(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "codex", _CODEX_FAKE_REJECTS_BOTH)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t3", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "unexpected argument" in (result.error or "")
+    spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 2  # one retry, then it stops — no loop
+
+
+def test_codex_unrelated_failure_does_not_retry(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "codex", _HELP_GUARD + 'echo spawn >> "$(dirname "$0")/.codex_spawns"\ncat > /dev/null\necho boom 1>&2\nexit 3')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t4", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is False and "boom" in (result.error or "")
+    spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 1
 
 
 def test_spawn_timeout_kills_process(tmp_path):
@@ -901,6 +1134,13 @@ if usage_file and mode != "nowrite":
     elif mode == "empty":
         with open(usage_file, "w") as fh:
             fh.write(json.dumps({}))
+    elif mode == "failed":
+        # The CLI exits 0 on API-level failures; the report is the signal.
+        report = {"completed": False, "failed": True}
+        if os.environ.get("HERMES_FAILURE") is not None:
+            report["failure"] = os.environ["HERMES_FAILURE"]
+        with open(usage_file, "w") as fh:
+            fh.write(json.dumps(report))
     else:
         report = {
             "estimated_cost_usd": 0.42, "input_tokens": 100, "output_tokens": 50,
@@ -1006,6 +1246,44 @@ def test_hermes_no_usage_file(tmp_path):
     finally:
         os.environ["PATH"] = old
     assert result.ok is True and result.usage is None  # no log_dir -> no --usage-file
+
+
+def test_hermes_failed_report_flips_result_to_failed(tmp_path):
+    # The transcript defect: the CLI exits 0 on an API-level failure (missing
+    # subscription key); the usage report's failed flag must flip the result to
+    # a proper failure instead of a silent COMPLETED.
+    old = _hermes_adapter(tmp_path)
+    try:
+        os.environ["HERMES_USAGE_MODE"] = "failed"
+        os.environ["HERMES_FAILURE"] = "HTTP 401: Access denied due to missing subscription key"
+        result = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t6", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        del os.environ["HERMES_USAGE_MODE"]
+        del os.environ["HERMES_FAILURE"]
+        os.environ["PATH"] = old
+    assert result.ok is False and result.exit_code == 0
+    assert "HTTP 401: Access denied due to missing subscription key" in (result.error or "")
+
+
+def test_hermes_failed_report_blank_or_missing_detail(tmp_path):
+    old = _hermes_adapter(tmp_path)
+    try:
+        os.environ["HERMES_USAGE_MODE"] = "failed"
+        os.environ["HERMES_FAILURE"] = ""
+        blank = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t7", timeout=30, log_dir=tmp_path / "logs"
+        )
+        del os.environ["HERMES_FAILURE"]
+        missing = HermesAdapter(_spec("hm", kind="hermes")).run(
+            "p", tmp_path, "t8", timeout=30, log_dir=tmp_path / "logs2"
+        )
+    finally:
+        del os.environ["HERMES_USAGE_MODE"]
+        os.environ["PATH"] = old
+    assert blank.ok is False and blank.error == "Agent 'hermes' reported a failed run"
+    assert missing.ok is False and missing.error == "Agent 'hermes' reported a failed run"
 
 
 def test_pi_start_command_not_implemented(tmp_path):
@@ -1283,3 +1561,175 @@ def test_probe_codex_probe_failure_falls_back(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cx.subprocess, "run", boom)
     assert cx.probe_codex_autonomy_flags("/bin/true") == ["--approve-for-me"]
+
+
+# ---------------------------------------------------------------- opencode
+_OPENCODE_FAKE_PY = """
+import json, os, sys
+
+args = sys.argv[1:]
+prompt_parts = []
+model = None
+variant = None
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-m":
+        model = args[i + 1]; i += 2; continue
+    if a == "--variant":
+        variant = args[i + 1]; i += 2; continue
+    if a in ("--format",):
+        i += 2; continue
+    if a in ("run", "--auto"):
+        i += 1; continue
+    prompt_parts.append(a)
+    i += 1
+prompt = " ".join(prompt_parts)
+
+args_file = os.environ.get("OC_ARGS_FILE")
+if args_file:
+    with open(args_file, "w") as fh:
+        json.dump({"model": model, "variant": variant, "prompt": prompt}, fh)
+
+mode = os.environ.get("OC_MODE", "full")
+def emit(obj):
+    print(json.dumps(obj), flush=True)
+
+emit({"type": "step_start", "part": {"type": "step-start"}})
+if mode == "error":
+    emit({"type": "error", "error": {"name": "APIError", "data": {"message": "Not authenticated", "statusCode": 401}}})
+    sys.exit(1)
+emit({"type": "text", "part": {"type": "text", "text": f"done: {prompt}"}})
+if mode == "nopart":
+    emit({"type": "step_finish"})
+elif mode == "nocache":
+    emit({"type": "step_finish", "part": {"reason": "stop", "cost": 0.1,
+                                          "tokens": {"total": 50, "input": 40, "output": 10, "reasoning": 0}}})
+elif mode == "empty":
+    emit({"type": "step_finish", "part": {}})
+elif mode == "partial":
+    emit({"type": "step_finish", "part": {"reason": "stop", "cost": 0.5, "tokens": None}})
+elif mode == "sparse":
+    emit({"type": "step_finish", "part": {"reason": "stop", "cost": None, "tokens": {"total": 99, "input": "lots", "output": 12, "reasoning": 0, "cache": {"read": 4}}}})
+elif mode == "garbage":
+    print("not a json line at all")
+    emit({"type": "step_finish", "part": {"reason": "stop", "cost": 0.25, "tokens": {"total": 10, "input": 8, "output": 2, "reasoning": 0, "cache": {"write": 1}}}})
+else:
+    emit({"type": "step_finish", "part": {"reason": "stop", "cost": 0.5, "tokens": {"total": 160, "input": 100, "output": 50, "reasoning": 9, "cache": {"write": 3, "read": 7}}}})
+sys.exit(0)
+"""
+
+
+def _opencode_adapter(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir(exist_ok=True)
+    (binpath / "_opencode_fake.py").write_text(_OPENCODE_FAKE_PY, encoding="utf-8")
+    _fake_bin(binpath, "opencode", 'exec python3 "$(dirname "$0")/_opencode_fake.py" "$@"')
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    return old
+
+
+def test_opencode_input_mode_is_arg():
+    assert OpenCodeAdapter(_spec("oc", kind="opencode")).input_mode() == "arg"
+
+
+def test_opencode_build_command_bare(tmp_path):
+    adapter = OpenCodeAdapter(_spec("oc", kind="opencode"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {})
+    assert cmd == ["opencode", "run", "--format", "json", "--auto", "do it"]
+
+
+def test_opencode_build_command_from_spec(tmp_path):
+    adapter = OpenCodeAdapter(_spec("oc", kind="opencode", model="opencode/big-pickle", effort="high"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {})
+    assert cmd == ["opencode", "run", "--format", "json", "--auto", "-m", "opencode/big-pickle", "--variant", "high", "do it"]
+
+
+def test_opencode_build_command_settings_win(tmp_path):
+    adapter = OpenCodeAdapter(_spec("oc", kind="opencode", model="spec-model", effort="low"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {"model": "task-model", "effort": "max"})
+    assert "-m" in cmd and cmd[cmd.index("-m") + 1] == "task-model"
+    assert "--variant" in cmd and cmd[cmd.index("--variant") + 1] == "max"
+
+
+def test_opencode_happy_path_with_usage(tmp_path):
+    old = _opencode_adapter(tmp_path)
+    try:
+        result = OpenCodeAdapter(_spec("oc", kind="opencode")).run(
+            "write the report", tmp_path, "task-1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True and result.exit_code == 0
+    assert result.usage == {
+        "cost_usd": 0.5, "input_tokens": 100, "output_tokens": 50,
+        "reasoning_tokens": 9, "total_tokens": 160,
+        "cache_read_tokens": 7, "cache_write_tokens": 3,
+    }
+    log = (tmp_path / "logs" / "opencode-task-1.log").read_text(encoding="utf-8")
+    assert "done: write the report" in log
+
+
+def test_opencode_usage_variants(tmp_path):
+    def _run(mode, tag):
+        os.environ["OC_MODE"] = mode
+        try:
+            return OpenCodeAdapter(_spec("oc", kind="opencode")).run(
+                "p", tmp_path, f"t-{tag}", timeout=30, log_dir=tmp_path / "logs"
+            )
+        finally:
+            del os.environ["OC_MODE"]
+
+    old = _opencode_adapter(tmp_path)
+    try:
+        partial = _run("partial", "partial")      # cost only, tokens null
+        sparse = _run("sparse", "sparse")         # mixed token values, no cache write
+        nocache = _run("nocache", "nocache")      # tokens without a cache key
+        empty = _run("empty", "empty")            # step_finish with empty part
+        nopart = _run("nopart", "nopart")         # step_finish without part
+        garbage = _run("garbage", "garbage")      # non-JSON line before the event
+    finally:
+        os.environ["PATH"] = old
+    assert partial.ok is True and partial.usage == {"cost_usd": 0.5}
+    assert sparse.ok is True and sparse.usage == {"total_tokens": 99, "output_tokens": 12, "reasoning_tokens": 0, "cache_read_tokens": 4}
+    assert nocache.ok is True and nocache.usage == {
+        "cost_usd": 0.1,
+        "total_tokens": 50,
+        "input_tokens": 40,
+        "output_tokens": 10,
+        "reasoning_tokens": 0,
+    }
+    assert empty.ok is True and empty.usage is None
+    assert nopart.ok is True and nopart.usage is None
+    assert garbage.ok is True and garbage.usage == {"cost_usd": 0.25, "total_tokens": 10, "input_tokens": 8, "output_tokens": 2, "reasoning_tokens": 0, "cache_write_tokens": 1}
+
+
+def test_opencode_api_error_fails(tmp_path):
+    old = _opencode_adapter(tmp_path)
+    try:
+        os.environ["OC_MODE"] = "error"
+        result = OpenCodeAdapter(_spec("oc", kind="opencode")).run(
+            "p", tmp_path, "t1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        del os.environ["OC_MODE"]
+        os.environ["PATH"] = old
+    assert result.ok is False and result.exit_code == 1
+    assert "Not authenticated" in (result.error or "")
+
+
+def test_opencode_forwards_model_and_variant(tmp_path):
+    args_file = tmp_path / "args.json"
+    old = _opencode_adapter(tmp_path)
+    try:
+        os.environ["OC_ARGS_FILE"] = str(args_file)
+        result = OpenCodeAdapter(_spec("oc", kind="opencode", model="opencode/big-pickle", effort="high")).run(
+            "hello world", tmp_path, "t1", timeout=30, log_dir=tmp_path / "logs"
+        )
+    finally:
+        del os.environ["OC_ARGS_FILE"]
+        os.environ["PATH"] = old
+    assert result.ok is True
+    sent = json.loads(args_file.read_text(encoding="utf-8"))
+    assert sent == {"model": "opencode/big-pickle", "variant": "high", "prompt": "hello world"}

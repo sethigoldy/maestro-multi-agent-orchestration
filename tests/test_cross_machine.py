@@ -240,7 +240,7 @@ def test_daemon_to_daemon_delegation_with_token(tmp_path, monkeypatch):
         a.registry.save(AgentSpec(name="codex", kind="codex"))
         b.registry.save(AgentSpec(name="remote-a", kind="a2a_remote", command=f"http://127.0.0.1:{a.port}", token=a.token))
 
-        doc = HandoffDoc(title="Cross-machine work", request="Implement it", target_agent="remote-a", verification="none", commit_policy="no-commit")
+        doc = HandoffDoc(title="Cross-machine work", request="Implement it", target_agent="remote-a", explicit_target=True, verification="none", commit_policy="no-commit")
         started = b.delegate(doc, ws_a)
         assert started["queued"] is False
         final = b.wait(started["task_id"], timeout=60)
@@ -266,7 +266,7 @@ def test_daemon_to_daemon_wrong_token_fails_fast(tmp_path, monkeypatch):
     b = MaestroDaemon(state_dir=home_b, start_http=True, port=0, max_retries=0, backoff_s=0)
     try:
         b.registry.save(AgentSpec(name="remote-a", kind="a2a_remote", command=f"http://127.0.0.1:{a.port}", token="wrong-token"))
-        doc = HandoffDoc(title="t", request="r", target_agent="remote-a", verification="none", commit_policy="no-commit")
+        doc = HandoffDoc(title="t", request="r", target_agent="remote-a", explicit_target=True, verification="none", commit_policy="no-commit")
         started = b.delegate(doc, tmp_path)
         final = b.wait(started["task_id"], timeout=30)
         assert final["status"]["state"] == "failed"

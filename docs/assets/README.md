@@ -2,17 +2,23 @@
 
 This directory holds images for the README and release notes.
 
-**No screenshots are checked in yet.** They have not been captured in this
-release cycle, so the README deliberately does not reference any image files.
-Capture them with the steps below and commit them here; then link them from the
-README (task detail + receipt panel as `console-task.png`, the doctor screen as
-`doctor.png`).
+**Checked in:** `demo-v0.10.gif` — a 90-second terminal recording of a real
+`scripts/demo-v0.10.sh` run (doctor → work-mode delegation → verify-fix bounce
+→ durable receipt), embedded in the README. It was produced by driving the
+real CLI through [VHS](https://github.com/charmbracelet/vhs) with the demo's
+output paced to the storyboard in `docs/demo-v0.10.md`; every line shown is
+genuine output from a real run (only the timing is presentation).
+
+**Not captured yet:** the PNG screenshots below have not been taken in this
+release cycle, so the README does not reference them. Capture them with the
+steps below and commit them here; then link them from the README (task detail +
+receipt panel as `console-task.png`, the doctor screen as `doctor.png`).
 
 ## What to capture
 
 | File | Content | Where it comes from |
 | --- | --- | --- |
-| `console-task.png` | Web console: task list with one completed task, detail pane open showing the execution receipt (attempts, verification, gates, final result) | Console while/after `scripts/demo-v0.9.sh` runs |
+| `console-task.png` | Web console: task list with one completed task, detail pane open showing the execution receipt (attempts, verification, gates, final result) | Console while/after `scripts/demo-v0.10.sh` runs |
 | `execution-receipt.png` | Terminal output of `maestro task receipt <id>` for the demo task | Same run, terminal |
 | `doctor.png` | Terminal output of `maestro doctor` in a healthy environment | Any machine with Maestro + one agent CLI installed |
 
@@ -28,14 +34,14 @@ README (task detail + receipt panel as `console-task.png`, the doctor screen as
 2. Run the demo in a terminal you will keep open:
 
    ```sh
-   scripts/demo-v0.9.sh
+   scripts/demo-v0.10.sh
    ```
 
    The script prints the doctor screen, the delegation, and both receipts —
    capture `execution-receipt.png` (and `doctor.png`) from that terminal output.
    Note: the script removes its temp state on exit; for the console shot you want
    the daemon still running, so instead of letting it finish, run the steps by
-   hand (see `docs/demo-v0.9.md`, "Replaying pieces by hand") or re-run the demo
+   hand (see `docs/demo-v0.10.md`, "Replaying pieces by hand") or re-run the demo
    and keep a second copy of the state dir.
 
 3. For `console-task.png`: with the daemon from step 2 still running, open

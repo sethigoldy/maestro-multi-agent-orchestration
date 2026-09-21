@@ -361,8 +361,15 @@ class MaestroDaemon:
         return "codex"
 
     def _agent_known(self, name: str) -> bool:
-        """True when the name resolves to a registered agent or a builtin adapter kind."""
-        return self.registry.get(name) is not None or name in BUILTIN_ADAPTERS
+        """True when the name resolves to a registered agent or a builtin adapter kind.
+
+        Names that are not even valid registry names (bad characters) simply
+        count as unknown — this is a predicate, not a validator.
+        """
+        try:
+            return self.registry.get(name) is not None or name in BUILTIN_ADAPTERS
+        except ValueError:
+            return False
 
     def _apply_work_mode(self, doc: HandoffDoc) -> HandoffDoc:
         """Expand a work-mode preset onto the handoff and validate its routing pins.
@@ -405,13 +412,131 @@ class MaestroDaemon:
         doc.context_entries = [e.to_dict() for e in composed]
         return doc
 
+    # ------------------------------------------------- routing defaults ([defaults])
+    def _apply_defaults(self, doc: HandoffDoc) -> bool:
+        """Fill missing routing from the config ``[defaults]`` table.
+
+        Returns True when a target agent is now resolved (the handoff named one
+        explicitly, or ``[defaults].agent`` supplied it). Returns False when the
+        handoff names no target and no default is configured — the caller must
+        ask the user which agent/model to use instead of guessing.
+
+        ``[defaults].fallback`` fills an empty fallback chain, and
+        ``[defaults].model``/``effort`` are applied to the chosen agent when the
+        handoff does not set them (explicit handoff values always win).
+        """
+        defaults = self.maestro.config.get("defaults") or {}
+        if not doc.explicit_target:
+            agent = defaults.get("agent")
+            if not agent:
+                return False
+            registered = ", ".join(spec.name for spec in self.registry.list()) or "none"
+            if not self._agent_known(agent):
+                raise ValueError(f"Unknown default agent {agent!r} (from [defaults]). Registered agents: {registered}")
+            doc.target_agent = str(agent)
+            doc.explicit_target = True
+        if not doc.fallback and defaults.get("fallback"):
+            doc.fallback = list(defaults["fallback"])
+        model = defaults.get("model")
+        if model and not doc.agent_settings.get("model"):
+            doc.agent_settings["model"] = str(model)
+        effort = defaults.get("effort")
+        if effort and not doc.agent_settings.get("effort"):
+            doc.agent_settings["effort"] = str(effort)
+        return True
+
+    def _routing_question(self) -> str:
+        """The input-required question asked when no agent/model can be resolved.
+
+        Lists every runnable agent: registered ones (with their configured
+        model/version) first, then builtin CLIs discovered on PATH that are not
+        registered yet (the daemon runs them via an implicit spec).
+        """
+        lines = [
+            "No default agent/model is configured for this project and the handoff does not name one.",
+            "Which agent (and model) should run this task? Available agents:",
+        ]
+        listed: set[str] = set()
+        for spec in self.registry.list():
+            status = self.registry.status(spec.name)
+            version = status.get("version") if isinstance(status, dict) else None
+            detail = f" ({version})" if version else ""
+            model_note = f" [model: {spec.model}]" if spec.model else ""
+            lines.append(f"  - {spec.name}{detail}{model_note}")
+            listed.add(spec.kind)
+        for candidate in self.registry.discover():
+            if not candidate["found"] or candidate["kind"] in listed:
+                continue
+            lines.append(f"  - {candidate['name']} (on PATH, not registered)")
+            listed.add(candidate["kind"])
+        lines.append("Answer with the agent name, optionally a model — e.g. 'codex' or 'agent=codex model=gpt-5.6-luna'.")
+        lines.append("To stop being asked, set [defaults] in .maestro/config.toml (keys: agent, fallback, model, effort).")
+        return "\n".join(lines)
+
+    def _parse_routing_answer(self, record: dict[str, Any], answer: str) -> HandoffDoc:
+        """Resolve a routing question's answer into the task's handoff document.
+
+        Accepted forms: JSON ``{"agent": …, "model": …}``; ``key=value`` pairs
+        (``agent=… model=…``); or a bare agent name (first token that matches a
+        registered agent). Raises ValueError with guidance when it cannot resolve
+        to a known agent — the task stays input-required for another answer.
+        """
+        from .handoff import from_dict
+
+        doc = from_dict(record["doc"]) if isinstance(record.get("doc"), dict) else self._doc_from_record(record)
+        text = str(answer).strip()
+        agent: str | None = None
+        model: str | None = None
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                if isinstance(payload.get("agent"), str):
+                    agent = payload["agent"].strip()
+                if isinstance(payload.get("model"), str):
+                    model = payload["model"].strip() or None
+        except (ValueError, TypeError):
+            pass
+        if not agent:
+            match = re.search(r"(?:^|\s)agent\s*[:=]\s*(\S+)", text)
+            if match:
+                agent = match.group(1).strip(".,;")
+        if not model:
+            match = re.search(r"(?:^|\s)model\s*[:=]\s*(\S+)", text)
+            if match:
+                model = match.group(1).strip(".,;")
+        if not agent:
+            tokens = [t.strip(".,;") for t in text.split() if t.strip(".,;")]
+            for candidate in tokens:
+                if self._agent_known(candidate):
+                    agent = candidate
+                    break
+            else:
+                # A bare name we do not know: report it as unknown rather than
+                # "could not determine", so the user sees exactly what was tried.
+                if len(tokens) == 1:
+                    agent = tokens[0]
+        registered = ", ".join(spec.name for spec in self.registry.list()) or "none"
+        if not agent:
+            raise ValueError(
+                f"Could not determine an agent from answer {answer!r}; "
+                f"use e.g. 'codex' or 'agent=codex model=gpt-5.6-luna'. Registered agents: {registered}"
+            )
+        if not self._agent_known(agent):
+            raise ValueError(f"Unknown agent {agent!r}. Registered agents: {registered}")
+        doc.target_agent = agent
+        doc.explicit_target = True
+        if model:
+            doc.agent_settings["model"] = model
+        return doc
+
     def delegate(self, doc: HandoffDoc, workspace: str | Path) -> dict[str, Any]:
         from .handoff import validate_handoff
 
         doc = validate_handoff(doc)
         doc = self._apply_work_mode(doc)
         doc = self._apply_context(doc)
-        if doc.target_agent == doc.origin_agent:
+        routing_resolved = self._apply_defaults(doc)
+        if routing_resolved and doc.target_agent == doc.origin_agent:
             raise ValueError(
                 f"Agent {doc.target_agent!r} cannot delegate to itself (no self-review/self-delegation); "
                 "pick a different target or add a fallback agent"
@@ -446,6 +571,13 @@ class MaestroDaemon:
         if doc.sensitive:
             # Governance: sensitive workspaces pause for approval before any agent runs.
             self._set_state(task_id, STATE_INPUT_REQUIRED, question="Approval required: this task targets a sensitive workspace.")
+            return {"task_id": task_id, "queued": False, "state": STATE_INPUT_REQUIRED, "ts": utcnow_iso()}
+        if not routing_resolved:
+            # No explicit target and no [defaults]: ask the user which agent/model
+            # to use instead of silently guessing (resume via answer_question).
+            record["awaiting"] = "routing"
+            self._persist(task_id, doc)
+            self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
             return {"task_id": task_id, "queued": False, "state": STATE_INPUT_REQUIRED, "ts": utcnow_iso()}
         thread = threading.Thread(target=self._run_task, args=(task_id, doc, ws), daemon=True)
         thread.start()
@@ -506,6 +638,11 @@ class MaestroDaemon:
         self._set_state(task_id, STATE_SUBMITTED)
         if doc.sensitive:
             self._set_state(task_id, STATE_INPUT_REQUIRED, question="Approval required: this task targets a sensitive workspace.")
+            return
+        if not self._apply_defaults(doc):
+            record["awaiting"] = "routing"
+            self._persist(task_id, doc)
+            self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
             return
         thread = threading.Thread(target=self._run_task, args=(task_id, doc, ws), daemon=True)
         thread.start()
@@ -981,6 +1118,22 @@ class MaestroDaemon:
         if not str(answer).strip():
             raise ValueError("Answer cannot be empty")
         doc = self._doc_from_record(record)
+        if record.get("awaiting") == "routing":
+            # The task is parked on the routing question: the answer selects the
+            # agent/model, then the task starts. A bad answer raises and leaves
+            # the task input-required for another attempt.
+            doc = self._parse_routing_answer(record, answer)
+            record["doc"] = doc.to_dict()
+            record["target_agent"] = doc.target_agent
+            record.pop("awaiting", None)
+            self._persist(task_id, doc)
+        elif not self._apply_defaults(doc):
+            # Parked for another reason (e.g. sensitive approval) while routing was
+            # never resolved: ask now instead of running under a guessed target.
+            record["awaiting"] = "routing"
+            self._persist(task_id, doc)
+            self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
+            return {"task_id": task_id, "state": STATE_INPUT_REQUIRED}
         workspace = Path(record["workspace"])
         record_transcript_answer(self._tasks.get(task_id), answer)
         thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace), daemon=True)

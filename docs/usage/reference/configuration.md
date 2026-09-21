@@ -16,6 +16,26 @@ The project root is the git common directory's parent when available, else the
 workspace itself. Unreadable or unparsable files are skipped silently; an
 invalid value that *is* read raises an error (e.g. unsupported effort).
 
+### `[defaults]` — routing defaults
+
+```toml
+[defaults]
+agent    = "codex"          # default implementation agent
+fallback = ["claude_code"]  # optional fallback chain (list of agent names)
+model    = "gpt-5.6-luna"   # optional; applied when the handoff sets none
+effort   = "max"            # optional: low | medium | high | xhigh | max
+```
+
+Consulted at delegate time when a handoff names no target agent: `agent`
+becomes the task's target (as if explicitly chosen), `fallback` fills an empty
+fallback chain, and `model`/`effort` are applied to the chosen agent only when
+the handoff does not set them. An explicit handoff target always wins over
+`[defaults].agent`. If neither the handoff nor `[defaults]` names an agent,
+the task parks in state `input-required` with a question listing every
+available agent; answer it via MCP `answer_task_question` (a bare agent name,
+`agent=… model=…` pairs, or JSON). Unknown keys and invalid values are errors
+at daemon start. Shown by `maestro config`.
+
 ### `[codex]`
 
 ```toml
