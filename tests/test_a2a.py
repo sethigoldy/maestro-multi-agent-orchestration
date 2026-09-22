@@ -52,6 +52,12 @@ class FakeDaemon:
         self.calls.append(("cancel", task_id, reason))
         return {"task_id": task_id, "state": "canceled"}
 
+    def followup(self, task_id, instruction, context_mode="reuse"):
+        if task_id == "task-shallow":
+            raise ValueError("Max delegation depth exceeded")
+        self.calls.append(("followup", task_id, instruction, context_mode))
+        return {"task_id": task_id, "state": "submitted"}
+
 
 def _dispatch():
     return A2ADispatcher(FakeDaemon())
@@ -205,6 +211,48 @@ def test_send_data_part_without_sections_falls_back_to_text():
 def test_tasks_cancel_empty_id():
     resp = _dispatch().handle(_req("tasks/cancel", {"id": ""}))
     assert resp["error"]["code"] == ERR_INVALID_PARAMS
+
+
+# ------------------------------------------------------------------ tasks/followup
+def test_tasks_followup_happy_path_defaults_to_reuse():
+    daemon = FakeDaemon()
+    dispatcher = A2ADispatcher(daemon)
+    resp = dispatcher.handle(_req("tasks/followup", {"id": "task-1", "instruction": "keep going"}))
+    assert "result" in resp, resp
+    assert resp["result"]["task"]["id"] == "task-1"
+    assert daemon.calls[0] == ("followup", "task-1", "keep going", "reuse")
+
+
+def test_tasks_followup_passes_context_mode():
+    daemon = FakeDaemon()
+    dispatcher = A2ADispatcher(daemon)
+    resp = dispatcher.handle(_req("tasks/followup", {"id": "task-1", "instruction": "clean turn", "context_mode": "fresh"}))
+    assert "result" in resp, resp
+    assert daemon.calls[0][3] == "fresh"
+
+
+def test_tasks_followup_param_errors():
+    dispatcher = _dispatch()
+    for params in (
+        {},  # no id
+        {"id": ""},
+        {"id": 7, "instruction": "x"},
+        {"id": "task-1"},  # no instruction
+        {"id": "task-1", "instruction": "   "},
+        {"id": "task-1", "instruction": "x", "context_mode": "sometimes"},
+    ):
+        resp = dispatcher.handle(_req("tasks/followup", params))
+        assert resp["error"]["code"] == ERR_INVALID_PARAMS, (params, resp)
+
+
+def test_tasks_followup_unknown_task():
+    resp = _dispatch().handle(_req("tasks/followup", {"id": "missing", "instruction": "x"}))
+    assert resp["error"]["code"] == ERR_TASK_NOT_FOUND
+
+
+def test_tasks_followup_depth_guard_maps_to_param_error():
+    resp = _dispatch().handle(_req("tasks/followup", {"id": "task-shallow", "instruction": "one more"}))
+    assert resp["error"]["code"] == ERR_INVALID_PARAMS and "depth" in resp["error"]["message"].lower()
 
 
 def test_send_retargets_unresolvable_hop_name_to_local_default():

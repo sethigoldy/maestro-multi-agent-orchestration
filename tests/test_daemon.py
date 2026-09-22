@@ -51,12 +51,37 @@ def _doc(**kw) -> HandoffDoc:
     return HandoffDoc(**base)
 
 
+def _drain_workers(daemon: MaestroDaemon | None = None, timeout_s: float = 3.0) -> None:
+    """Neutralize in-flight turns before the daemon stops.
+
+    ``MaestroDaemon.stop()`` does not join in-flight turns. A worker whose task
+    is canceled can no longer do post-completion work (verification/gate spawns)
+    once its agent process exits, so teardown cancels every non-terminal task
+    and gives already-running turns a brief moment to observe the flag. Without
+    this, a slow fake agent from this test would finish under the *next* test's
+    PATH and spawn verification/review agents against that test's fixtures."""
+    if daemon is None:
+        return
+    for tid, rec in list(daemon._tasks.items()):
+        if rec.get("state") not in ("completed", "failed", "canceled"):
+            try:
+                daemon.cancel(tid, reason="test teardown")
+            except (KeyError, ValueError):
+                pass
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not any("_run_task" in (t.name or "") for t in threading.enumerate()):
+            return
+        time.sleep(0.05)
+
+
 @pytest.fixture
 def daemon(tmp_path, monkeypatch):
     home = tmp_path / "home"
     monkeypatch.setenv("MAESTRO_HOME", str(home))
     d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
     yield d
+    _drain_workers(d)
     d.stop()
 
 
@@ -477,6 +502,7 @@ def test_mcp_tools_end_to_end(tmp_path, monkeypatch):
         assert "error" in canceled
     finally:
         if dm._instance is not None:
+            _drain_workers(dm._instance)
             dm._instance.stop()
         dm._instance = old
 
@@ -773,6 +799,7 @@ def test_mcp_answer_task_question_and_error_paths(tmp_path, monkeypatch):
         assert "error" in wrong_state  # no longer awaiting input
     finally:
         if dm._instance is not None:
+            _drain_workers(dm._instance)
             dm._instance.stop()
         dm._instance = old
 
@@ -790,6 +817,7 @@ def test_mcp_agents_list_with_registered_agent(tmp_path, monkeypatch):
         assert listing[0]["name"] == "codex" and "status" in listing[0]
     finally:
         if dm._instance is not None:
+            _drain_workers(dm._instance)
             dm._instance.stop()
         dm._instance = old
 
@@ -884,6 +912,7 @@ def test_mcp_cancel_unknown_task(tmp_path, monkeypatch):
         assert "error" in out2
     finally:
         if dm._instance is not None:
+            _drain_workers(dm._instance)
             dm._instance.stop()
         dm._instance = old
 
@@ -1083,6 +1112,260 @@ def test_followup_depth_guard(daemon, tmp_path, binpath):
         daemon.followup(started["task_id"], "one more")
 
 
+# ------------------------------------------------------------------ M3b: task continuation + knowledge
+def _prompt_capture_bin(binpath: Path, log: Path) -> None:
+    """Fake agent that appends each prompt it receives to `log`, delimited.
+
+    It also prints a 2000-char line on stdout (longer than the 1500-char
+    latest-summary tail), so tests can prove raw turn output is stored
+    durably but only its bounded tail reaches later prompts. Every spawn is
+    additionally recorded in `log`.spawns with its MAESTRO_TASK_ID and a
+    timestamp, which pinpoints any unexpected agent launches.
+
+    Preflight probes (``codex --version``, ``codex exec --help``) exit before
+    touching the log: they inherit the test process's stdin and would otherwise
+    append foreign entries that shift prompt counts under timing changes."""
+    _fake_bin(
+        binpath, "codex",
+        f'if [ "$1" = "--version" ]; then exit 0; fi\n'
+        f'if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then exit 0; fi\n'
+        f"cat >> {log}\necho '===PROMPT-SEP===' >> {log}\nhead -c 2000 /dev/zero | tr '\\0' 'A'\n"
+        f"echo \"$(date +%s.%N) $MAESTRO_TASK_ID argv=[$*]\" >> {log}.spawns\nexit 0",
+    )
+
+
+def _prompts(log: Path) -> list[str]:
+    return [p for p in log.read_text(encoding="utf-8").split("===PROMPT-SEP===") if p.strip()]
+
+
+def test_knowledge_claim_written_on_terminal_state(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="OAuth work", request="Implement OAuth with refresh tokens"), ws)
+    tid = started["task_id"]
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    claims = daemon.maestro._claims(tid)
+    knowledge = json.loads(claims["task_knowledge"])
+    assert knowledge["schema_version"] == 1 and knowledge["goal"] == "Implement OAuth with refresh tokens"
+    assert knowledge["source_turn"] == 1 and knowledge["task_id"] == tid
+
+
+def test_followup_reuse_injects_task_knowledge(daemon, tmp_path, binpath):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="OAuth work", request="Implement OAuth with refresh tokens"), ws)
+    tid = started["task_id"]
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    result = daemon.followup(tid, "Fix the failing refresh-token test")
+    assert result["state"] == "submitted"
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 2
+    first, second = prompts
+    assert "TASK KNOWLEDGE" not in first  # turn one has no accumulated knowledge yet
+    assert "TASK KNOWLEDGE" in second
+    assert "Implement OAuth with refresh tokens" in second  # goal projected from durable state
+    assert "Fix the failing refresh-token test" in second  # new instruction travels as the request
+    # Raw turn output is stored durably but only its bounded tail is replayed:
+    assert "A" * 2000 not in second and "[truncated" in second
+
+    stats = daemon._tasks[tid]["context_stats"]
+    assert stats["mode"] == "reuse" and stats["context_chars"] > 0
+    assert stats["knowledge_chars"] > 0
+    assert stats["estimated_tokens"] == max(1, stats["context_chars"] // 4)
+    assert isinstance(stats["raw_history_bytes"], int) and stats["raw_history_bytes"] > 0
+    if stats["raw_history_bytes"] > 0 and stats["context_chars"] > 0:
+        assert stats["reduction_ratio"] == round(1 - stats["context_chars"] / stats["raw_history_bytes"], 3)
+
+
+def test_followup_fresh_mode_skips_knowledge(daemon, tmp_path, binpath):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="fresh work"), ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+
+    daemon.followup(tid, "clean context turn", context_mode="fresh")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 2 and "TASK KNOWLEDGE" not in prompts[1]
+    assert "clean context turn" in prompts[1]
+    stats = daemon._tasks[tid]["context_stats"]
+    assert stats["mode"] == "fresh" and "context_chars" not in stats
+
+
+def test_followup_invalid_context_mode(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    record_id = "task-19700101-000000-deadbe"
+    with pytest.raises(ValueError, match="context_mode"):
+        daemon.followup(record_id, "x", context_mode="sometimes")
+
+
+def test_followup_stale_knowledge_entry_replaced(daemon, tmp_path, binpath):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="chain", max_depth_remaining=5), ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+    daemon.followup(tid, "turn two")
+    daemon.wait(tid, timeout=60)
+    daemon.followup(tid, "turn three")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 3
+    for prompt in (prompts[1], prompts[2]):
+        assert prompt.count("TASK KNOWLEDGE") == 1  # fresh snapshot each turn, never stacked
+
+
+def test_followup_carries_composed_context_entries(daemon, tmp_path, binpath):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    doc = _doc(title="carry", context_entries=[{"label": "notes", "kind": "text", "text": "CARRY-ME-SENTINEL"}])
+    started = daemon.delegate(doc, ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+
+    daemon.followup(tid, "keep carrying")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 2
+    assert "CARRY-ME-SENTINEL" in prompts[0] and "CARRY-ME-SENTINEL" in prompts[1]
+
+
+def test_followup_after_restart_reconstructs_from_claims(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="durable"), ws)
+    tid = started["task_id"]
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    d2 = MaestroDaemon(state_dir=daemon.state_dir, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        assert tid not in d2._tasks  # fresh process memory
+        d2.followup(tid, "post-restart work")
+        assert d2.wait(tid, timeout=60)["status"]["state"] == "completed"
+        record = d2._tasks[tid]
+        assert record["turn"] == 2
+        assert record["transcript"] == []  # transcript was never durable (pre-existing)
+        assert record["workspace"] == str(ws)
+        with pytest.raises(KeyError):
+            d2.followup("task-19700101-000000-deadbe", "x")
+    finally:
+        d2.stop()
+
+
+def test_followup_depth_guard_applies_after_restart(daemon, tmp_path, binpath):
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="depth2", max_depth_remaining=2), ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+    daemon.followup(tid, "one more")  # consumes one depth unit (2 -> 1)
+    daemon.wait(tid, timeout=60)
+
+    d2 = MaestroDaemon(state_dir=daemon.state_dir, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        with pytest.raises(ValueError, match="depth"):
+            d2.followup(tid, "one more still")  # reconstructed doc has depth 1 -> follow-up would be 0
+    finally:
+        d2.stop()
+
+
+def test_followup_continuation_disabled_via_config(daemon, tmp_path, binpath):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="disabled"), ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+
+    daemon.maestro.config["continuation"] = {"enabled": False, "max_tokens": 6000}
+    daemon.followup(tid, "no knowledge please")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 2
+    assert "TASK KNOWLEDGE" not in prompts[1]
+    assert "context_stats" not in daemon._tasks[tid]
+
+
+def test_followup_env_budget_override(daemon, tmp_path, binpath, monkeypatch):
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(title="tiny budget"), ws)
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+
+    monkeypatch.setenv("MAESTRO_CONTINUATION_MAX_TOKENS", "1")  # 4 chars: header alone cannot fit
+    daemon.followup(tid, "budgeted turn")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+
+    prompts = _prompts(log)
+    assert len(prompts) == 2 and "TASK KNOWLEDGE" not in prompts[1]
+    stats = daemon._tasks[tid]["context_stats"]
+    assert stats["mode"] == "reuse" and stats["context_chars"] == 0
+
+
+def test_refresh_knowledge_no_claims_returns_none(daemon):
+    assert daemon._refresh_knowledge("task-20260101-000000-noclaims") is None
+
+
+def test_refresh_knowledge_tolerates_malformed_runtime_claim(daemon):
+    tid = "task-20260101-000000-badruntime"
+    daemon.maestro._register_task(tid, "Broken", 1)
+    daemon.maestro._write_claim(tid, "task_request", "do it")
+    daemon.maestro._write_claim(tid, "task_workspace", "/ws/x")
+    daemon.maestro._write_claim(tid, "task_runtime", "{not valid json")
+    knowledge = daemon._refresh_knowledge(tid)
+    assert knowledge is not None and knowledge.goal == "do it"  # runtime degrades to empty
+
+
+def test_durable_record_tolerates_malformed_runtime_claim(daemon):
+    tid = "task-20260101-000000-badruntime2"
+    daemon.maestro._register_task(tid, "Broken", 2)
+    daemon.maestro._write_claim(tid, "task_workspace", "/ws/y")
+    daemon.maestro._write_claim(tid, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(tid, "task_runtime", "{not valid json")
+    record = daemon._durable_record(tid)
+    assert record is not None and record["state"] == "completed"  # phase fallback
+    assert record["turn"] == 0 and record["transcript"] == []
+
+
+def test_durable_record_without_runtime_claim(daemon):
+    """Workspace claim but no runtime snapshot at all: plain phase-driven record."""
+    tid = "task-20260101-000000-noruntime"
+    daemon.maestro._register_task(tid, "No runtime", 3)
+    daemon.maestro._write_claim(tid, "task_workspace", "/ws/z")
+    record = daemon._durable_record(tid)
+    assert record is not None and record["state"] == "working"  # no phase claim either
+    assert record["attempts"] == [] and record["turn"] == 0
+
+
+def test_durable_record_unknown_task_returns_none(daemon):
+    assert daemon._durable_record("task-20260101-000000-ghost") is None
+
+
+def test_raw_history_bytes_missing_dir_and_unreadable_entry(daemon):
+    assert daemon._raw_history_bytes("task-20260101-000000-nodir") == 0
+    tid = "task-20260101-000000-bytes"
+    task_dir = daemon.state_dir / "tasks" / tid
+    task_dir.mkdir(parents=True)
+    (task_dir / "a.txt").write_text("hello", encoding="utf-8")
+    (task_dir / "broken-link").symlink_to("/nonexistent/maestro-test-target")
+    assert daemon._raw_history_bytes(tid) == 5  # the broken symlink is skipped, not counted
+
+
 def test_delegate_rejects_self_delegation(daemon, tmp_path):
     ws = _git_repo(tmp_path)
     doc = _doc(title="selfish", target_agent="codex", origin_agent="codex")
@@ -1159,6 +1442,7 @@ def test_mcp_followup_and_self_delegation_errors(tmp_path, monkeypatch):
         assert "error" in rejected and "itself" in rejected["error"]
     finally:
         if dm._instance is not None:
+            _drain_workers(dm._instance)
             dm._instance.stop()
         dm._instance = old
 
@@ -1176,7 +1460,7 @@ def test_mcp_tools_keep_stable_signatures():
         "agents_list": [],
         "cancel_task": ["workspace", "task_id", "reason"],
         "answer_task_question": ["workspace", "task_id", "answer"],
-        "followup": ["workspace", "task_id", "instruction"],
+        "followup": ["workspace", "task_id", "instruction", "context_mode"],
     }
     for name, params in expected.items():
         sig = list(inspect.signature(getattr(mcp_server, name)).parameters)

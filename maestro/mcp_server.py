@@ -134,15 +134,22 @@ def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
 
 
 @mcp.tool()
-def followup(workspace: str, task_id: str, instruction: str) -> str:
+def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str:
     """Send a follow-up instruction to a finished task (completed/failed/canceled).
-    The same agent resumes on the same task branch with the new instruction and
-    its previous Q&A in context — unless the task's handoff pins a fixer agent,
-    in which case the follow-up runs under it. Blocks until the follow-up turn
-    finishes or needs input — no polling."""
+    The same agent resumes on the same task branch with the new instruction —
+    unless the task's handoff pins a fixer agent, in which case the follow-up
+    runs under it.
+
+    context_mode: 'reuse' (default) injects a compact task-knowledge snapshot
+    (goal, current state, files changed, latest verification result and failures,
+    known issues) so the agent continues without re-discovering the work; raw
+    history stays in the durable record and is never replayed. 'fresh' skips the
+    snapshot for a clean reasoning context (same task/workspace/branch).
+
+    Blocks until the follow-up turn finishes or needs input — no polling."""
     d = get_daemon()
     try:
-        started = d.followup(d.resolve(task_id), instruction)
+        started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
     except ValueError as exc:

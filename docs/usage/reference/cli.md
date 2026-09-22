@@ -139,6 +139,7 @@ maestro task show <task-id|number>        # alias of status
 maestro task tail <task-id> [--all]
 maestro task audit <task-id>
 maestro task receipt <task-id|number> [--json]
+maestro task continue <task-id> --request "new instruction" [--context reuse|fresh] [--no-wait]
 ```
 
 Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
@@ -150,7 +151,8 @@ Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
 | `status` / `show` | Prints one task's state as JSON (see [Inspect tasks and artifacts](../how-to/inspect-tasks-and-artifacts.md#read-one-tasks-state) for the fields). Accepts a full task id or a numeric task number. Unknown references exit 2 |
 | `tail` | Live-follows one task's event stream over SSE (no polling). `--all` follows the global stream instead of one task; with `--all` the exit code is always 0 (absent Ctrl-C) |
 | `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), the composed context entries (`context`, with their sources), accumulated usage, error, and parsed result files. Works after daemon restarts |
-| `receipt` | Prints the **execution receipt** — a human-readable summary (or stable JSON with `--json`) of what happened on one task: final state; per-attempt phase, agent, duration, cost, and ok/error; the deterministic verification result and command; work-mode gate verdicts and bounce count; and totals (wall-clock or attempt-sum duration, aggregated cost when any attempt reported one). The receipt is a projection of the durable task state — it works for running, completed, failed, and canceled tasks alike, and after daemon restarts. If a daemon is reachable the receipt is served over its API (`GET /tasks/<id>/receipt`); otherwise it is built locally from the state directory. Unknown references exit 2 when no daemon can answer |
+| `receipt` | Prints the **execution receipt** — a human-readable summary (or stable JSON with `--json`) of what happened on one task: final state; per-attempt phase, agent, duration, cost, and ok/error; the deterministic verification result and command; work-mode gate verdicts and bounce count; totals (wall-clock or attempt-sum duration, aggregated cost when any attempt reported one), plus turn count, task-knowledge schema metadata, and continuation context stats for continued tasks. The receipt is a projection of the durable task state — it works for running, completed, failed, and canceled tasks alike, and after daemon restarts. If a daemon is reachable the receipt is served over its API (`GET /tasks/<id>/receipt`); otherwise it is built locally from the state directory. Unknown references exit 2 when no daemon can answer |
+| `continue` | Continues a finished task (completed/failed/canceled) with a new instruction: the same task id, workspace, branch, and routing resume — the follow-up turn runs under the handoff's fixer agent when one is pinned. `--context reuse` (default) injects the compact [task-knowledge snapshot](../reference/configuration.md#continuation--task-continuation-context); `--context fresh` starts a clean reasoning context. Blocks and streams the turn like `delegate` unless `--no-wait` prints the submission JSON and returns immediately. Requires a reachable daemon; unknown tasks or exhausted delegation depth exit 2 |
 
 ## dashboard
 

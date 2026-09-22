@@ -92,6 +92,8 @@ def test_migration_idempotent(tmp_path, monkeypatch):
 
 def test_normalize_short_form():
     assert _normalize_argv(['task','abc'])==['task','status','abc']; assert _normalize_argv(['maestro','task','abc'])==['maestro','task','status','abc']; assert _normalize_argv(['task','list'])==['task','list']
+    # 'continue' is a real subcommand, not a bare task id: it must not be rewritten to status.
+    assert _normalize_argv(['task','continue','task-1','--request','x'])==['task','continue','task-1','--request','x']
 
 def test_default_user_home_and_windows(monkeypatch, tmp_path):
     from maestro import core

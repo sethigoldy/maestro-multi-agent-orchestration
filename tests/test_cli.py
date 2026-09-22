@@ -188,6 +188,63 @@ def test_delegate_mode_requires_title_and_request(monkeypatch, tmp_path):
     assert rc == 2
 
 
+def _followup_capture(monkeypatch, result=None, stream_rc=0):
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
+    captured = {}
+
+    def fake_post(url, method, payload, token=None):
+        captured["method"] = method
+        captured["payload"] = payload
+        return result if result is not None else {"task": {"id": "task-c"}}
+
+    def fake_stream(url, task_id, token=None):
+        captured["streamed"] = task_id
+        return stream_rc
+
+    monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
+    monkeypatch.setattr(cli, "_stream_task", fake_stream)
+    return captured
+
+
+def test_task_continue_posts_followup_and_streams(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _followup_capture(monkeypatch)
+    rc = cli.main(["task", "continue", "task-c", "--request", "keep going"])
+    assert rc == 0
+    assert captured["method"] == "tasks/followup"
+    assert captured["payload"] == {"id": "task-c", "instruction": "keep going", "context_mode": "reuse"}
+    assert captured.get("streamed") == "task-c"
+    out = capsys.readouterr().out
+    assert "[task] task-c — continuation (context=reuse) resuming" in out
+
+
+def test_task_continue_fresh_context_flag(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _followup_capture(monkeypatch)
+    rc = cli.main(["task", "continue", "task-c", "--request", "clean turn", "--context", "fresh"])
+    assert rc == 0
+    assert captured["payload"]["context_mode"] == "fresh"
+    assert "context=fresh" in capsys.readouterr().out
+
+
+def test_task_continue_no_wait_prints_json(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _followup_capture(monkeypatch)
+    rc = cli.main(["task", "continue", "task-c", "--request", "x", "--no-wait"])
+    assert rc == 0
+    assert "streamed" not in captured
+    assert json.loads(capsys.readouterr().out)["task"]["id"] == "task-c"
+
+
+def test_task_continue_error_result_prints_json(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _followup_capture(monkeypatch, result={"error": {"code": -32004, "message": "Unknown task"}})
+    rc = cli.main(["task", "continue", "task-gone", "--request", "x"])
+    assert rc == 0
+    assert "streamed" not in captured
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == -32004
+
+
 def test_config_lists_modes(monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
@@ -211,6 +268,31 @@ def test_config_without_modes_key(monkeypatch, tmp_path, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["modes"] == {}
+
+
+def test_config_lists_continuation(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    (home / "config.toml").write_text(
+        "[continuation]\nenabled = false\nmax_tokens = 900\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["config"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["continuation"] == {"enabled": False, "max_tokens": 900}
+
+
+def test_config_continuation_defaults(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    rc = cli.main(["config"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["continuation"] == {"enabled": True, "max_tokens": 6000}
 
 
 def test_delegate_context_flags_in_payload(monkeypatch, tmp_path):

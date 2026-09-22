@@ -204,10 +204,12 @@ You own the final review decision:
 3. If the result is acceptable, report it to the user (files changed, evidence,
    how to verify).
 4. If not, send a fix pass **through Maestro** instead of editing the code
-   yourself: MCP `followup` with the task id and a precise instruction (the CLI
-   has no followup command — re-delegating the same workspace is the CLI
-   equivalent). Repeat at most a few times; if fixes do not converge, stop and
-   report the blocker to the user.
+   yourself: MCP `followup` with the task id and a precise instruction, or the
+   CLI equivalent `maestro task continue <task-id> --request "…"` (both reuse
+   the same task, workspace, branch, and routing; both inject a compact
+   task-knowledge snapshot by default — pass `--context fresh` /
+   `context_mode="fresh"` for a clean reasoning context). Repeat at most a few
+   times; if fixes do not converge, stop and report the blocker to the user.
 
 ## 8. Fallback when Maestro is unavailable
 
@@ -362,8 +364,8 @@ When your environment exposes the Maestro MCP server, these tools are available
   task object (state, artifacts, workspace/branch metadata). If the workspace
   already has an active task you get `{"queued": true, …}` immediately. Routing
   defaults and the input-required question behave exactly as in section 3.
-- **`followup(workspace, task_id, instruction)`** — send a precise fix pass to a
-  finished/failed task; blocks until that follow-up turn settles.
+- **`followup(workspace, task_id, instruction, context_mode="reuse")`** — send a precise fix pass to a
+  finished/failed task; blocks until that follow-up turn settles. `context_mode="reuse"` (default) injects the compact task-knowledge snapshot; `"fresh"` starts a clean reasoning context.
 - **`task_wait(workspace, task_id)`** — block on an earlier (e.g. queued or
   `--no-wait`) task until it reaches a terminal state or needs input.
 - **`task_status(workspace, task_id)`** — current status object (state, question

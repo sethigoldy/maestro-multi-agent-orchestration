@@ -41,6 +41,7 @@ CLI_COMMANDS = (
     "task status",
     "task tail",
     "task audit",
+    "task continue",
     "dashboard",
     "agents add",
     "agents discover",
@@ -82,6 +83,7 @@ ENV_VARS = (
     "MAESTRO_DISCOVERY",
     "MAESTRO_NODE_NAME",
     "MAESTRO_STORAGE",
+    "MAESTRO_CONTINUATION_MAX_TOKENS",
 )
 
 

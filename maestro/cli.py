@@ -41,7 +41,7 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
-    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt"}
+    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue"}
     if len(argv) >= 2 and argv[0] == "task":
         subcommand = argv[1]
         if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
@@ -315,6 +315,25 @@ def _cmd_task_receipt(args: argparse.Namespace) -> int:
         m.close()
 
 
+def _cmd_task_continue(args: argparse.Namespace) -> int:
+    url, token = _daemon_endpoint()
+    result = _post_jsonrpc(
+        url, "tasks/followup",
+        {"id": args.task_id, "instruction": args.request, "context_mode": args.context},
+        token=token,
+    )
+    task = (result or {}).get("task") or {}
+    task_id = task.get("id")
+    if not task_id:
+        print(json.dumps(result, indent=2))
+        return 0
+    if args.no_wait:
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"[task] {task_id} — continuation (context={args.context}) resuming", flush=True)
+    return _stream_task(url, task_id, token=token)
+
+
 def _cmd_doctor(args: argparse.Namespace) -> int:
     from .doctor import format_doctor, run_doctor
 
@@ -544,6 +563,15 @@ def main(argv: list[str] | None = None) -> int:
     task_receipt = task_sub.add_parser("receipt", help="Show the execution receipt (attempts, verification, gates, totals)")
     task_receipt.add_argument("task_id")
     task_receipt.add_argument("--json", action="store_true", dest="as_json", help="Machine-readable JSON receipt")
+    task_continue = task_sub.add_parser(
+        "continue",
+        help="Continue a finished task with a new instruction (reuses the same task, workspace, branch, and routing; compact task-knowledge context by default)",
+    )
+    task_continue.add_argument("task_id")
+    task_continue.add_argument("--request", required=True, help="The new instruction for this turn")
+    task_continue.add_argument("--context", choices=("reuse", "fresh"), default="reuse",
+                               help="'reuse' injects the compact task-knowledge snapshot (default); 'fresh' starts a clean reasoning context")
+    task_continue.add_argument("--no-wait", action="store_true", help="Return as soon as the turn is submitted (no SSE streaming)")
 
     d = sub.add_parser("delegate", help="Delegate a handoff to any registered agent via the local daemon")
     d.add_argument("--file", default=None, help="Handoff document file (TOML or JSON)")
@@ -663,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_audit(args)
         if args.cmd == "task" and args.task_cmd == "receipt":
             return _cmd_task_receipt(args)
+        if args.cmd == "task" and args.task_cmd == "continue":
+            return _cmd_task_continue(args)
         if args.cmd == "doctor":
             return _cmd_doctor(args)
         if args.cmd == "daemon":
@@ -730,7 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "config":
                 modes = {name: preset.to_dict() for name, preset in (m.config.get("modes") or {}).items()}
                 context = {label: entry.to_dict() for label, entry in (m.config.get("context") or {}).items()}
-                print(json.dumps({**m.codex_defaults(), "defaults": m.config.get("defaults") or {}, "modes": modes, "context": context}, indent=2)); return 0
+                print(json.dumps({**m.codex_defaults(), "defaults": m.config.get("defaults") or {}, "modes": modes, "context": context, "continuation": m.config.get("continuation") or {}}, indent=2)); return 0
             raise AssertionError("unhandled command")  # pragma: no cover
         finally:
             m.close()
