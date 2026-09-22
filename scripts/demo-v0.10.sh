@@ -56,7 +56,9 @@ echo "# demo repo" > "$WS/README.md"
 git -C "$WS" add . && git -C "$WS" commit -qm "initial"
 
 # --- fake agents -------------------------------------------------------------
-# Implementer (also the fixer): streams one line, reports a small usage cost.
+# Implementer (also the fixer): streams one line, reports a small usage cost,
+# and leaves a real working-tree change — the deterministic fallback verifier
+# (`git diff --check`) requires evidence of work before it can certify.
 # Like a real CLI it answers --version without side effects (Maestro's preflight
 # probes run `<binary> --version` before every turn and before doctor's check).
 IMPL="$WORK/demo-impl.sh"
@@ -69,6 +71,7 @@ fi
 cat > /dev/null
 echo "implementing the change..."
 echo '{"cost_usd": 0.15}'
+echo "- health-check endpoint" >> README.md
 exit 0
 EOF
 chmod +x "$IMPL"
