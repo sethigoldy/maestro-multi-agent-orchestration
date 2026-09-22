@@ -101,7 +101,7 @@ def test_installed_maestro_mcp_speaks_mcp_over_stdio():
 
 def test_version_is_090_and_single_sourced():
     data = _pyproject()
-    assert data["project"]["version"] == "0.10.0"
+    assert data["project"]["version"] == "0.11.0"
     from maestro import VERSION
 
     assert VERSION == data["project"]["version"], (
@@ -146,10 +146,43 @@ def test_web_console_assets_exist_and_are_nonempty():
 
 
 def test_release_scripts_exist_and_are_executable():
-    for script in ("smoke-fake-agent.sh", "validate-package.sh", "demo-v0.10.sh"):
+    for script in (
+        "smoke-fake-agent.sh",
+        "validate-package.sh",
+        "demo-v0.10.sh",
+        "demo-gif-setup.sh",
+        "demo-gif-build-vhs.sh",
+    ):
         path = REPO_ROOT / "scripts" / script
         assert path.is_file(), f"scripts/{script} missing"
         if sys.platform != "win32":
             import os
 
             assert os.access(path, os.X_OK), f"scripts/{script} is not executable"
+
+
+def test_demo_gif_build_vhs_keeps_recording_fixes():
+    """scripts/demo-gif-build-vhs.sh must keep both patches that make the demo
+    GIF re-recordable (see docs/assets/README.md): the ffmpeg context detach
+    and the xterm.js renderer no-pause/refresh hooks. Without them, upstream
+    VHS either exits without writing the GIF or drops lines nondeterministically."""
+    path = REPO_ROOT / "scripts" / "demo-gif-build-vhs.sh"
+    assert path.is_file(), "scripts/demo-gif-build-vhs.sh missing"
+    text = path.read_text(encoding="utf-8")
+    assert 'exec.Command(' in text, "script must patch the ffmpeg CommandContext bug"
+    assert "_isPaused" in text, "script must neutralize the xterm.js renderer pause"
+    assert "term.refresh(0, term.rows - 1)" in text, "script must refresh rows before each frame capture"
+
+
+def test_demo_gif_tape_exists_and_keeps_storyboard():
+    """The VHS tape in scripts/demo-gif.tape is the documented source of
+    docs/assets/demo-v0.10.gif (see docs/assets/README.md). Guard its key
+    properties so a re-record cannot regress the font fix or drop the story."""
+    path = REPO_ROOT / "scripts" / "demo-gif.tape"
+    assert path.is_file(), "scripts/demo-gif.tape missing"
+    tape = path.read_text(encoding="utf-8")
+    assert 'FontFamily Menlo' in tape, "tape must use the Menlo font"
+    assert "LetterSpacing 0" in tape, "tape must not add letter spacing"
+    assert ". scripts/demo-gif-setup.sh" in tape, "tape must source the hidden setup script"
+    assert "Durable execution for coding agents." in tape, "tape must end on the tagline"
+

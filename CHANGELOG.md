@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-22
+
 ### Added
 
 - **Task continuation + context reuse** — a finished task (completed/failed/canceled) can now be continued with a new instruction on the *same* task id, workspace, branch, and routing: CLI `maestro task continue <task-id> --request "…" [--context reuse|fresh] [--no-wait]`, MCP `followup(…, context_mode=…)`, A2A `tasks/followup`. In the default **reuse** mode the daemon projects a compact, versioned **task-knowledge** snapshot (goal, current state, files changed, latest verification result and failures, known issues, bounded tail of the last turn's output) from durable state and injects it as one labeled context entry — raw history stays in the task record and is never replayed. The snapshot budget is configurable (`[continuation] max_tokens`, `MAESTRO_CONTINUATION_MAX_TOKENS`); sections are dropped or truncated deterministically until it fits. Knowledge is persisted as a durable `task_knowledge` claim when a turn reaches a terminal state, so continuation works **after daemon restarts** (the task record is reconstructed from claims). `--context fresh` skips the snapshot for a clean reasoning context; `[continuation] enabled = false` makes all follow-ups fresh. Receipts now report turn count, knowledge schema metadata, and honest per-turn context stats (`mode`, `knowledge_chars`, `context_chars`, `raw_history_bytes`, labeled token estimate, reduction ratio); `maestro config` prints the effective `[continuation]`. Delegation depth still bounds continuation chains (each follow-up decrements `max_depth_remaining`).
@@ -31,6 +33,14 @@ semantic versioning.
   timing, so CI occasionally failed the coverage gate. Added a deterministic
   test that exercises the top-of-loop branch (an early event followed by
   silence).
+
+### Changed
+
+- **Flagship demo GIF re-recorded with a normal monospace font** — the previous
+  recording rendered with wide letter spacing; the new one uses Menlo with zero
+  tracking. The demo's fake implementer now leaves a real working-tree change
+  (required by the new evidence-of-work verification rule), and the recording is
+  reproducible from `scripts/demo-gif.tape` + `scripts/demo-gif-setup.sh`.
 
 ## [0.10.0] — 2026-09-21
 

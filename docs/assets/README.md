@@ -2,12 +2,35 @@
 
 This directory holds images for the README and release notes.
 
-**Checked in:** `demo-v0.10.gif` — a 90-second terminal recording of a real
-`scripts/demo-v0.10.sh` run (doctor → work-mode delegation → verify-fix bounce
-→ durable receipt), embedded in the README. It was produced by driving the
-real CLI through [VHS](https://github.com/charmbracelet/vhs) with the demo's
-output paced to the storyboard in `docs/demo-v0.10.md`; every line shown is
-genuine output from a real run (only the timing is presentation).
+**Checked in:** `demo-v0.10.gif` — a ~85-second terminal recording of the
+flagship demo (doctor → work-mode delegation → verify-fix bounce → durable
+receipt), embedded in the README. It is produced by driving the real CLI
+through [VHS](https://github.com/charmbracelet/vhs) with the phases paced to
+the storyboard in `docs/demo-v0.10.md`; every line shown is genuine output
+from a real run (only the timing is presentation). Re-record it with:
+
+```sh
+scripts/demo-gif-build-vhs.sh          # builds ./vhs-demo (patched VHS, see below)
+VHS_NO_SANDBOX=1 ./vhs-demo scripts/demo-gif.tape -o docs/assets/demo-v0.10.gif
+```
+
+The tape's hidden setup phase runs `scripts/demo-gif-setup.sh` (same fake
+agents and work-mode preset as `scripts/demo-v0.10.sh`). VHS needs `ffmpeg`,
+`ttyd`, and Go on PATH; in nested-sandbox environments add `VHS_NO_SANDBOX=1`.
+The v0.11 recording uses Menlo with zero letter spacing — the earlier take
+rendered with wide character gaps, which is why the tape pins
+`Set FontFamily Menlo` / `Set LetterSpacing 0`.
+
+Upstream VHS v0.12.0 cannot record this tape reliably, so
+`scripts/demo-gif-build-vhs.sh` builds a patched binary (details in the
+script header): it detaches the ffmpeg encode from the already-cancelled
+render context (upstream exits without writing the GIF) and keeps xterm.js's
+canvas renderer from pausing under headless Chrome — while paused, output
+lands in the terminal buffer but is never drawn to the canvases VHS captures,
+so lines vanish from the recording nondeterministically. Recordings made
+with stock VHS may be missing lines (notably near the end of the tape);
+verify a re-recording by checking that its final frame ends with the
+`Durable execution for coding agents.` tagline.
 
 **Not captured yet:** the PNG screenshots below have not been taken in this
 release cycle, so the README does not reference them. Capture them with the
