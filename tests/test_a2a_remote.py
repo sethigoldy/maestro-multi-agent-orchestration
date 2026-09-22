@@ -624,8 +624,9 @@ def test_a2a_remote_stream_error_and_timeout(tmp_path):
 
 
 def test_a2a_remote_timeout_after_late_event(tmp_path):
-    """An event arriving well before the deadline means the next top-of-loop
-    check sees an already-expired deadline — the other timeout branch."""
+    """An early event must not prevent the timeout: after it is processed the
+    wait continues until the deadline, and the (single) Empty exit reports
+    'timed out'. Deterministic on any machine — no timing-dependent branch."""
     srv = _JsonRpcServer(tmp_path)
     srv.sse_body = b'event: ping\ndata: {"task_id": "remote-1", "type": "ping", "data": {}}\n\n'
     srv.hold_after_sse = True  # stream stays open after the event
@@ -813,9 +814,10 @@ def test_a2a_remote_observer_exception_and_postloop_timeout(tmp_path):
 
     # Hold the stream open (no events, no close) so the only way out before
     # the tiny deadline is the timeout path itself — deterministic on any OS:
-    # either the pre-get check fires or queue.get() times out, both report
-    # "timed out after 0.001s". An immediately-closing stream would race the
-    # deadline and sometimes win with "stream closed before a terminal state".
+    # the clamped wait is zero or near-zero, so queue.get() returns Empty
+    # immediately and reports "timed out after 0.001s". An immediately-closing
+    # stream would race the deadline and sometimes win with "stream closed
+    # before a terminal state".
     quick = _JsonRpcServer(tmp_path, hold_sse=True)
     try:
         adapter = A2ARemoteAdapter(AgentSpec(name="x", kind="a2a_remote", command=quick.url))

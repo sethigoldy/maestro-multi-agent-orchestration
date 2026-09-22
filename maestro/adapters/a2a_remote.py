@@ -125,11 +125,16 @@ class A2ARemoteAdapter(BaseAdapter):
         deadline = started + timeout if timeout else None
         try:
             while True:
+                # Clamp to zero: get(timeout=<negative>) raises ValueError
+                # instead of Empty, so an already-expired deadline must not be
+                # passed through. A single Empty exit covers both "deadline
+                # expired at the top of the loop" and "queue read timed out" —
+                # two branches here made 100% branch coverage depend on event
+                # timing (which exit fired first), flaking the CI gate.
                 remaining = (deadline - time.monotonic()) if deadline is not None else None
-                if remaining is not None and remaining <= 0:
-                    return AdapterResult(ok=False, error=f"A2A remote task timed out after {timeout}s", usage=usage, duration_s=time.monotonic() - started)
+                wait = None if remaining is None else max(remaining, 0)
                 try:
-                    item = event_q.get(timeout=remaining)
+                    item = event_q.get(timeout=wait)
                 except _queue.Empty:
                     return AdapterResult(ok=False, error=f"A2A remote task timed out after {timeout}s", usage=usage, duration_s=time.monotonic() - started)
                 if item is None:
