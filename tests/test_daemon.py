@@ -2353,6 +2353,24 @@ def test_claude_code_context_flags_and_staging(daemon, tmp_path, binpath):
     assert system_file.read_text(encoding="utf-8") == "[style] (project config)\nStanding rule.\n"
 
 
+def test_build_prompt_forbids_mid_run_approval_stalls():
+    """Implementation turns are non-interactive batch runs: the prompt must tell
+    the agent nobody can answer it mid-run, so it completes the work instead of
+    stopping to ask for approval (a stalled turn previously completed as PASSED
+    with nothing built until the zero-work guard landed)."""
+    from maestro.daemon import build_prompt
+
+    doc = _doc(design="The design.")
+    prompt = build_prompt(doc, "task-1", Path("/tmp"), [])
+    assert "non-interactive batch run" in prompt
+    assert "Do not stop to ask for approval or confirmation" in prompt
+    # Open questions must surface in the final report so the supervisor can
+    # answer them on a follow-up turn — that is the only Q&A channel.
+    assert "list any open questions in your final report" in prompt
+    # The directive sits with the other standing instructions, before the Q&A.
+    assert prompt.index("EXECUTION MODE:") < prompt.index("PREVIOUS Q&A")
+
+
 def test_build_prompt_context_block_placement(daemon, tmp_path):
     from maestro.daemon import build_fix_prompt, build_prompt, build_review_prompt, build_verify_prompt
 
