@@ -12,6 +12,7 @@ import http.client
 import json
 import os
 import select
+import signal
 import sys
 import termios
 import threading
@@ -40,6 +41,49 @@ _STATE_COLORS = {
     "failed": RED,
     "canceled": RED,
 }
+
+
+def _terminal_width(stdout: Any, fallback: int = 80) -> int:
+    """Best-effort terminal width for frame layout.
+
+    Resolution order: ``$COLUMNS`` (explicit user intent), then a TIOCGWINSZ
+    query on the stdout fd, then a sane default. The result is clamped — an
+    over-wide guess makes every line wrap and destroys the layout."""
+    cols = os.environ.get("COLUMNS")
+    if cols:
+        try:
+            value = int(cols)
+            if 20 <= value <= 500:
+                return value
+        except ValueError:
+            pass
+    try:
+        size = os.get_terminal_size(stdout.fileno())
+        if 20 <= size.columns <= 500:
+            return size.columns
+    except (OSError, ValueError, AttributeError):
+        pass
+    return fallback
+
+
+def _install_winch_handler(stdout: Any, width_holder: dict[str, int], wake_fd: int):
+    """Re-query the terminal width on SIGWINCH and wake the render loop.
+
+    Returns a restore callable (a no-op when signals are unavailable, e.g.
+    ``run`` called from a non-main thread)."""
+    def _on_winch(signum, frame):
+        width_holder["width"] = _terminal_width(stdout)
+        try:
+            os.write(wake_fd, b"w")  # wake the select() loop for a redraw
+        except OSError:
+            pass
+
+    try:
+        previous = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, _on_winch)
+    except (ValueError, OSError):
+        return lambda: None
+    return lambda: signal.signal(signal.SIGWINCH, previous)
 
 
 def normalize(record: dict[str, Any]) -> dict[str, Any]:
@@ -72,12 +116,15 @@ def _state_color(state: str) -> str:
 
 def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, width: int = 100) -> str:
     """Render one full screen (ANSI). Pure function — trivially testable."""
+    width = max(40, int(width))  # clamp: tiny widths would produce negative columns
     lines: list[str] = []
     counts: dict[str, int] = {}
     for task in tasks:
         state = task.get("state") or "unknown"
         counts[state] = counts.get(state, 0) + 1
     summary = " ".join(f"{n} {s}" for s, n in sorted(counts.items())) or "no tasks"
+    if len(summary) > max(10, width - 30):
+        summary = summary[: max(10, width - 31)] + "…"
     dot = f"{GREEN}●{RESET}" if live else f"{RED}○{RESET}"
     lines.append(f"{BOLD}MAESTRO{RESET} {DIM}dashboard{RESET}  {dot}  {summary}")
     lines.append("")
@@ -105,10 +152,8 @@ def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, 
     if sel is not None:
         lines.append("")
         state = sel.get("state") or "unknown"
-        lines.append(
-            f"{BOLD}{sel.get('title') or sel.get('task_id')}{RESET} "
-            f"{_state_color(state)}[{state}]{RESET}"
-        )
+        detail_title = str(sel.get("title") or sel.get("task_id"))[: max(10, width - 12)]
+        lines.append(f"{BOLD}{detail_title}{RESET} {_state_color(state)}[{state}]{RESET}")
         for label, value in (
             ("route", f"{sel.get('origin_agent') or '?'} → {sel.get('target_agent') or '?'}"),
             ("workspace", sel.get("workspace")),
@@ -116,7 +161,9 @@ def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, 
             ("error", (sel.get("error") or "").splitlines()[0] if sel.get("error") else None),
         ):
             if value:
-                lines.append(f"  {DIM}{label}:{RESET} {value}")
+                # Plain-text truncation before the ANSI wrapping keeps the whole
+                # line inside the terminal width (no mid-line wrapping).
+                lines.append(f"  {DIM}{label}:{RESET} {str(value)[: max(10, width - len(label) - 6)]}")
         attempts = sel.get("attempts") or []
         for attempt in attempts[-3:]:
             ok = not attempt.get("error")
@@ -243,7 +290,10 @@ def run(
 
     read_fd, write_fd = os.pipe()
     done = threading.Event()
+    width_holder = {"width": _terminal_width(stdout)}
+    restore_winch = lambda: None  # noqa: E731 — replaced once the handler is installed
     try:
+        restore_winch = _install_winch_handler(stdout, width_holder, write_fd)
         conn = http.client.HTTPConnection(url.split("//", 1)[1], timeout=None)
         try:
             headers = {"Authorization": f"Bearer {token}"} if token else {}
@@ -291,12 +341,12 @@ def run(
                         state.selected = min(len(state.tasks) - 1, (state.selected or 0) + 1)
                     else:
                         continue
-                    stdout.write(render_frame(state.tasks, state.selected, state.live))
+                    stdout.write(render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
                     stdout.flush()
                 if read_fd in ready:
                     os.read(read_fd, 64)  # drain; one redraw per wakeup
                     state.clamp_selection()
-                    stdout.write(render_frame(state.tasks, state.selected, state.live))
+                    stdout.write(render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
                     stdout.flush()
                     if done.is_set():
                         exit_code = 1  # the stream ended (daemon stopped)
@@ -312,6 +362,7 @@ def run(
                     pass
         return exit_code
     finally:
+        restore_winch()
         try:
             os.close(write_fd)
         except OSError:

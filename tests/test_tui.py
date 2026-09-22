@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -649,3 +650,167 @@ def test_cli_main_uses_marker_token(tmp_path, monkeypatch):
     monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
     assert tui_mod.main([]) == 0
     assert calls == {"url": "http://127.0.0.1:8790", "token": "mk-token"}
+
+
+# ---------------------------------------------------------------- terminal width
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_lines(frame: str) -> list[str]:
+    return [_ANSI_RE.sub("", ln) for ln in frame.split("\n")]
+
+
+def test_terminal_width_prefers_columns_env(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "64")
+    assert tui._terminal_width(io.StringIO()) == 64
+
+
+@pytest.mark.parametrize("bad", ["not-a-number", "5", "9999"])
+def test_terminal_width_ignores_bad_columns_env(monkeypatch, bad):
+    monkeypatch.setenv("COLUMNS", bad)
+    assert tui._terminal_width(io.StringIO()) == 80  # falls through to the default
+
+
+def test_terminal_width_from_stdout_fd(monkeypatch):
+    monkeypatch.delenv("COLUMNS", raising=False)  # force the fd path
+
+    class _Fd:
+        def fileno(self):
+            return 7
+
+    monkeypatch.setattr(tui.os, "get_terminal_size", lambda fd: os.terminal_size((72, 30)))
+    assert tui._terminal_width(_Fd()) == 72
+    # Out-of-range terminal sizes fall through to the default.
+    monkeypatch.setattr(tui.os, "get_terminal_size", lambda fd: os.terminal_size((10, 30)))
+    assert tui._terminal_width(_Fd()) == 80
+
+
+def test_terminal_width_fallback_without_usable_fd(monkeypatch):
+    monkeypatch.delenv("COLUMNS", raising=False)
+    assert tui._terminal_width(io.StringIO()) == 80  # StringIO.fileno() raises OSError
+
+    class _NoFileno:
+        pass
+
+    assert tui._terminal_width(_NoFileno()) == 80  # AttributeError path
+    rfd, wfd = os.pipe()
+    try:
+
+        class _PipeFd:
+            def fileno(self):
+                return rfd
+
+        assert tui._terminal_width(_PipeFd()) == 80  # a pipe is not a terminal
+    finally:
+        os.close(rfd)
+        os.close(wfd)
+
+
+def test_render_frame_clamps_tiny_width():
+    frame = tui.render_frame([{"task_id": "task-1", "title": "T", "state": "working"}], 0, live=True, width=5)
+    assert "task-1" in _plain_lines(frame)[2]  # clamped to 40: still a sane frame
+
+
+def test_render_frame_detail_values_truncated_to_width():
+    task = {
+        "task_id": "task-9", "title": "T" * 60, "state": "failed",
+        "workspace": "/very/long/" + "x" * 120,
+        "error": "E" * 200,
+    }
+    frame = tui.render_frame([task], 0, live=False, width=60)
+    lines = _plain_lines(frame)
+    assert all(len(ln) <= 60 for ln in lines)
+    text = "".join(lines)
+    assert not re.search(r"T{49,}", text)  # the 60-char title is truncated everywhere
+    assert "T" * 14 in text  # list-row title column at width 60
+
+
+def test_render_frame_summary_truncated_on_narrow_width():
+    states = ["submitted", "working", "input-required", "completed", "failed", "canceled", "unknown"]
+    tasks = [{"task_id": f"t{i}", "title": f"T{i}", "state": s} for i, s in enumerate(states)]
+    frame = tui.render_frame(tasks, None, live=True, width=60)
+    assert all(len(ln) <= 60 for ln in _plain_lines(frame))
+
+
+def test_run_uses_detected_terminal_width(tmp_path, monkeypatch):
+    frames = _frame("task-1", "state", {"state": "working"})
+    server, url = _sse_server(
+        tmp_path,
+        [{"id": "task-1", "status": {"state": "submitted"}, "metadata": {"title": "X" * 40}}],
+        frames,
+    )
+    monkeypatch.setenv("COLUMNS", "60")
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, stdin=_PipeStdin(b"q", delay_s=0.5), stdout=out, is_tty=lambda: True)
+        assert rc == 0
+        text = out.getvalue()
+        assert "X" * 14 in text and "X" * 40 not in text  # title truncated for width 60
+        nonempty = [ln for ln in _plain_lines(text) if ln.strip()]
+        assert all(len(ln) <= 60 for ln in nonempty)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_winch_handler_updates_width_and_wakes(monkeypatch):
+    import signal as _signal
+
+    holder = {"width": 100}
+    rfd, wfd = os.pipe()
+    try:
+        previous = _signal.getsignal(_signal.SIGWINCH)
+        restore = tui._install_winch_handler(io.StringIO(), holder, wfd)
+        assert restore is not None and callable(restore)
+        monkeypatch.setenv("COLUMNS", "64")
+        os.kill(os.getpid(), _signal.SIGWINCH)  # CPython runs the handler before the next bytecode
+        assert holder["width"] == 64
+        assert os.read(rfd, 1) == b"w"
+        # A closed wake fd must not kill the handler.
+        os.close(wfd)
+        os.kill(os.getpid(), _signal.SIGWINCH)
+        assert holder["width"] == 64
+        restore()
+        assert _signal.getsignal(_signal.SIGWINCH) is previous
+    finally:
+        try:
+            os.close(rfd)
+        except OSError:
+            pass
+
+
+def test_install_winch_handler_noop_off_main_thread():
+    box: dict = {}
+
+    def worker():
+        rfd, wfd = os.pipe()
+        try:
+            restore = tui._install_winch_handler(io.StringIO(), {"width": 80}, wfd)
+            box["restore"] = restore
+            box["result"] = restore()
+        except BaseException as exc:  # surface worker failures to the main thread
+            box["error"] = exc
+        finally:
+            os.close(rfd)
+            os.close(wfd)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive() and "error" not in box
+    assert callable(box["restore"]) and box["result"] is None  # no-op restore, nothing installed
+
+
+def test_run_restores_winch_handler(tmp_path):
+    import signal as _signal
+
+    server, url = _sse_server(tmp_path, [], b"", close_after_connect=True)
+    previous = _signal.getsignal(_signal.SIGWINCH)
+    try:
+        rc = tui.run(url, stdin=_PipeStdin(b""), stdout=io.StringIO(), is_tty=lambda: True)
+        assert rc == 1
+        assert _signal.getsignal(_signal.SIGWINCH) is previous
+    finally:
+        server.shutdown()
+        server.server_close()
