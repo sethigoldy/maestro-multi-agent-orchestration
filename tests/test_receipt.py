@@ -683,9 +683,14 @@ def test_live_receipt_fallback_chain(live_daemon, tmp_path, monkeypatch):
 def test_live_receipt_work_mode_bounce(live_daemon, tmp_path, monkeypatch):
     bp = tmp_path / "bin"
     bp.mkdir(exist_ok=True)
-    # Implementer ok; verifier FAILs with one issue (drives one fix bounce);
-    # deterministic verification (auto-detected) passes after the fix.
-    _fake_bin(bp, "codex", 'cat > /dev/null\necho \'{"total_cost_usd": 0.1}\'\nexit 0')
+    # Implementer ok (leaves real changes so the auto-detected deterministic
+    # check passes); verifier FAILs with one issue (drives one fix bounce).
+    # Guarded: preflight probes run without "-" from the daemon's cwd.
+    _fake_bin(
+        bp, "codex",
+        's=0; for a in "$@"; do [ "$a" = "-" ] && s=1; done; [ $s -eq 1 ] || exit 0\n'
+        "cat > /dev/null\necho '{\"total_cost_usd\": 0.1}'\necho work >> README.md\nexit 0",
+    )
     bp2 = tmp_path / "bin2"
     bp2.mkdir(exist_ok=True)
     _fake_bin(bp2, "claude", 'cat > /dev/null\necho "VERDICT: FAIL"\necho "- flaky assertion"\nexit 0')

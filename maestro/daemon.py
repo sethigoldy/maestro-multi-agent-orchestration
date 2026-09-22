@@ -688,6 +688,12 @@ class MaestroDaemon:
             if record is not None:
                 record["branch"] = branch
             self.maestro._write_claim(task_id, "task_branch", branch)
+        base_head = self._base_head(workspace)
+        if base_head:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record["base_head"] = base_head  # per-turn evidence baseline for verification
+            self.maestro._write_claim(task_id, "task_base_head", base_head)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
         last_error: str | None = None
         for agent_name in chain:
@@ -838,7 +844,7 @@ class MaestroDaemon:
         self._set_state(task_id, STATE_WORKING, verifying=True)
         verification_ok: bool | None = None
         if doc.verification != "none":
-            verification_ok = self._verify(workspace, task_id, doc)
+            verification_ok = self._verify(workspace, task_id, doc, output_tail=self._output_tail(result))
         record = self._tasks.get(task_id)
         if record is not None:
             record["result"] = result.to_dict()
@@ -1069,13 +1075,57 @@ class MaestroDaemon:
             return "failed", result.error or "fix turn failed"
         return "ok", None
 
-    def _verify(self, workspace: Path, task_id: str, doc: HandoffDoc) -> bool:
+    @staticmethod
+    def _base_head(workspace: Path) -> str | None:
+        """The HEAD commit before this turn's work (the evidence baseline), or None."""
+        probe = subprocess.run(["git", "-C", str(workspace), "rev-parse", "HEAD"], text=True, capture_output=True)
+        if probe.returncode != 0:
+            return None
+        head = probe.stdout.strip()
+        return head or None
+
+    def _workspace_has_changes(self, workspace: Path, task_id: str) -> tuple[bool, str]:
+        """Evidence that the turn produced work: working-tree changes or new commits."""
+        status = subprocess.run(["git", "-C", str(workspace), "status", "--porcelain"], text=True, capture_output=True)
+        if status.returncode == 0 and status.stdout.strip():
+            return True, "working-tree changes are present"
+        record = self._tasks.get(task_id) or {}
+        base = record.get("base_head") or self.maestro._claims(task_id).get("task_base_head")
+        if base:
+            ahead = subprocess.run(
+                ["git", "-C", str(workspace), "rev-list", "--count", f"{base}..HEAD"], text=True, capture_output=True
+            )
+            count = ahead.stdout.strip()
+            if ahead.returncode == 0 and count not in ("", "0"):
+                return True, f"{count} new commit(s) since the turn started"
+        return False, "no working-tree changes and no new commits since the turn started"
+
+    @staticmethod
+    def _output_tail(result: Any, limit: int = 500) -> str | None:
+        """The tail of a turn's output (for reports), or None when unavailable."""
+        path = getattr(result, "output_path", None)
+        if not path:
+            return None
+        try:
+            text = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return text[-limit:] or None
+
+    def _verify(self, workspace: Path, task_id: str, doc: HandoffDoc, output_tail: str | None = None) -> bool:
         import shlex
 
         configured = None
         if doc.verification == "command":
             configured = shlex.split(doc.request)  # explicit command mode carries the command in request (M2 simplification)
         test_cmd, note = _verification_command(workspace, configured)
+        # The auto-detected fallback is `git diff --check` plus a note. It passes
+        # trivially on an untouched workspace, so it must never certify a turn
+        # that left no changes behind — otherwise a zero-work turn (e.g. an agent
+        # that stopped to ask for approval a batch run can never receive) would
+        # complete as PASSED. Explicit commands and real test runners are
+        # authoritative and keep their current semantics.
+        fallback_only = note is not None and test_cmd == ["git", "diff", "--check"]
         diff = subprocess.run(["git", "diff", "--check"], cwd=workspace, text=True, capture_output=True)
         try:
             tests = subprocess.run(test_cmd, cwd=workspace, text=True, capture_output=True)
@@ -1087,10 +1137,26 @@ class MaestroDaemon:
 
             tests = _FailedRun()
         ok = diff.returncode == 0 and tests.returncode == 0
+        no_changes_reason: str | None = None
+        if ok and fallback_only:
+            has_changes, evidence = self._workspace_has_changes(workspace, task_id)
+            if not has_changes:
+                ok = False
+                no_changes_reason = evidence
         note_text = f"verification note: {note}\n\n" if note else ""
+        no_changes_text = ""
+        if no_changes_reason is not None:
+            tail_text = f"\n\nlast lines of the agent's output:\n{output_tail}" if output_tail else ""
+            no_changes_text = (
+                "\nRESULT: FAILED — no changes detected. "
+                f"{no_changes_reason}. The only available check is `git diff --check` "
+                "(no project test runner was detected), which passes trivially on an "
+                "untouched workspace, so Maestro will not report PASSED without evidence of work."
+                + tail_text
+            )
         report = (
             f"workspace: {workspace}\nverification command: {' '.join(test_cmd)}\n\n{note_text}"
-            f"git diff --check:\n{diff.stdout}\n{diff.stderr}\n\nverification:\n{tests.stdout}\n{tests.stderr}"
+            f"git diff --check:\n{diff.stdout}\n{diff.stderr}\n\nverification:\n{tests.stdout}\n{tests.stderr}{no_changes_text}"
         )
         task_dir = self.state_dir / "tasks" / task_id
         task_dir.mkdir(parents=True, exist_ok=True)

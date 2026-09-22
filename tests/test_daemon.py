@@ -670,12 +670,137 @@ def test_verification_command_mode_failed(daemon, tmp_path, binpath):
 
 
 def test_verification_auto_passes(daemon, tmp_path, binpath):
-    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    # The fallback verifier (git diff --check) only passes when there is actual
+    # work to check — an idle agent on a clean tree must not certify as PASSED.
+    # Guarded: the preflight probe runs the binary without "-" from the daemon's
+    # cwd, so side effects must only fire on the real invocation.
+    _fake_bin(
+        binpath, "codex",
+        's=0; for a in "$@"; do [ "$a" = "-" ] && s=1; done; [ $s -eq 1 ] || exit 0\n'
+        "cat > /dev/null\necho work >> README.md\nexit 0",
+    )
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(verification="auto"), ws)
     final = daemon.wait(started["task_id"], timeout=60)
     claims = daemon.maestro._claims(started["task_id"])
     assert claims["task_verification"].startswith("PASSED")
+
+
+def test_verification_auto_no_changes_fails(daemon, tmp_path, binpath):
+    # The zero-work failure mode: the agent exits 0 without producing anything
+    # (e.g. it stopped to ask for approval that a batch run can never receive).
+    # A fallback-only verifier must not certify that as PASSED.
+    _fake_bin(binpath, "codex", 'cat > /dev/null\necho please approve this design\nexit 0')
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    claims = daemon.maestro._claims(started["task_id"])
+    assert claims["task_verification"].startswith("FAILED")
+    report = (daemon.state_dir / "tasks" / started["task_id"] / "verification.txt").read_text(encoding="utf-8")
+    assert "no changes detected" in report
+    assert "please approve this design" in report  # the agent's last words are surfaced
+
+
+def test_verification_auto_committed_work_passes(daemon, tmp_path, binpath):
+    # Committed work (clean tree, new commit) is evidence too — a clean tree
+    # must not fail verification when the turn produced commits.
+    _fake_bin(
+        binpath, "codex",
+        's=0; for a in "$@"; do [ "$a" = "-" ] && s=1; done; [ $s -eq 1 ] || exit 0\n'
+        "cat > /dev/null\necho work >> README.md\n"
+        "git add -A >/dev/null 2>&1\n"
+        "GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t git commit -qm work >/dev/null 2>&1\n"
+        "exit 0",
+    )
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(verification="auto"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    claims = daemon.maestro._claims(started["task_id"])
+    assert claims["task_verification"].startswith("PASSED")
+
+
+def test_base_head_and_workspace_changes(daemon, tmp_path):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+
+    def git(ws: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(ws), *args], text=True, capture_output=True, env=env)
+
+    ws = _git_repo(tmp_path)
+    assert daemon._base_head(ws) is not None
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert daemon._base_head(plain) is None  # not a git repo
+
+    # Working-tree changes are evidence (unknown task id: record fallback works).
+    (ws / "new.txt").write_text("x\n", encoding="utf-8")
+    ok, why = daemon._workspace_has_changes(ws, "task-missing")
+    assert ok and "working-tree" in why
+
+    # A clean tree with no baseline is not evidence.
+    (ws / "new.txt").unlink()
+    ok, why = daemon._workspace_has_changes(ws, "task-missing")
+    assert not ok and "no new commits" in why
+
+    # A clean tree that has committed work since the baseline is evidence.
+    record = {"base_head": daemon._base_head(ws)}
+    daemon._tasks["task-committed"] = record
+    (ws / "new.txt").write_text("x\n", encoding="utf-8")
+    git(ws, "add", "-A")
+    git(ws, "commit", "-qm", "work")
+    ok, why = daemon._workspace_has_changes(ws, "task-committed")
+    assert ok and "1 new commit" in why
+
+    # A clean tree with no commits since the baseline is not evidence.
+    record["base_head"] = daemon._base_head(ws)  # re-baseline after the commit
+    ok, why = daemon._workspace_has_changes(ws, "task-committed")
+    assert not ok and "no working-tree changes" in why
+
+    # A non-git workspace has no evidence either.
+    ok, why = daemon._workspace_has_changes(plain, "task-missing")
+    assert not ok
+
+
+def test_verify_no_changes_report_without_tail(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    daemon._tasks["task-x"] = {"base_head": daemon._base_head(ws)}
+    ok = daemon._verify(ws, "task-x", _doc(verification="auto"), output_tail=None)
+    assert ok is False
+    report = (daemon.state_dir / "tasks" / "task-x" / "verification.txt").read_text(encoding="utf-8")
+    assert "no changes detected" in report and "last lines of the agent's output" not in report
+
+
+def test_output_tail(daemon, tmp_path):
+    class _NoPath:
+        output_path = None
+
+    assert daemon._output_tail(_NoPath()) is None
+
+    f = tmp_path / "out.txt"
+    f.write_text("x" * 900, encoding="utf-8")
+
+    class _WithFile:
+        output_path = str(f)
+
+    assert daemon._output_tail(_WithFile()) == "x" * 500  # capped at the default limit
+    f.write_text("   \n", encoding="utf-8")
+    assert daemon._output_tail(_WithFile()) is None  # blank-only output
+
+    class _Missing:
+        output_path = str(tmp_path / "missing.txt")
+
+    assert daemon._output_tail(_Missing()) is None  # unreadable file
+
+
+def test_base_head_empty_stdout(daemon, tmp_path, monkeypatch):
+    import maestro.daemon as dm
+
+    class _Probe:
+        returncode = 0
+        stdout = "   \n"
+
+    monkeypatch.setattr(dm.subprocess, "run", lambda *a, **kw: _Probe())
+    assert daemon._base_head(tmp_path) is None  # rc 0 but no usable sha
 
 
 def test_usage_event_published(daemon, tmp_path, binpath):
@@ -1496,7 +1621,7 @@ def test_parse_verdict_protocol():
 def test_work_mode_economy_end_to_end(daemon, tmp_path, binpath):
     from maestro.modes import parse_modes
 
-    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho implemented\nexit 0')
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho work >> README.md\nexit 0')
     _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
     daemon.maestro.config["modes"] = parse_modes({"economy": {"implementer": "impl", "reviewer": "rev"}})
     ws = _git_repo(tmp_path)
@@ -1513,7 +1638,7 @@ def test_work_mode_economy_end_to_end(daemon, tmp_path, binpath):
 def test_work_mode_bounce_loop_fixes_then_passes(daemon, tmp_path, binpath):
     from maestro.modes import parse_modes
 
-    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho work >> README.md\nexit 0')
     _register_generic(daemon, binpath, "fixer", 'cat > /dev/null\necho fixing\nexit 0')
     _register_generic(
         daemon, binpath, "rev",
@@ -1552,7 +1677,9 @@ def test_work_mode_bounce_exhaustion_parks(daemon, tmp_path, binpath):
 def test_work_mode_zero_bounces_parks_without_fix(daemon, tmp_path, binpath):
     from maestro.modes import parse_modes
 
-    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    # The implementer leaves real changes (deterministic check passes); the park
+    # below is driven purely by the LLM issue with zero bounces allowed.
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho work >> README.md\nexit 0')
     _register_generic(
         daemon, binpath, "rev",
         'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- nope"\nexit 0',
@@ -1570,7 +1697,7 @@ def test_work_mode_zero_bounces_parks_without_fix(daemon, tmp_path, binpath):
 def test_work_mode_verifier_issues_join_bounce_loop(daemon, tmp_path, binpath):
     from maestro.modes import parse_modes
 
-    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\nexit 0')
+    _register_generic(daemon, binpath, "impl", 'cat > /dev/null\necho work >> README.md\nexit 0')
     _register_generic(daemon, binpath, "verif", 'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- untested edge"\nexit 0')
     _register_generic(daemon, binpath, "rev", 'cat > /dev/null\necho VERDICT: PASS\nexit 0')
     daemon.maestro.config["modes"] = parse_modes({"both": {"implementer": "impl", "verifier": "verif", "reviewer": "rev"}})
