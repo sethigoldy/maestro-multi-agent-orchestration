@@ -559,7 +559,9 @@ def test_defensive_unit_paths(daemon):
     daemon._persist("ghost")  # unknown task: no-op
     daemon._set_state("ghost", "weird")  # unknown task + unmapped state: no claims, event still published
     daemon._record_attempt("ghost", "a", None)  # unknown task: no-op
-    assert daemon.status_a2a("ghost")["status"]["state"] == "working"  # durable fallback default
+    # Durable fallback default: a task with no usable status claim belongs to a
+    # dead process and can never finish on its own — FAILED, not "working".
+    assert daemon.status_a2a("ghost")["status"]["state"] == "failed"
 
 
 def test_start_queued_defensive_paths(daemon, tmp_path):
@@ -1468,12 +1470,15 @@ def test_durable_record_tolerates_malformed_runtime_claim(daemon):
 
 
 def test_durable_record_without_runtime_claim(daemon):
-    """Workspace claim but no runtime snapshot at all: plain phase-driven record."""
+    """Workspace claim but no runtime snapshot at all: plain phase-driven record.
+
+    A missing status claim means the turn never reached its first persisted
+    state — the record must default to FAILED, not a misleading WORKING."""
     tid = "task-20260101-000000-noruntime"
     daemon.maestro._register_task(tid, "No runtime", 3)
     daemon.maestro._write_claim(tid, "task_workspace", "/ws/z")
     record = daemon._durable_record(tid)
-    assert record is not None and record["state"] == "working"  # no phase claim either
+    assert record is not None and record["state"] == "failed"  # no phase claim either
     assert record["attempts"] == [] and record["turn"] == 0
 
 
@@ -2384,3 +2389,345 @@ def test_build_prompt_context_block_placement(daemon, tmp_path):
     assert "CTX" in build_verify_prompt(doc, "t", ws, True, report, context_block="CTX")
     assert "CTX" in build_review_prompt(doc, "t", ws, True, report, [], context_block="CTX")
     assert "CTX" in build_fix_prompt(doc, "t", ws, ["i"], False, context_block="CTX")
+
+
+# ------------------------------------------------------------------ state management regressions
+# A long-running task must always end in a persisted terminal state. These
+# regressions cover the "stuck at [state] working / IMPLEMENTING" class of bugs:
+# an uncaught exception in the turn thread, a daemon restart mid-turn, and a
+# stop() while a turn is in flight all used to leave the task reporting
+# "working" forever with no thread left to drive it.
+
+
+def _slow_fake_bin(binpath: Path, name: str = "codex", ticks: int = 40) -> None:
+    """A fake agent that works for a while (ticks * 0.1s) before finishing."""
+    _fake_bin(binpath, name, f"cat > /dev/null\ni=0\nwhile [ $i -lt {ticks} ]; do echo tick; sleep 0.1; i=$((i+1)); done\nexit 0")
+
+
+def test_long_task_completes_and_final_state_is_last_event(daemon, tmp_path, binpath):
+    """A task that runs for several seconds must end in completed, and the LAST
+    state event a follower observes must be 'completed' — never a stale working."""
+    _slow_fake_bin(binpath)
+    ws = _git_repo(tmp_path)
+    started = daemon.delegate(_doc(), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"
+    states = [e.data.get("state") for e in daemon.bus.history(task_id=started["task_id"]) if e.type == "state"]
+    assert states and states[-1] == "completed"
+
+
+def test_turn_crash_fails_task_and_frees_workspace(daemon, tmp_path, binpath, monkeypatch):
+    """An uncaught exception inside the turn (after STATE_WORKING) must end the
+    task FAILED — not leave it 'working' — and free the workspace slot."""
+    _slow_fake_bin(binpath)  # keep the agent alive long enough to patch under it
+    ws = _git_repo(tmp_path)
+
+    def boom(*a, **kw):
+        raise OSError("disk on fire")
+
+    orig_bookkeep = daemon._bookkeep_turn
+    monkeypatch.setattr(daemon, "_bookkeep_turn", boom)
+    started = daemon.delegate(_doc(), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "failed"
+    assert "turn crashed" in (final["metadata"].get("error") or "")
+    # The workspace slot must be free: a new handoff runs immediately, not queued.
+    daemon._bookkeep_turn = orig_bookkeep  # the crash was one-off, not permanent
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    again = daemon.delegate(_doc(title="second"), ws)
+    assert again["queued"] is False
+    assert daemon.wait(again["task_id"], timeout=60)["status"]["state"] == "completed"
+
+
+def test_crash_during_post_complete_fails_not_completes(daemon, tmp_path, binpath, monkeypatch):
+    """If the agent succeeded but post-completion work raises, the task must
+    fail — never report completed or linger in working."""
+    _fake_bin(binpath, "codex", 'cat > /dev/null\necho done\nexit 0')
+    ws = _git_repo(tmp_path)
+
+    def boom(*a, **kw):
+        raise RuntimeError("verify exploded")
+
+    monkeypatch.setattr(daemon, "_verify", boom)
+    started = daemon.delegate(_doc(verification="command"), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "failed"
+    assert "turn crashed" in (final["metadata"].get("error") or "")
+
+
+def test_crash_does_not_override_parked_state(daemon, tmp_path, binpath, monkeypatch):
+    """If the turn parks (input-required) and then crashes, the park must win:
+    the task stays input-required holding its slot, not failed."""
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+
+    def park_then_boom(task_id, doc, workspace, agent_name, result):
+        daemon._set_state(task_id, "input-required", question="parked for test")
+        raise RuntimeError("boom after park")
+
+    monkeypatch.setattr(daemon, "_post_complete", park_then_boom)
+    started = daemon.delegate(_doc(), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "input-required"
+
+
+def test_crash_guard_survives_state_write_failure(daemon, tmp_path):
+    """Even when the FAILED state write itself fails (e.g. disk error), the
+    crash guard must not raise out of the thread; the slot stays held so a new
+    handoff to the same workspace queues instead of racing the ghost."""
+    ws = _git_repo(tmp_path)
+    task_id, record = daemon._make_record(_doc(), str(ws))
+    with daemon._lock:
+        daemon._active[str(ws)] = task_id
+    record["state"] = "working"
+    orig_persist = daemon._persist
+
+    def boom(*a, **kw):
+        raise OSError("disk on fire")
+
+    daemon._persist = boom  # every state write now fails (disk error)
+    try:
+        daemon._handle_turn_crash(task_id, OSError("agent spawn failed"))  # must not raise
+    finally:
+        daemon._persist = orig_persist
+    with daemon._lock:
+        assert daemon._active.get(str(ws)) == task_id  # slot still held by the broken task
+
+
+def test_crash_guard_survives_release_failure(daemon, tmp_path, binpath, monkeypatch):
+    """A release failure inside the crash guard must not mask the FAILED state."""
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 1')
+    ws = _git_repo(tmp_path)
+
+    def boom_release(*a, **kw):
+        raise OSError("slot table corrupt")
+
+    # The normal failure path's own release raises into the guard; the task is
+    # already FAILED by then, so the guard must leave the state untouched.
+    monkeypatch.setattr(daemon, "_release", boom_release)
+    started = daemon.delegate(_doc(), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "failed"
+
+
+def test_restart_fails_interrupted_working_task(tmp_path):
+    """A task whose previous daemon died mid-turn (durable status IMPLEMENTING)
+    must be marked failed by the next daemon — not reported 'working' forever."""
+    home = tmp_path / "home"
+    ws = _git_repo(tmp_path, name="ws")
+    d1 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000000-stuck"
+    d1.maestro._register_task(tid, "Stuck task", 1, project_root=str(ws))
+    d1.maestro._write_claim(tid, "task_title", "Stuck task")
+    d1.maestro._write_claim(tid, "task_workspace", str(ws))
+    d1.maestro._write_claim(tid, "task_request", "Do it")
+    d1.maestro._write_claim(tid, "task_status", "IMPLEMENTING")
+    d1.maestro._write_claim(tid, "task_runtime", json.dumps({"state": "working", "workspace": str(ws), "title": "Stuck task"}))
+    d1.stop()
+
+    d2 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        status = d2.status_a2a(tid)
+        assert status["status"]["state"] == "failed"
+        assert "interrupted" in (status["metadata"].get("error") or "")
+        # wait() must not block on a dead task.
+        final = d2.wait(tid, timeout=5)
+        assert final["status"]["state"] == "failed"
+    finally:
+        d2.stop()
+
+
+def test_restart_fails_queued_task_without_status(tmp_path):
+    """A task queued behind a busy workspace when the previous process died has
+    no status claim (the queue is in-memory); the next daemon must fail it —
+    it can never start on its own."""
+    home = tmp_path / "home"
+    ws = _git_repo(tmp_path, name="ws")
+    d1 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000001-queued"
+    d1.maestro._register_task(tid, "Queued task", 2, project_root=str(ws))
+    d1.maestro._write_claim(tid, "task_title", "Queued task")
+    d1.maestro._write_claim(tid, "task_workspace", str(ws))
+    # The registration snapshot (state=submitted) but no status claim: exactly
+    # what a queued handoff leaves before it is ever promoted.
+    d1.maestro._write_claim(tid, "task_runtime", json.dumps({"state": "submitted", "workspace": str(ws), "title": "Queued task"}))
+    d1.stop()
+
+    d2 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        status = d2.status_a2a(tid)
+        assert status["status"]["state"] == "failed"
+        assert "before the task started" in (status["metadata"].get("error") or "")
+    finally:
+        d2.stop()
+
+
+def test_restart_leaves_parked_task_awaiting_input(tmp_path):
+    """A parked input-required task (REVIEWING phase) is legitimately waiting
+    for an answer — reconciliation must not fail it."""
+    home = tmp_path / "home"
+    ws = _git_repo(tmp_path, name="ws")
+    d1 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000002-parked"
+    d1.maestro._register_task(tid, "Parked task", 3, project_root=str(ws))
+    d1.maestro._write_claim(tid, "task_title", "Parked task")
+    d1.maestro._write_claim(tid, "task_workspace", str(ws))
+    d1.maestro._write_claim(tid, "task_status", "REVIEWING")
+    d1.maestro._write_claim(tid, "task_runtime", json.dumps({"state": "input-required", "workspace": str(ws), "title": "Parked task"}))
+    d1.stop()
+
+    d2 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        assert d2.status_a2a(tid)["status"]["state"] == "input-required"
+    finally:
+        d2.stop()
+
+
+def test_stop_marks_in_flight_task_failed(tmp_path, binpath):
+    """stop() must fail in-flight turns: right after the daemon stops, the
+    durable state of a running task is failed — not 'working'."""
+    home = tmp_path / "home"
+    _slow_fake_bin(binpath, ticks=60)  # ~6s of work; the assertion runs long before it ends
+    ws = _git_repo(tmp_path, name="ws")
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    started = d.delegate(_doc(), ws)
+    time.sleep(0.5)  # let the turn reach working
+    with d._lock:
+        assert d._tasks[started["task_id"]]["state"] == "working"
+    d.stop()
+    claims = d.maestro._claims(started["task_id"])
+    assert claims["task_status"] == "FAILED"
+
+
+def test_reconciliation_defensive_paths(daemon, tmp_path, monkeypatch):
+    """Reconciliation must survive a corrupt registry/claims store and never
+    block daemon startup; tasks it cannot reconstruct are skipped, not fatal."""
+    def boom(*a, **kw):
+        raise OSError("store unreadable")
+
+    # 1. Unreadable registry → early return, no raise.
+    monkeypatch.setattr(daemon.maestro, "_registry_records", boom)
+    daemon._reconcile_interrupted_tasks()
+
+    # 2. Unreadable claims for one task → skipped.
+    monkeypatch.setattr(daemon.maestro, "_registry_records", lambda: [{"task_id": "task-20260101-000009-badclaims"}])
+    monkeypatch.setattr(daemon.maestro, "_claims", boom)
+    daemon._reconcile_interrupted_tasks()
+
+    # 3. A registry entry without a task id is skipped.
+    monkeypatch.setattr(daemon.maestro, "_registry_records", lambda: [{"title": "no id"}])
+    monkeypatch.setattr(daemon.maestro, "_claims", lambda tid: {})
+    daemon._reconcile_interrupted_tasks()
+
+    # 4. A task that is already in memory is skipped (left to its live thread).
+    ws = _git_repo(tmp_path)
+    live_id, live_record = daemon._make_record(_doc(), str(ws))
+    monkeypatch.setattr(daemon.maestro, "_registry_records", lambda: [{"task_id": live_id}])
+    daemon._reconcile_interrupted_tasks()
+    assert live_record["state"] == "submitted"  # untouched
+
+    # 5. A task with no workspace claim cannot be reconstructed → skipped.
+    monkeypatch.setattr(daemon.maestro, "_registry_records", lambda: [{"task_id": "task-20260101-000010-nows"}])
+    monkeypatch.setattr(daemon.maestro, "_claims", lambda tid: {"task_status": "IMPLEMENTING"})
+    daemon._reconcile_interrupted_tasks()
+
+    # 6. A state write that fails mid-reconciliation is logged, not fatal.
+    monkeypatch.setattr(
+        daemon.maestro, "_claims",
+        lambda tid: {"task_status": "IMPLEMENTING", "task_workspace": "/ws/x"},
+    )
+    orig_persist = daemon._persist
+    daemon._persist = boom  # restored before teardown cancels the live task above
+    try:
+        daemon._reconcile_interrupted_tasks()  # must not raise
+    finally:
+        daemon._persist = orig_persist
+
+
+def test_stop_survives_state_write_failure(daemon, tmp_path, monkeypatch):
+    """stop()'s in-flight marking must not raise even when a state write fails;
+    the shutdown still completes."""
+    ws = _git_repo(tmp_path)
+    task_id, record = daemon._make_record(_doc(), str(ws))
+    record["state"] = "working"
+
+    def boom(*a, **kw):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(daemon, "_persist", boom)
+    daemon.stop()  # must not raise; shutdown completes
+
+
+def test_set_state_survives_knowledge_refresh_failure(daemon, tmp_path, binpath, monkeypatch):
+    """A failing task-knowledge projection must not abort a terminal transition:
+    the state is still persisted and its event still published."""
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path)
+
+    def boom(*a, **kw):
+        raise OSError("knowledge store broken")
+
+    monkeypatch.setattr(daemon, "_refresh_knowledge", boom)
+    started = daemon.delegate(_doc(), ws)
+    final = daemon.wait(started["task_id"], timeout=60)
+    assert final["status"]["state"] == "completed"  # the transition survived
+
+
+def _seed_parked_task(home: Path, tid: str, number: int, title: str, ws: Path) -> None:
+    """Write the durable claims of a task parked in input-required (REVIEWING
+    phase), exactly as a previous daemon run would have left them."""
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    doc = _doc(title=title)
+    d.maestro._register_task(tid, title, number, project_root=str(ws))
+    d.maestro._write_claim(tid, "task_title", title)
+    d.maestro._write_claim(tid, "task_workspace", str(ws))
+    d.maestro._write_claim(tid, "task_request", doc.request)
+    d.maestro._write_claim(tid, "task_status", "REVIEWING")
+    runtime = {
+        "state": "input-required",
+        "workspace": str(ws),
+        "title": title,
+        "doc": doc.to_dict(),
+        "turn": 1,
+        "question": "which option?",
+    }
+    d.maestro._write_claim(tid, "task_runtime", json.dumps(runtime))
+    d.stop()
+
+
+def test_parked_task_can_be_answered_after_restart(tmp_path, binpath):
+    """A task parked in input-required when the daemon died must still be
+    answerable after a restart — and the answered turn must run to completion."""
+    home = tmp_path / "home"
+    _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
+    ws = _git_repo(tmp_path, name="ws")
+    _seed_parked_task(home, "task-20260101-000011-parked", 5, "Parked task", ws)
+
+    d2 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        # Reconciliation must have left it parked (not failed).
+        assert d2.status_a2a("task-20260101-000011-parked")["status"]["state"] == "input-required"
+        result = d2.answer_question("task-20260101-000011-parked", "codex")
+        assert result["state"] == "working"
+        final = d2.wait("task-20260101-000011-parked", timeout=60)
+        assert final["status"]["state"] == "completed"
+    finally:
+        _drain_workers(d2)
+        d2.stop()
+
+
+def test_parked_task_can_be_canceled_after_restart(tmp_path):
+    """A task parked in an earlier daemon run must be cancelable after a
+    restart (durable-aware cancel), ending in canceled — not left hanging."""
+    home = tmp_path / "home"
+    ws = _git_repo(tmp_path, name="ws")
+    _seed_parked_task(home, "task-20260101-000012-parked", 6, "Parked task", ws)
+
+    d2 = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        result = d2.cancel("task-20260101-000012-parked", reason="no longer needed")
+        assert result["state"] == "canceled"
+        assert d2.status_a2a("task-20260101-000012-parked")["status"]["state"] == "canceled"
+    finally:
+        _drain_workers(d2)
+        d2.stop()

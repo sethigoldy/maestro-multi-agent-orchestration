@@ -13,7 +13,9 @@ import os
 import re
 import stat
 import subprocess
+import sys
 import threading
+import traceback
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -67,6 +69,37 @@ _STATE_BY_PHASE = {
     Phase.REVIEWING.value: STATE_COMPLETED,
     Phase.FAILED.value: STATE_FAILED,
 }
+
+_ALL_STATES = (STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED, STATE_COMPLETED, STATE_FAILED, STATE_CANCELED)
+
+
+def _durable_state(claims: dict[str, str], runtime: dict[str, Any]) -> str:
+    """Resolve the state of a task that has no live in-memory record.
+
+    The phase claim is lossy (input-required and completed both map to
+    REVIEWING), so the runtime snapshot's own state — written on every
+    transition by _persist — wins when it names a known A2A state. Only then
+    does the phase mapping apply; a missing/unknown status means the task's
+    process is gone and it can never finish on its own, so that defaults to
+    FAILED rather than a misleading WORKING.
+    """
+    raw = str(runtime.get("state") or "")
+    if raw in _ALL_STATES:
+        return raw
+    return _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_FAILED)
+
+
+def _runtime_from_claims(claims: dict[str, str]) -> dict[str, Any]:
+    """Parse the task_runtime claim (the last persisted record snapshot)."""
+    raw_runtime = claims.get("task_runtime")
+    if isinstance(raw_runtime, str):
+        try:
+            parsed = json.loads(raw_runtime)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    return {}
 
 
 def build_prompt(doc: HandoffDoc, task_id: str, workspace: Path, transcript: list[dict[str, str]], context_block: str = "") -> str:
@@ -262,6 +295,7 @@ class MaestroDaemon:
         self._presence: Any | None = None
         self._stopped = False
         self.sse_heartbeat_s = 15.0  # keepalive interval for /tasks/<id>/events streams
+        self._reconcile_interrupted_tasks()
         if start_http:
             self.start_http(port)
 
@@ -325,6 +359,17 @@ class MaestroDaemon:
         if self._stopped:
             return
         self._stopped = True
+        # Mark in-flight turns as failed before shutting down: once this process
+        # exits, no thread remains to drive them to a terminal state, and their
+        # durable status must not keep claiming "working". Parked (input-required)
+        # tasks are left for the next daemon; already-terminal ones need nothing.
+        for task_id, record in list(self._tasks.items()):
+            if record.get("state") in TERMINAL_STATES or record.get("state") == STATE_INPUT_REQUIRED:
+                continue
+            try:
+                self._set_state(task_id, STATE_FAILED, error="daemon stopped while the task was running; re-delegate, or continue this task to resume.")
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
         if self._presence is not None:
             self._presence.stop()
             self._presence = None
@@ -339,6 +384,54 @@ class MaestroDaemon:
             except OSError:
                 pass
         self.maestro.close()
+
+    def _reconcile_interrupted_tasks(self) -> None:
+        """Fail tasks that a previous daemon process left mid-flight.
+
+        A turn is an in-process thread. When the daemon dies (SIGKILL, OOM,
+        reboot, crash) or stops while a task is working — or while it was still
+        queued — no thread remains to drive it to a terminal state, and its
+        durable status stays IMPLEMENTING/VERIFYING/FIXING forever: every later
+        query would report "working" for work that can never finish on its own.
+        At startup we mark exactly those tasks FAILED with an explanatory error
+        (they stay continuable via followup/task continue). Parked
+        input-required tasks are left alone — they are legitimately waiting for
+        an answer, not interrupted.
+        """
+        try:
+            records = self.maestro._registry_records()
+        except Exception:
+            return  # unreadable registry: never block daemon startup on reconciliation
+        for item in records:
+            task_id = str(item.get("task_id") or "")
+            if not task_id or task_id in self._tasks:
+                continue
+            try:
+                claims = self.maestro._claims(task_id)
+            except Exception:
+                continue
+            runtime = _runtime_from_claims(claims)
+            state = _durable_state(claims, runtime)
+            if state == STATE_WORKING:
+                reason = (
+                    "daemon stopped or crashed while the task was running; its turn was interrupted. "
+                    "Re-delegate, or continue this task to resume."
+                )
+            elif state == STATE_SUBMITTED or (not claims.get("task_status") and not runtime.get("state")):
+                # Registered but never started (queued behind a workspace that
+                # was busy when the previous process died — the queue is
+                # in-memory) or died before its first state was persisted.
+                reason = "daemon restarted before the task started; re-delegate to run it."
+            else:
+                continue  # completed/failed/canceled or parked input-required: leave as-is
+            try:
+                record = self._durable_record(task_id)
+                if record is None:
+                    continue
+                record["error"] = reason
+                self._set_state(task_id, STATE_FAILED, error=reason)
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
 
     # ------------------------------------------------------------- delegation
     def _budget_records(self) -> list[dict[str, Any]]:
@@ -675,11 +768,52 @@ class MaestroDaemon:
         if state in TERMINAL_STATES:
             # Every terminal transition refreshes the durable task-knowledge
             # projection (deterministic; re-derived from claims + git state).
-            self._refresh_knowledge(task_id)
+            # The projection is derived data: a failure here must never abort
+            # the transition itself, or the task would be durably terminal in
+            # the record/claims but its terminal event would never be published.
+            try:
+                self._refresh_knowledge(task_id)
+            except Exception:
+                print(f"[maestro] task {task_id}: knowledge refresh failed after {state}:", file=sys.stderr, flush=True)
+                traceback.print_exc(file=sys.stderr)
         self.bus.publish(TaskEvent(task_id=task_id, type="state", data={"state": state, **{k: v for k, v in data.items() if v is not None}}))
 
     def _run_task(self, task_id: str, doc: HandoffDoc, workspace: Path) -> None:
-        self._set_state(task_id, STATE_WORKING)
+        """Thread entry point for one turn.
+
+        Crash safety: a turn runs in a bare daemon thread, so any uncaught
+        exception (adapter spawn failure, disk error writing the result file,
+        git/subprocess failure inside verification or the knowledge refresh)
+        used to kill the thread silently — the task then reported "working"
+        forever with no thread left to drive it to a terminal state, and every
+        later handoff to that workspace queued behind the ghost. Any exception
+        now ends the task in FAILED (unless it already parked or terminated on
+        its own) and frees the workspace slot.
+        """
+        try:
+            self._set_state(task_id, STATE_WORKING)
+            self._run_turn(task_id, doc, workspace)
+        except Exception as exc:
+            self._handle_turn_crash(task_id, exc)
+
+    def _handle_turn_crash(self, task_id: str, exc: BaseException) -> None:
+        """Terminal safety net for a crashed turn. Marks the task FAILED and
+        frees its workspace slot — unless it already parked (input-required
+        holds its slot by design) or reached a terminal state on its own.
+        Never raises: this is the last line of defense in a bare thread."""
+        record = self._tasks.get(task_id) or {}
+        state = record.get("state")
+        if state != STATE_INPUT_REQUIRED and state not in TERMINAL_STATES:
+            try:
+                self._set_state(task_id, STATE_FAILED, error=f"turn crashed before completion: {exc!r}")
+                self.bus.publish(TaskEvent(task_id=task_id, type="state", data={"escalation": True, "error": f"turn crashed: {exc!r}"}))
+                self._release(task_id)  # idempotent: frees the slot only if this task still owns it
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        print(f"[maestro] task {task_id} turn crashed (state={state}):", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+
+    def _run_turn(self, task_id: str, doc: HandoffDoc, workspace: Path) -> None:
         record = self._tasks.get(task_id)
         turn = (record.get("turn") or 0) + 1 if record is not None else 1
         if record is not None:
@@ -1184,7 +1318,9 @@ class MaestroDaemon:
 
     # ------------------------------------------------------------ interactions
     def answer_question(self, task_id: str, answer: str) -> dict[str, Any]:
-        record = self._tasks.get(task_id)
+        # Durable-aware: a task parked in an earlier daemon run can be answered
+        # after a restart (its record is reconstructed from claims).
+        record = self._tasks.get(task_id) or self._durable_record(task_id)
         if record is None:
             raise KeyError(f"Unknown task reference {task_id!r}")
         if record["state"] != STATE_INPUT_REQUIRED:
@@ -1250,19 +1386,13 @@ class MaestroDaemon:
         claims = self.maestro._claims(task_id)
         if not claims.get("task_workspace"):
             return None
-        runtime: dict[str, Any] = {}
-        raw_runtime = claims.get("task_runtime")
-        if isinstance(raw_runtime, str):
-            try:
-                parsed = json.loads(raw_runtime)
-            except (ValueError, TypeError):
-                parsed = None
-            if isinstance(parsed, dict):
-                runtime = parsed
+        runtime = _runtime_from_claims(claims)
         doc = runtime.get("doc") if isinstance(runtime.get("doc"), dict) else None
         record = {
             "task_id": task_id,
-            "state": _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING),
+            # Prefer the runtime snapshot's own state (the phase claim is lossy:
+            # parked and completed both map to REVIEWING); unknown → failed.
+            "state": _durable_state(claims, runtime),
             "origin_agent": claims.get("task_origin_agent"),
             "target_agent": claims.get("task_target_agent") or (doc or {}).get("routing", {}).get("target_agent"),
             "agent": runtime.get("agent"),
@@ -1406,7 +1536,9 @@ class MaestroDaemon:
         )
 
     def cancel(self, task_id: str, reason: str = "") -> dict[str, Any]:
-        record = self._tasks.get(task_id)
+        # Durable-aware: a parked task from an earlier daemon run can be
+        # canceled after a restart (its record is reconstructed from claims).
+        record = self._tasks.get(task_id) or self._durable_record(task_id)
         if record is None:
             raise KeyError(f"Unknown task reference {task_id!r}")
         if record["state"] in TERMINAL_STATES:
@@ -1439,7 +1571,10 @@ class MaestroDaemon:
             claims = self.maestro._claims(task_id)
             if not claims and not (self.state_dir / "tasks" / task_id).is_dir():
                 raise KeyError(f"Unknown task reference {task_id!r}")
-            state = _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING)
+            # A task without a live record belongs to a dead process and can
+            # never emit events, so an unresolved state must not block waiters
+            # for the full timeout: _durable_state resolves it (unknown → failed).
+            state = _durable_state(claims, _runtime_from_claims(claims))
             if state in stop_states:
                 return self.status_a2a(task_id)  # durable terminal from an earlier run
         threshold = max((e.seq for e in self.bus.history(task_id=task_id)), default=0)
@@ -1476,21 +1611,16 @@ class MaestroDaemon:
             bounces = record.get("bounces")
         else:  # durable fallback for tasks from earlier daemon runs
             claims = self.maestro._claims(task_id)
-            state = _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING)
+            runtime = _runtime_from_claims(claims)
+            # The runtime snapshot's own state wins over the lossy phase claim;
+            # a missing/unknown status means the task's process is gone and it
+            # can never finish on its own — report FAILED, not WORKING.
+            state = _durable_state(claims, runtime)
             workspace = claims.get("task_workspace")
             branch = claims.get("task_branch")
             origin = claims.get("task_origin_agent")
             target = claims.get("task_target_agent")
             title = claims.get("task_title")
-            runtime: dict[str, Any] = {}
-            raw_runtime = claims.get("task_runtime")
-            if isinstance(raw_runtime, str):
-                try:
-                    parsed = json.loads(raw_runtime)
-                    if isinstance(parsed, dict):
-                        runtime = parsed
-                except (ValueError, TypeError):
-                    runtime = {}
             usage = runtime.get("usage")
             attempts = runtime.get("attempts") or []
             error = runtime.get("error")
