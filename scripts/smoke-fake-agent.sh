@@ -35,7 +35,7 @@ export MAESTRO_DISCOVERY_IF=127.0.0.1
 unset MAESTRO_DAEMON_URL MAESTRO_DAEMON_TOKEN 2>/dev/null || true
 
 # --- workspace: a git repo with no test runner (verification degrades to
-# --- git diff --check, which the fake agent cannot break).
+# --- git diff --check, which now also requires evidence of work).
 WS="$WORK/ws"
 mkdir -p "$WS"
 git -C "$WS" init -q
@@ -44,13 +44,18 @@ git -C "$WS" config user.name "Smoke Test"
 echo "# smoke repo" > "$WS/README.md"
 git -C "$WS" add . && git -C "$WS" commit -qm "initial"
 
-# --- the fake agent: consumes the prompt, streams one line, reports usage.
+# --- the fake agent: consumes the prompt, streams one line, reports usage,
+# --- and leaves a real working-tree change (the fallback verifier refuses to
+# --- certify a turn with no changes). Guarded: the preflight probe runs the
+# --- binary with --version from the daemon's cwd, not a real turn.
 FAKE="$WORK/fake-agent.sh"
 cat > "$FAKE" <<'EOF'
 #!/bin/sh
+case "${1:-}" in --version) exit 0 ;; esac
 cat > /dev/null
 echo "implementing (fake agent)"
 echo '{"cost_usd": 0.41}'
+echo "fake work" >> README.md
 exit 0
 EOF
 chmod +x "$FAKE"
