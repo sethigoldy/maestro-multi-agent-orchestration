@@ -88,6 +88,8 @@ class A2ADispatcher:
             return self._get(request_id, params)
         if method == "tasks/cancel":
             return self._cancel(request_id, params)
+        if method == "tasks/followup":
+            return self._followup(request_id, params)
         return jsonrpc_error(request_id, ERR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
     def _send(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -152,6 +154,24 @@ class A2ADispatcher:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
         try:
             result = self.daemon.cancel(self.daemon.resolve(task_ref), reason=str(params.get("reason") or ""))
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        except ValueError as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
+        return jsonrpc_ok(request_id, {"task": self.daemon.status_a2a(result["task_id"])})
+
+    def _followup(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        instruction = params.get("instruction")
+        if not isinstance(instruction, str) or not instruction.strip():
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.instruction is required (non-empty string)")
+        context_mode = params.get("context_mode", "reuse")
+        if context_mode not in ("reuse", "fresh"):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.context_mode must be 'reuse' or 'fresh'")
+        try:
+            result = self.daemon.followup(self.daemon.resolve(task_ref), instruction, context_mode=context_mode)
         except KeyError as exc:
             return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
         except ValueError as exc:

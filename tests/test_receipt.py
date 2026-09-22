@@ -177,6 +177,79 @@ def test_receipt_phase_fallback_without_runtime(plain_state):
     assert r["totals"]["duration_s"] is None and r["totals"]["duration_basis"] is None
 
 
+def test_receipt_turns_knowledge_and_context(plain_state):
+    """A continued task surfaces turn count, knowledge metadata, and context stats."""
+    m, _ = plain_state
+    tid = "task-20260101-000000-kk0001"
+    stats = {
+        "mode": "reuse", "knowledge_chars": 512, "context_chars": 480,
+        "raw_history_bytes": 4096, "estimated_tokens": 120, "reduction_ratio": 0.883,
+    }
+    _seed(
+        m, tid,
+        runtime={
+            "state": "completed",
+            "turn": 2,
+            "context_stats": stats,
+            "attempts": [
+                {"agent": "codex", "role": "implement", "ok": True, "exit_code": 0,
+                 "duration_s": 10.0, "finished_at": "2026-01-01T00:00:10+00:00"},
+            ],
+        },
+    )
+    m._write_claim(
+        tid, "task_knowledge",
+        json.dumps({"schema_version": 1, "source_turn": 2, "last_updated": "2026-01-01T00:00:11+00:00"}),
+    )
+    from maestro.receipt import build_receipt, format_receipt
+
+    r = build_receipt(tid, m)
+    assert r["turns"] == 2
+    assert r["knowledge"] == {"schema_version": 1, "source_turn": 2, "last_updated": "2026-01-01T00:00:11+00:00"}
+    assert r["context"] == stats
+    text = format_receipt(r)
+    assert "Turns       2 (continuations on the same task)" in text
+    assert "Knowledge   schema v1, turn 2" in text
+
+
+def test_receipt_legacy_task_without_knowledge(plain_state):
+    """Old tasks (no task_knowledge claim, single turn) stay clean: no new lines."""
+    m, _ = plain_state
+    tid = "task-20260101-000000-kk0002"
+    _seed(m, tid, runtime={"state": "completed", "attempts": []})
+    from maestro.receipt import build_receipt, format_receipt
+
+    r = build_receipt(tid, m)
+    assert r["turns"] is None and r["knowledge"] is None and r["context"] is None
+    text = format_receipt(r)
+    assert "Turns" not in text and "Knowledge" not in text
+
+
+def test_receipt_malformed_knowledge_claim_ignored(plain_state):
+    m, _ = plain_state
+    tid = "task-20260101-000000-kk0003"
+    _seed(m, tid, runtime={"state": "completed", "turn": 1, "attempts": []})
+    m._write_claim(tid, "task_knowledge", "{not valid json")
+    from maestro.receipt import build_receipt
+
+    r = build_receipt(tid, m)
+    assert r["knowledge"] is None and r["turns"] == 1
+
+
+def test_receipt_knowledge_without_source_turn(plain_state):
+    """Knowledge metadata without a source turn renders the bare schema line."""
+    m, _ = plain_state
+    tid = "task-20260101-000000-kk0004"
+    _seed(m, tid, runtime={"state": "completed", "turn": 3, "attempts": []})
+    m._write_claim(tid, "task_knowledge", json.dumps({"schema_version": 2}))
+    from maestro.receipt import build_receipt, format_receipt
+
+    r = build_receipt(tid, m)
+    assert r["knowledge"] == {"schema_version": 2, "source_turn": None, "last_updated": None}
+    text = format_receipt(r)
+    assert "Knowledge   schema v2" in text and ", turn" not in text.split("Knowledge")[1]
+
+
 def test_receipt_number_from_registry_when_claim_missing(plain_state):
     m, _ = plain_state
     tid = "task-20260101-000000-eeeeee"

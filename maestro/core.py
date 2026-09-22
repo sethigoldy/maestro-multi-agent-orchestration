@@ -254,13 +254,14 @@ class Maestro:
         elif command is not None and not (isinstance(command, list) and all(isinstance(x, str) for x in command)):
             raise ValueError("Verification command must be a string or list of strings")
         from .context import parse_context_config
+        from .knowledge import parse_continuation
         from .modes import parse_modes
 
         context: dict[str, Any] = {}
         for source, table in context_layers:
             context.update(parse_context_config(table, source))
 
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults}
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults, "continuation": parse_continuation(merged.get("continuation"))}
 
     @staticmethod
     def _parse_defaults(raw: Any) -> dict[str, Any]:
@@ -356,7 +357,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request", "task_runtime", "task_gates"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_request", "task_runtime", "task_gates", "task_knowledge"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)

@@ -134,6 +134,27 @@ wins over the user-level one for that label. Validation at load is strict —
 invalid entries raise, like `[modes]`. `maestro config` lists every defined
 entry with its source.
 
+### `[continuation]` — task continuation context
+
+```toml
+[continuation]
+enabled    = true    # default: reuse the compact task-knowledge snapshot on follow-ups
+max_tokens = 6000    # default: budget for the injected snapshot (chars ≈ 4 × tokens)
+```
+
+Controls how `followup` (CLI `task continue`, MCP `followup`, A2A
+`tasks/followup`) builds the next turn's context. In the default `reuse` mode,
+the daemon projects a compact **task-knowledge** snapshot — goal, current
+state, files changed, latest verification result and failures, known issues,
+and a bounded tail of the last turn's output — from durable state and injects
+it as one labeled context entry; raw history stays in the task record and is
+never replayed. `enabled = false` turns follow-ups into clean-context turns
+(equivalent to always passing `--context fresh`). `max_tokens` caps the
+snapshot size: sections are dropped or truncated deterministically until it
+fits (the budget is a character budget of `4 × max_tokens`, so values are
+comparable across models). `MAESTRO_CONTINUATION_MAX_TOKENS` overrides
+`max_tokens` per daemon process when set to a positive integer.
+
 ## Verification auto-detection
 
 With handoff `verification = "auto"` (the default), the check command is
@@ -182,6 +203,7 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort fallbacks when no config file sets them |
 | `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc env`) to spawned agents |
 | `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment |
+| `MAESTRO_CONTINUATION_MAX_TOKENS` | from `[continuation]` | Positive-integer override of the continuation context budget (see `[continuation]`) |
 | `MAESTRO_PYTHON` | — | Interpreter for verification's pytest probe (must be a file) |
 
 Misconfigured budget values (non-numeric, negative) are ignored rather than

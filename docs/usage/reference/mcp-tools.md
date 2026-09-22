@@ -84,15 +84,24 @@ Signature unchanged: the context lives in the file.
 ## followup
 
 ```text
-followup(workspace: str, task_id: str, instruction: str) -> str
+followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str
 ```
 
 Resumes a finished task (`completed`/`failed`/`canceled`) with a new
-instruction; the same agent continues on the same task branch with its previous
-Q&A in context. When the task was delegated under a work mode, follow-ups run
-under that mode's `fixer` (the agent already pinned to fixing) instead of the
-original implementer. Blocks like `delegate` (same timeout and `timed_out`
-semantics). Each follow-up decrements `max_depth_remaining` by one.
+instruction; the same agent continues on the same task branch. When the task
+was delegated under a work mode, follow-ups run under that mode's `fixer` (the
+agent already pinned to fixing) instead of the original implementer. Blocks
+like `delegate` (same timeout and `timed_out` semantics). Each follow-up
+decrements `max_depth_remaining` by one.
+
+`context_mode`: `"reuse"` (default) injects a compact **task-knowledge**
+snapshot — goal, current state, files changed, latest verification result and
+failures, known issues, and a bounded tail of the last turn's output — projected
+from durable state, so the agent continues without re-discovering the work; raw
+history stays in the task record and is never replayed. `"fresh"` skips the
+snapshot for a clean reasoning context (same task/workspace/branch). See
+[Configuration: `[continuation]`](./configuration.md#continuation--task-continuation-context)
+to disable reuse or resize its budget.
 
 Errors: unknown task (`KeyError` text), empty instruction, task still active
 (`"…cancel it or answer its question before following up"`), depth exhausted —

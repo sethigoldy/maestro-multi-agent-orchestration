@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import subprocess
 import threading
 import uuid
@@ -38,6 +39,7 @@ from .context import RenderedContext, compose_context, entry_from_dict, render_c
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
 from .handoff import HandoffDoc
+from .knowledge import TaskKnowledge, continuation_budget_chars, estimate_tokens, project_knowledge, render_continuation_block
 from .models import Phase
 from .modes import DEFAULT_MAX_BOUNCES, expand as expand_mode, resolve_mode
 from .worker import _verification_command
@@ -668,6 +670,10 @@ class MaestroDaemon:
         if phase is not None:
             self.maestro._write_claim(task_id, "task_status", phase.value)
         self._persist(task_id)
+        if state in TERMINAL_STATES:
+            # Every terminal transition refreshes the durable task-knowledge
+            # projection (deterministic; re-derived from claims + git state).
+            self._refresh_knowledge(task_id)
         self.bus.publish(TaskEvent(task_id=task_id, type="state", data={"state": state, **{k: v for k, v in data.items() if v is not None}}))
 
     def _run_task(self, task_id: str, doc: HandoffDoc, workspace: Path) -> None:
@@ -1140,13 +1146,108 @@ class MaestroDaemon:
         thread.start()
         return {"task_id": task_id, "state": STATE_WORKING}
 
-    def followup(self, task_id: str, instruction: str) -> dict[str, Any]:
+    # ------------------------------------------------------------ task knowledge
+    def _refresh_knowledge(self, task_id: str) -> TaskKnowledge | None:
+        """Re-project durable state into the task's knowledge snapshot.
+
+        Writes the ``task_knowledge`` claim (the single durable home of the
+        snapshot — works on both storage backends, survives restarts). Returns
+        the projected knowledge, or None when no claims exist yet for the task.
+        """
+        claims = self.maestro._claims(task_id)
+        if not claims:
+            return None
+        runtime: dict[str, Any] = {}
+        raw_runtime = claims.get("task_runtime")
+        if isinstance(raw_runtime, str):
+            try:
+                parsed = json.loads(raw_runtime)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                runtime = parsed
+        workspace_raw = claims.get("task_workspace")
+        knowledge = project_knowledge(task_id, claims, runtime, workspace=Path(workspace_raw) if workspace_raw else None)
+        self.maestro._write_claim(task_id, "task_knowledge", knowledge.serialize())
+        return knowledge
+
+    def _durable_record(self, task_id: str) -> dict[str, Any] | None:
+        """Rebuild the in-memory record from durable claims after a restart.
+
+        Returns None when the task has no durable workspace claim (unknown
+        task). The Q&A transcript is intentionally not reconstructed — it was
+        never persisted (pre-existing behavior); continuations rely on task
+        knowledge instead of the transcript.
+        """
+        claims = self.maestro._claims(task_id)
+        if not claims.get("task_workspace"):
+            return None
+        runtime: dict[str, Any] = {}
+        raw_runtime = claims.get("task_runtime")
+        if isinstance(raw_runtime, str):
+            try:
+                parsed = json.loads(raw_runtime)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                runtime = parsed
+        doc = runtime.get("doc") if isinstance(runtime.get("doc"), dict) else None
+        record = {
+            "task_id": task_id,
+            "state": _STATE_BY_PHASE.get(str(claims.get("task_status")), STATE_WORKING),
+            "origin_agent": claims.get("task_origin_agent"),
+            "target_agent": claims.get("task_target_agent") or (doc or {}).get("routing", {}).get("target_agent"),
+            "agent": runtime.get("agent"),
+            "workspace": claims["task_workspace"],
+            "branch": claims.get("task_branch") or runtime.get("branch"),
+            "title": claims.get("task_title"),
+            "doc": doc,
+            "attempts": runtime.get("attempts") or [],
+            "result": runtime.get("result"),
+            "usage": runtime.get("usage"),
+            "error": runtime.get("error"),
+            "started_at": runtime.get("started_at"),
+            "turn": runtime.get("turn") or 0,
+            "transcript": [],
+        }
+        with self._lock:
+            self._tasks[task_id] = record
+            self._cancel_flags.setdefault(task_id, threading.Event())
+        return record
+
+    def _raw_history_bytes(self, task_id: str) -> int:
+        """Total bytes of the task's durable artifact trail (honest raw size).
+
+        One ``stat`` per entry (no separate is_file probe): an entry that
+        vanishes or is unreadable between enumeration and stat is skipped."""
+        task_dir = self.state_dir / "tasks" / task_id
+        if not task_dir.is_dir():
+            return 0
+        total = 0
+        for path in sorted(task_dir.rglob("*")):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if stat.S_ISREG(st.st_mode):
+                total += st.st_size
+        return total
+
+    def followup(self, task_id: str, instruction: str, context_mode: str = "reuse") -> dict[str, Any]:
         """Resume a finished task (completed/failed/canceled) with a new instruction.
 
-        The same target agent continues on the same task branch with the previous
-        Q&A transcript in context. Depth is decremented so follow-up chains cannot
-        nest forever."""
-        record = self._tasks.get(task_id)
+        The same target agent continues on the same task branch. With
+        ``context_mode="reuse"`` (default) the turn receives a compact task-
+        knowledge snapshot — goal, current state, verification result, known
+        issues — instead of re-discovering everything; raw history stays in the
+        durable record. ``context_mode="fresh"`` skips the snapshot for a clean
+        reasoning context (same task/workspace/branch). Depth is decremented so
+        follow-up chains cannot nest forever. Works after a daemon restart: an
+        unknown in-memory task is reconstructed from durable claims.
+        """
+        if context_mode not in ("reuse", "fresh"):
+            raise ValueError(f"context_mode must be 'reuse' or 'fresh': {context_mode!r}")
+        record = self._tasks.get(task_id) or self._durable_record(task_id)
         if record is None:
             raise KeyError(f"Unknown task reference {task_id!r}")
         instruction = str(instruction).strip()
@@ -1189,6 +1290,30 @@ class MaestroDaemon:
         )
         if followup_doc.max_depth_remaining <= 0:
             raise ValueError("Max delegation depth exceeded; refusing to nest further")
+        # Continuation context: carry the task's composed [[context]] entries
+        # forward (follow-up turns must see what earlier turns saw), dropping
+        # any stale knowledge entry from an earlier turn; in reuse mode a fresh
+        # compact knowledge snapshot is then injected as its own entry, rendered
+        # through the standard context pipeline.
+        followup_doc.context_entries = [e for e in doc.context_entries if e.get("label") != "task-knowledge"]
+        raw_history = self._raw_history_bytes(task_id)
+        continuation_config = self.maestro.config.get("continuation") or {}
+        if context_mode == "reuse" and continuation_config.get("enabled", True):
+            knowledge = self._refresh_knowledge(task_id)
+            block = render_continuation_block(knowledge, continuation_budget_chars(self.maestro.config)) if knowledge is not None else ""
+            if block:
+                followup_doc.context_entries.append({"label": "task-knowledge", "kind": "text", "text": block})
+            record["context_stats"] = {
+                "mode": "reuse",
+                "knowledge_chars": len(knowledge.serialize()) if knowledge is not None else 0,
+                "context_chars": len(block),
+                "raw_history_bytes": raw_history,
+                # chars/4 estimate — labeled as an estimate in receipts/docs.
+                "estimated_tokens": estimate_tokens(block),
+                "reduction_ratio": round(1 - len(block) / raw_history, 3) if (block and raw_history > 0) else None,
+            }
+        elif context_mode == "fresh":
+            record["context_stats"] = {"mode": "fresh", "raw_history_bytes": raw_history}
         record["doc"] = followup_doc.to_dict()  # the chain accumulates: later follow-ups see reduced depth
         record["target_agent"] = followup_doc.target_agent  # a pinned fixer becomes the task's current target
         self._persist(task_id, followup_doc)

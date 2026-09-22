@@ -156,6 +156,20 @@ def build_receipt(task_id: str, maestro: Any, state_dir: str | Path | None = Non
     doc = runtime.get("doc") if isinstance(runtime.get("doc"), dict) else {}
     routing = doc.get("routing") if isinstance(doc.get("routing"), dict) else {}
 
+    knowledge: dict[str, Any] | None = None
+    raw_knowledge = claims.get("task_knowledge")
+    if isinstance(raw_knowledge, str):
+        try:
+            parsed_knowledge = json.loads(raw_knowledge)
+        except (ValueError, TypeError):
+            parsed_knowledge = None
+        if isinstance(parsed_knowledge, dict):
+            knowledge = {
+                "schema_version": parsed_knowledge.get("schema_version"),
+                "source_turn": parsed_knowledge.get("source_turn"),
+                "last_updated": parsed_knowledge.get("last_updated"),
+            }
+
     pairs: list[tuple[dict[str, Any], datetime | None]] = []
     for index, raw in enumerate(runtime.get("attempts") or []):
         if isinstance(raw, dict):
@@ -197,6 +211,14 @@ def build_receipt(task_id: str, maestro: Any, state_dir: str | Path | None = Non
         },
         "state": state,
         "error": runtime.get("error"),
+        # Task turns (executions of the logical task) vs. agent attempts below:
+        # a follow-up is one more turn on the same task, not a new task.
+        "turns": runtime.get("turn"),
+        # Compact continuation snapshot metadata (projection, not source data).
+        "knowledge": knowledge,
+        # Continuation instrumentation after a reuse/fresh follow-up: honest
+        # measured sizes plus a labeled token estimate (see knowledge.py).
+        "context": runtime.get("context_stats"),
         "attempts": [view for view, _ in pairs],
         "verification": verification,
         "gates": gates,
@@ -262,6 +284,14 @@ def format_receipt(receipt: dict[str, Any]) -> str:
     ):
         if value not in (None, ""):
             lines.append(f"{label:<12}{value}")
+
+    turns = receipt.get("turns")
+    if isinstance(turns, int) and turns > 1:
+        lines.append(f"{'Turns':<12}{turns} (continuations on the same task)")
+    knowledge = receipt.get("knowledge") or {}
+    if knowledge.get("schema_version"):
+        updated = f", turn {knowledge['source_turn']}" if isinstance(knowledge.get("source_turn"), int) else ""
+        lines.append(f"{'Knowledge':<12}schema v{knowledge['schema_version']}{updated}")
 
     attempts = receipt.get("attempts") or []
     if attempts:
