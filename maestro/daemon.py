@@ -95,6 +95,8 @@ CONTEXT FILES: {context_files}
 
 EXPECTATIONS: artifacts: {", ".join(doc.artifacts)}; verification: {doc.verification}; commit policy: {doc.commit_policy}
 
+EXECUTION MODE: this is a non-interactive batch run — nobody can answer questions or grant approvals while you work. Do not stop to ask for approval or confirmation; make reasonable decisions within the request's scope, complete the work in this run, and list any open questions in your final report so they can be answered on a follow-up turn.
+
 PREVIOUS Q&A (if any):
 {qa}
 
