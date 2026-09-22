@@ -12,6 +12,8 @@ semantic versioning.
 
 ### Fixed
 
+- **Dashboard layout on terminals narrower than 100 columns** — `maestro dashboard` rendered every frame for a fixed 100-column width, so on narrower terminals each line wrapped and the whole screen cascaded into a scattered layout. The TUI now detects the real terminal width (`$COLUMNS`, then a TIOCGWINSZ query on the stdout fd, falling back to 80) and re-queries it on `SIGWINCH` with an immediate redraw; the frame renderer also clamps its width input and truncates detail-pane values (title, workspace, branch, error, transcript lines) so no line in the frame can wrap.
+
 - **Agents now inherit login-shell environment variables** — spawned agents
   previously received only the daemon process's environment, so profile exports
   (API keys such as `GROVE_API_KEY`) were missing whenever the daemon was
