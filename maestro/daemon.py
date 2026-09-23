@@ -48,7 +48,7 @@ from .handoff import HandoffDoc
 from .knowledge import TaskKnowledge, continuation_budget_chars, estimate_tokens, project_knowledge, render_continuation_block
 from .models import Phase
 from .modes import DEFAULT_MAX_BOUNCES, expand as expand_mode, resolve_mode
-from .worker import _verification_command
+from .worker import _has_python_test_suite, _verification_command
 
 _TASK_ID_RE = re.compile(r"^task-\d{8}-\d{6}-[0-9a-f]{6}$")
 
@@ -1019,12 +1019,7 @@ class MaestroDaemon:
                 # The branch was renamed by hand since the last turn and this
                 # turn adopted the new name: tell every view.
                 self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
-        base_head = self._base_head(workspace)
-        if base_head:
-            record = self._tasks.get(task_id)
-            if record is not None:
-                record["base_head"] = base_head  # per-turn evidence baseline for verification
-            self.maestro._write_claim(task_id, "task_base_head", base_head)
+        self._record_turn_baseline(task_id, workspace, doc)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
         last_error: str | None = None
         for agent_name in chain:
@@ -1455,6 +1450,45 @@ class MaestroDaemon:
         head = probe.stdout.strip()
         return head or None
 
+    def _record_turn_baseline(self, task_id: str, workspace: Path, doc: HandoffDoc) -> None:
+        """Record what verification compares this turn against, before the agent runs.
+
+        Two values are kept, each in the task record and in a claim so that a
+        restarted daemon still has them:
+
+        - ``base_head``: the HEAD commit, so new commits count as work.
+        - ``python_test_suite``: whether the project had a Python test suite.
+          Verification accepts pytest's "no tests collected" exit code only
+          when it did not, so an agent that deletes or hides every test does
+          not pass. Only auto-detected verification uses this value, so the
+          project is scanned only in that mode.
+        """
+        base_head = self._base_head(workspace)
+        if base_head:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record["base_head"] = base_head  # per-turn evidence baseline for verification
+            self.maestro._write_claim(task_id, "task_base_head", base_head)
+        if doc.verification == "auto":
+            suite = _has_python_test_suite(workspace)
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record["python_test_suite"] = suite
+            self.maestro._write_claim(task_id, "task_python_test_suite", "true" if suite else "false")
+
+    def _had_python_test_suite(self, task_id: str) -> bool:
+        """Whether the project had a Python test suite when the turn started.
+
+        When nothing was recorded (a task started by an older Maestro), the
+        answer is True, so pytest's "no tests collected" exit code is not
+        accepted without evidence that there were no tests to begin with.
+        """
+        record = self._tasks.get(task_id) or {}
+        recorded = record.get("python_test_suite")
+        if recorded is None:
+            return self.maestro._claims(task_id).get("task_python_test_suite") != "false"
+        return bool(recorded)
+
     def _workspace_has_changes(self, workspace: Path, task_id: str) -> tuple[bool, str]:
         """Evidence that the turn produced work: working-tree changes or new commits."""
         status = subprocess.run(["git", "-C", str(workspace), "status", "--porcelain"], text=True, capture_output=True)
@@ -1516,16 +1550,27 @@ class MaestroDaemon:
 
             tests = _FailedRun()
         # An auto-detected pytest run that found no tests (exit code 5) is not
-        # a test failure, but it proves nothing about the turn either. It is
+        # a test failure when the project had no Python test suite when the
+        # turn started. It proves nothing about the turn either, so it is
         # treated like the `git diff --check` fallback: it passes only when the
-        # turn left changes behind. An explicit command keeps its exit code.
-        no_tests = configured is None and _pytest_found_no_tests(test_cmd, tests.returncode)
+        # turn left changes behind. When the project did have a test suite,
+        # exit code 5 means the tests were removed or hidden, and it is a
+        # failure. An explicit command always keeps its exit code.
+        pytest_no_tests = configured is None and _pytest_found_no_tests(test_cmd, tests.returncode)
+        suite_vanished = pytest_no_tests and self._had_python_test_suite(task_id)
+        no_tests = pytest_no_tests and not suite_vanished
         ok = diff.returncode == 0 and (tests.returncode == 0 or no_tests)
         no_changes_reason: str | None = None
         if ok and (fallback_only or no_tests) and not has_changes:
             ok = False
             no_changes_reason = evidence
         note_text = f"verification note: {note}\n\n" if note else ""
+        if suite_vanished:
+            note_text += (
+                "verification note: pytest collected no tests although the project had a Python test suite "
+                f"when the turn started (exit code {tests.returncode}). This counts as a failure, because "
+                "the tests may have been deleted, renamed or hidden.\n\n"
+            )
         if no_tests:
             note_text += (
                 f"verification note: pytest found no tests to run (exit code {tests.returncode}). "
@@ -1789,7 +1834,7 @@ class MaestroDaemon:
         }
         # What a parked task was waiting for (routing vs. a question), and the
         # gate and verification details the status views show.
-        for key in ("awaiting", "question", "gates", "bounces", "base_head", "verification"):
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification"):
             if runtime.get(key) is not None:
                 record[key] = runtime[key]
         with self._lock:

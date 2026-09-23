@@ -22,10 +22,45 @@ PYTEST_NO_TESTS_EXIT_CODE = 5
 # exits 1, so it means "this package has no tests", not "the tests failed".
 _NPM_DEFAULT_TEST_SCRIPT = re.compile(r"""echo\s+(["'])Error: no test specified\1\s*&&\s*exit\s+1""")
 
-# A Makefile rule line: one or more target names at the start of the line,
-# followed by ":" or "::". Variable assignments such as "X := 1" and "X ::= 1"
-# are excluded, and so are recipe lines, which start with a tab.
-_MAKE_RULE_LINE = re.compile(r"^([^\s:#=][^:#=]*?)\s*::?(?![:=])")
+# The names make looks for, in the order it looks for them. make reads only
+# the first one that exists.
+_MAKEFILE_NAMES = ("GNUmakefile", "makefile", "Makefile")
+
+# At most this many makefiles (the main one plus the files it includes) are
+# read when looking for a check target.
+_MAKEFILE_READ_LIMIT = 50
+
+# Words that start a make directive line. Such a line is never a rule.
+_MAKE_DIRECTIVES = frozenset({
+    "ifeq", "ifneq", "ifdef", "ifndef", "else", "endif", "include", "-include", "sinclude",
+    "export", "unexport", "override", "private", "vpath", "undefine", "define", "endef", "load", "-load",
+})
+
+# The start of a "define NAME" block, which may carry the override, export or
+# private prefixes. Everything up to the matching "endef" is variable text.
+_MAKE_DEFINE = re.compile(r"(?:(?:override|export|private)\s+)*define(?:\s|$)")
+_MAKE_ENDEF = re.compile(r"endef(?:\s|#|$)")
+
+# An include directive and the file names that follow it.
+_MAKE_INCLUDE = re.compile(r"(?:-include|sinclude|include)\s+(.*)")
+
+# The part of a line after "target:" when it is a target-specific variable,
+# such as "check: PYTEST_ARGS = -q" or "check: export PYTEST_ARGS=-q". Such a
+# line sets a variable for the target; it does not define a rule.
+_MAKE_TARGET_VARIABLE = re.compile(
+    r"(?:(?:export|override|private)\s+)*[^\s:=#;]+\s*(?:=|:=|::=|:::=|\+=|\?=|!=)"
+)
+
+# Directory names that never hold the project's own tests: installed
+# packages, caches and virtual environments. Hidden directories (names that
+# start with ".") are skipped as well, and so is any directory that holds a
+# pyvenv.cfg file, which marks a virtual environment.
+_NOT_PROJECT_DIRS = frozenset({"node_modules", "site-packages", "__pycache__", "venv"})
+_TEST_DIR_NAMES = frozenset({"tests", "test"})
+
+# The directory walk used outside git gives up after this many entries, so a
+# very large project cannot slow down every turn.
+_TEST_SUITE_WALK_LIMIT = 20000
 
 
 def _python_executable(root: Path) -> str:
@@ -55,21 +90,95 @@ def _file_contains(path: Path, text: str) -> bool:
         return False
 
 
+def _is_test_file(name: str) -> bool:
+    """Return True for a file name that pytest collects by default."""
+    return name.endswith(".py") and (name.startswith("test_") or name.endswith("_test.py"))
+
+
+def _skipped_dir(name: str) -> bool:
+    return name.startswith(".") or name in _NOT_PROJECT_DIRS
+
+
+def _git_lists_test_suite(root: Path) -> bool | None:
+    """Look for tests among the files git knows about, or return None when git cannot list them.
+
+    The list holds tracked files and new files that are not ignored.
+    """
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listing.returncode != 0:
+        return None
+    paths = [p.decode("utf-8", "replace").split("/") for p in listing.stdout.split(b"\0") if p]
+    venvs = {tuple(parts[:-1]) for parts in paths if parts[-1] == "pyvenv.cfg"}
+    for parts in paths:
+        dirs = parts[:-1]
+        if any(_skipped_dir(d) for d in dirs) or any(tuple(dirs[:i]) in venvs for i in range(1, len(dirs) + 1)):
+            continue
+        if any(d in _TEST_DIR_NAMES for d in dirs) or _is_test_file(parts[-1]):
+            return True
+    return False
+
+
+def _walk_finds_test_suite(root: Path) -> bool:
+    """Look for tests with a directory walk that stops after a fixed number of entries."""
+    seen = 0
+    pending = [root]
+    while pending:
+        directory = pending.pop(0)
+        try:
+            entries = list(os.scandir(directory))
+        except OSError:
+            continue
+        for entry in entries:
+            seen += 1
+            if seen > _TEST_SUITE_WALK_LIMIT:
+                return False
+            if entry.is_dir(follow_symlinks=False):
+                if _skipped_dir(entry.name) or (Path(entry.path) / "pyvenv.cfg").exists():
+                    continue
+                if entry.name in _TEST_DIR_NAMES:
+                    return True
+                pending.append(Path(entry.path))
+            elif _is_test_file(entry.name):
+                return True
+    return False
+
+
 def _has_python_test_suite(root: Path) -> bool:
     """Return True when the project clearly has pytest tests that must run.
 
-    That is the case when it has a ``tests/`` directory or a pytest
-    configuration: a ``pytest.ini`` file, a ``[tool.pytest...]`` table in
-    ``pyproject.toml``, a ``[tool:pytest]`` section in ``setup.cfg``, or a
-    ``[pytest]`` section in ``tox.ini``.
+    That is the case when the project has any of these:
+
+    - a ``tests/`` or ``test/`` directory anywhere, outside hidden
+      directories, virtual environments and ``node_modules``;
+    - a ``conftest.py`` file at the project root;
+    - a file named ``test_*.py`` or ``*_test.py`` in the same places;
+    - a pytest configuration: a ``pytest.ini`` file, a ``[tool.pytest...]``
+      table in ``pyproject.toml``, a ``[tool:pytest]`` section in
+      ``setup.cfg``, or a ``[pytest]`` section in ``tox.ini``.
+
+    In a git repository the files come from ``git ls-files``. Otherwise a
+    directory walk looks for them and stops after a fixed number of entries.
     """
-    return (
+    if (
         (root / "tests").is_dir()
+        or (root / "test").is_dir()
+        or (root / "conftest.py").is_file()
         or (root / "pytest.ini").exists()
         or _file_contains(root / "pyproject.toml", "[tool.pytest")
         or _file_contains(root / "setup.cfg", "[tool:pytest]")
         or _file_contains(root / "tox.ini", "[pytest]")
-    )
+    ):
+        return True
+    found = _git_lists_test_suite(root)
+    if found is None:
+        found = _walk_finds_test_suite(root)
+    return found
 
 
 def _pytest_importable(python: str, root: Path) -> bool:
@@ -91,32 +200,136 @@ def _missing_pytest_note(python: str) -> str:
     )
 
 
-def _makefile_has_check_target(root: Path) -> bool:
-    """Return True when the project's Makefile defines a ``check`` target.
+def _makefile_path(root: Path) -> Path | None:
+    """Return the makefile that ``make`` would read in this directory, or None."""
+    for name in _MAKEFILE_NAMES:
+        path = root / name
+        if path.is_file():
+            return path
+    return None
 
-    A check target written directly in the Makefile is found by reading the
-    file, without running make. Otherwise make itself is asked with a dry run
-    (``make -n check``), which also finds targets defined in included files or
-    by pattern rules. A dry run that reports "Nothing to be done" is not a
-    check target: it happens when a file named ``check`` exists but no rule
-    builds it, and ``make check`` would then pass without checking anything.
+
+def _makefile_lines(text: str):
+    """Yield the logical lines of a makefile.
+
+    A line that ends with a backslash continues on the next line, so the two
+    are joined into one.
     """
-    try:
-        text = (root / "Makefile").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
+    pending = ""
     for line in text.splitlines():
-        match = _MAKE_RULE_LINE.match(line)
-        if match and "check" in match.group(1).split():
-            return True
-    try:
-        probe = subprocess.run(
-            ["make", "-n", "check"], cwd=root, text=True, capture_output=True, timeout=30,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        stripped = line.rstrip("\\")
+        if (len(line) - len(stripped)) % 2 == 1:
+            pending += line[:-1] + " "
+            continue
+        yield pending + line
+        pending = ""
+    if pending:
+        yield pending
+
+
+def _strip_make_comment(line: str) -> str:
+    """Remove a "#" comment from a makefile line. An escaped "\\#" is kept."""
+    index = 0
+    while True:
+        index = line.find("#", index)
+        if index == -1:
+            return line
+        if index == 0 or line[index - 1] != "\\":
+            return line[:index]
+        index += 1
+
+
+def _make_rule_targets(line: str) -> list[str]:
+    """Return the targets of an explicit rule line, or an empty list when it is not a rule.
+
+    Variable assignments ("X = a:b", "X := 1", "check:=1") and target-specific
+    variables ("check: X = 1") are not rules.
+    """
+    colon = line.find(":")
+    if colon <= 0:
+        return []
+    targets = line[:colon]
+    if "=" in targets:
+        return []
+    after = line[colon:]
+    if re.match(r":{1,3}=", after):
+        return []
+    rest = after[2:] if after.startswith("::") else after[1:]
+    if _MAKE_TARGET_VARIABLE.match(rest.split(";", 1)[0].strip()):
+        return []
+    targets = targets.rstrip()
+    if targets.endswith("&"):  # grouped targets, "a b &: prerequisites"
+        targets = targets[:-1]
+    return targets.split()
+
+
+def _makefile_has_check_target(root: Path) -> bool:
+    """Return True when the project's makefile defines an explicit ``check`` rule.
+
+    The decision is made from the makefile text alone; make is never run.
+    Running make, even as a dry run (``make -n``), can change the workspace:
+    GNU make remakes included makefiles, runs recipe lines that use
+    ``$(MAKE)`` or start with ``+``, and runs ``$(shell ...)``. A dry run
+    also accepts targets that make builds from its built-in rules (such as
+    ``%: %.sh``) or from a catch-all rule, and ``make check`` then tests
+    nothing.
+
+    The makefile is the first of ``GNUmakefile``, ``makefile`` and
+    ``Makefile`` that exists, which is the one make reads. Files it includes
+    are read too, when the include names a literal path (no variables or
+    wildcards) to a file inside the workspace. A rule counts when ``check``
+    is one of its targets, as in ``check:``, ``check::`` or ``lint check:``.
+    These lines do not count: lines inside ``define ... endef`` blocks,
+    recipe lines (which start with a tab), comments, variable assignments,
+    and target-specific variables such as ``check: PYTEST_ARGS = -q``.
+    Conditionals (``ifeq`` and similar) are not evaluated, so a rule inside
+    a conditional counts whichever branch make would take.
+    """
+    first = _makefile_path(root)
+    if first is None:
         return False
-    return probe.returncode == 0 and "Nothing to be done" not in probe.stdout + probe.stderr
+    workspace = root.resolve()
+    pending = [first]
+    visited: set[Path] = set()
+    while pending and len(visited) < _MAKEFILE_READ_LIMIT:
+        path = pending.pop(0).resolve()
+        if path in visited:
+            continue
+        visited.add(path)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        define_depth = 0
+        for line in _makefile_lines(text):
+            if define_depth:
+                bare = line.strip()
+                if _MAKE_DEFINE.match(bare):
+                    define_depth += 1
+                elif _MAKE_ENDEF.match(bare):
+                    define_depth -= 1
+                continue
+            if line.startswith("\t"):
+                continue  # a recipe line
+            line = _strip_make_comment(line).strip()
+            if _MAKE_DEFINE.match(line):
+                define_depth = 1
+                continue
+            include = _MAKE_INCLUDE.fullmatch(line)
+            if include:
+                for name in include.group(1).split():
+                    if any(ch in name for ch in "$*?["):
+                        continue  # only literal paths are followed
+                    target = (root / name).resolve()
+                    if target.is_file() and target.is_relative_to(workspace):
+                        pending.append(target)
+                continue
+            words = line.split()
+            if not words or words[0] in _MAKE_DIRECTIVES:
+                continue
+            if "check" in _make_rule_targets(line):
+                return True
+    return False
 
 
 def _pytest_found_no_tests(command: list[str], returncode: int) -> bool:
@@ -127,7 +340,7 @@ def _pytest_found_no_tests(command: list[str], returncode: int) -> bool:
 def _verification_command(root: Path, configured: list[str] | None = None) -> tuple[list[str], str | None]:
     if configured:
         return list(configured), None
-    if (root / "Makefile").exists() and _makefile_has_check_target(root):
+    if _makefile_has_check_target(root):
         return ["make", "check"], None
     package_json = root / "package.json"
     if package_json.exists():
@@ -161,7 +374,8 @@ def _verification_command(root: Path, configured: list[str] | None = None) -> tu
             return [python, "-m", "pytest"], _missing_pytest_note(python)
         return ["git", "diff", "--check"], (
             "pytest is not installed in the selected Python environment, and this project has no "
-            "tests/ directory and no pytest configuration, so there were no tests to skip; "
+            "Python test suite (no tests/ or test/ directory, no test_*.py or *_test.py file, no "
+            "conftest.py at the root and no pytest configuration), so there were no tests to skip; "
             "using git diff --check only"
         )
     return ["git", "diff", "--check"], "no project test runner detected; using git diff --check only"

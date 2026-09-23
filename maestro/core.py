@@ -589,7 +589,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_base_head", "task_request", "task_runtime", "task_gates", "task_knowledge"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_base_head", "task_python_test_suite", "task_request", "task_runtime", "task_gates", "task_knowledge"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)

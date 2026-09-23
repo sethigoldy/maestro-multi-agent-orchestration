@@ -170,7 +170,7 @@ selected in this order — first match wins:
 
 | # | Condition | Command |
 |---|---|---|
-| 1 | `Makefile` defines a `check` target | `make check` |
+| 1 | The makefile defines an explicit `check` rule (see below) | `make check` |
 | 2 | `package.json` with a `test` script (other than the `npm init` default) + `pnpm-lock.yaml` | `pnpm test` |
 | 3 | same, with `yarn.lock` | `yarn test` |
 | 4 | same, without pnpm/yarn lockfile | `npm test` |
@@ -182,11 +182,32 @@ selected in this order — first match wins:
 
 Details of each rule:
 
-- **Makefile.** Maestro first reads the `Makefile` and looks for a rule whose
-  targets include `check` (for example `check:` or `lint check:`). If none is
-  written there, it asks make with a dry run, `make -n check`, which also finds
-  a `check` target defined in an included file. A `Makefile` without a `check`
-  target is skipped and detection continues with the next rule.
+- **Makefile.** Maestro decides from the makefile text alone and never runs
+  make, not even as a `make -n` dry run. A dry run can change the workspace:
+  GNU make remakes included makefiles, runs recipe lines that use `$(MAKE)` or
+  start with `+`, and runs `$(shell ...)`. The makefile is the first of
+  `GNUmakefile`, `makefile` and `Makefile` that exists, which is the one make
+  reads. A file it includes with `include`, `-include` or `sinclude` is read
+  too, when the include names a literal path (no variables or wildcards) to a
+  file inside the workspace; includes inside included files are followed the
+  same way, up to 50 files in all. `make check` is chosen only when one of
+  these files has an explicit rule whose targets include `check`, such as
+  `check:`, `check::` or `lint check:`. A line that ends with a backslash is
+  joined with the next line first. These lines do not count as a `check`
+  rule:
+  - lines inside a `define ... endef` block, including nested blocks;
+  - recipe lines, which start with a tab;
+  - comments and variable assignments, such as `check := yes`;
+  - target-specific variables, such as `check: PYTEST_ARGS = -q`, and the
+    same with `:=`, `+=`, `?=`, `!=`, or an `export`, `override` or `private`
+    prefix.
+
+  A target that make could only build from a built-in rule (for example
+  `%: %.sh` with a `check.sh` file) or from a catch-all rule (`%:` or
+  `.DEFAULT:`) does not count either, because `make check` would then run no
+  tests. Conditionals such as `ifeq` are not evaluated, so a `check` rule
+  inside one counts whichever branch make would take. A project without a
+  `check` rule is skipped, and detection continues with the next rule.
 - **Node.** The test script that `npm init` writes,
   `echo "Error: no test specified" && exit 1`, always fails. Maestro treats it
   as "this package has no tests" and continues with the next rule.
@@ -194,20 +215,43 @@ Details of each rule:
   `$MAESTRO_PYTHON` (if it is a file), `<workspace>/.venv/bin/python` (if
   executable), `<workspace>/venv/bin/python` (if executable), else the daemon's
   own interpreter.
-- **pytest missing.** A project has a Python test suite when it has a `tests/`
-  directory, a `pytest.ini` file, a `[tool.pytest.ini_options]` table in
-  `pyproject.toml`, a `[tool:pytest]` section in `setup.cfg`, or a `[pytest]`
-  section in `tox.ini`. If such a project's tests cannot run because pytest is
-  not installed in the selected interpreter, verification fails. The report
+- **Python test suite.** A project has a Python test suite when it has any
+  of these:
+  - a `tests/` or `test/` directory anywhere in the project, outside hidden
+    directories (names that start with `.`), virtual environments (a
+    directory named `venv` or holding a `pyvenv.cfg` file), `site-packages`,
+    `__pycache__` and `node_modules`;
+  - a `conftest.py` file at the project root;
+  - a file named `test_*.py` or `*_test.py` in the same places;
+  - a `pytest.ini` file, a `[tool.pytest.ini_options]` table in
+    `pyproject.toml`, a `[tool:pytest]` section in `setup.cfg`, or a
+    `[pytest]` section in `tox.ini`.
+
+  In a git repository Maestro takes the file list from `git ls-files` (tracked
+  files and new files that are not ignored). Outside git it walks the
+  directory tree and stops after 20,000 entries.
+- **pytest missing.** If a project with a Python test suite cannot run its
+  tests because pytest is not installed in the selected interpreter,
+  verification fails. The report
   names the interpreter and says how to fix it: set `MAESTRO_PYTHON` to the
   interpreter of the project's environment (for example a poetry or conda
   environment, or the main checkout's `.venv` when you work in a git
   worktree), or use `verification = "command"` with an explicit test command.
 - **No tests collected.** When pytest finds no tests, it exits with code 5.
-  For the auto-detected pytest command this is not counted as a test failure.
-  It is not evidence of work either, so it is handled like the
-  `git diff --check` fallback: the task passes only if the turn left
-  working-tree changes or new commits in the workspace.
+  At the start of every turn, before the agent runs, Maestro records whether
+  the project has a Python test suite. It keeps this in the task record, so a
+  restarted daemon still has it. What exit code 5 means depends on that
+  record:
+  - If the project had no test suite when the turn started, exit code 5 is
+    not counted as a test failure. It is not evidence of work either, so it
+    is handled like the `git diff --check` fallback: the task passes only if
+    the turn left working-tree changes or new commits in the workspace.
+  - If the project had a test suite when the turn started, exit code 5 is a
+    failure. The report says that pytest collected no tests although the
+    project had a test suite, because the tests may have been deleted,
+    renamed or hidden during the turn.
+  - If nothing was recorded (a task started by an older Maestro), exit code 5
+    is treated as a failure too.
 - **Fallback.** `git diff --check` alone passes on an untouched workspace, so
   when it is the only check, verification fails unless the turn left
   working-tree changes or new commits.

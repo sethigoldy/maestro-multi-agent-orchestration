@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -26,6 +27,7 @@ GIT_ENV = dict(
     os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"
 )
 FALLBACK = ["git", "diff", "--check"]
+needs_make = pytest.mark.skipif(shutil.which("make") is None, reason="make is not installed")
 
 
 def _git(ws: Path, *args: str) -> None:
@@ -79,9 +81,15 @@ def daemon(tmp_path, monkeypatch):
 
 
 def _verify(daemon: MaestroDaemon, ws: Path, task_id: str = "task-v", **doc_kw) -> tuple[bool, str]:
-    """Run daemon verification on a workspace as a fresh turn and return (ok, report)."""
-    daemon._tasks[task_id] = {"base_head": daemon._base_head(ws)}
-    ok = daemon._verify(ws, task_id, _doc(**doc_kw))
+    """Run daemon verification on a workspace as a fresh turn and return (ok, report).
+
+    The turn's baseline is recorded first, the way a real turn records it
+    before the agent runs.
+    """
+    doc = _doc(**doc_kw)
+    daemon._tasks[task_id] = {}
+    daemon._record_turn_baseline(task_id, ws, doc)
+    ok = daemon._verify(ws, task_id, doc)
     report = (daemon.state_dir / "tasks" / task_id / "verification.txt").read_text(encoding="utf-8")
     return ok, report
 
@@ -141,7 +149,7 @@ def test_missing_pytest_without_test_suite_keeps_fallback(tmp_path, monkeypatch,
     monkeypatch.setenv("MAESTRO_PYTHON", str(_python_without_pytest(tmp_path)))
     cmd, note = worker._verification_command(ws)
     assert cmd == FALLBACK
-    assert note is not None and "no tests/ directory" in note
+    assert note is not None and "no Python test suite" in note
 
 
 def test_unreadable_pyproject_is_not_a_test_suite(tmp_path, monkeypatch):
@@ -239,7 +247,7 @@ def test_makefile_lines_that_are_not_a_check_rule(tmp_path, makefile):
 
 
 def test_makefile_check_target_in_included_file_is_found(tmp_path):
-    """A check target defined in an included file is found by asking make itself."""
+    """A check target defined in an included file is found by reading that file."""
     ws = _repo(tmp_path, {"Makefile": "include rules.mk\n", "rules.mk": "check:\n\t@echo ok\n"})
     assert worker._verification_command(ws)[0] == ["make", "check"]
 
@@ -250,20 +258,33 @@ def test_file_named_check_is_not_a_check_target(tmp_path):
     assert worker._verification_command(ws)[0] == FALLBACK
 
 
-def test_makefile_probe_failures_fall_through(tmp_path, monkeypatch):
-    ws = _repo(tmp_path, {"Makefile": "build:\n\t@true\n"})
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"Makefile": "build:\n\t@true\n"},
+        {"Makefile": "include rules.mk\n", "rules.mk": "build:\n\t@true\n"},
+        {"Makefile": "build:\n\t@true\n%:\n\t@:\n"},
+    ],
+    ids=["no-check", "include-without-check", "catch-all"],
+)
+def test_makefile_detection_never_runs_make(tmp_path, monkeypatch, files):
+    """Detection reads the makefiles and never runs make, not even a dry run.
 
-    def make_missing(*_a, **_k):
-        raise FileNotFoundError("make")
+    A dry run is not harmless: GNU make remakes included makefiles, runs
+    `$(MAKE)` and `+` recipe lines, and expands `$(shell ...)` even under -n.
+    It also took up to 30 seconds on every verification.
+    """
+    ws = _repo(tmp_path, files)
+    real_run = subprocess.run
 
-    monkeypatch.setattr(worker.subprocess, "run", make_missing)
+    def no_make(cmd, *a, **k):
+        if cmd and cmd[0] == "make":
+            raise AssertionError(f"detection must not run make: {cmd}")
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(worker.subprocess, "run", no_make)
     assert worker._makefile_has_check_target(ws) is False
-
-    def make_hangs(*_a, **_k):
-        raise subprocess.TimeoutExpired("make", 30)
-
-    monkeypatch.setattr(worker.subprocess, "run", make_hangs)
-    assert worker._makefile_has_check_target(ws) is False
+    assert worker._verification_command(ws)[0] == FALLBACK
 
 
 def test_unreadable_makefile_falls_through(tmp_path):
@@ -331,3 +352,437 @@ def test_real_npm_test_script_is_still_used(tmp_path):
     package = {"name": "x", "scripts": {"test": "jest"}}
     ws = _repo(tmp_path, {"package.json": json.dumps(package)})
     assert worker._verification_command(ws)[0] == ["npm", "test"]
+
+
+def _status(ws: Path) -> str:
+    return subprocess.run(["git", "-C", str(ws), "status", "--porcelain"], text=True, capture_output=True).stdout
+
+
+# ------------------------------------------------ review: the make dry run had side effects
+def test_detection_does_not_remake_an_included_makefile(daemon, tmp_path):
+    """Choosing a test command must not change the workspace.
+
+    `make -n check` remade `config.mk` from its rule, and the new file then
+    counted as the agent's work, so a turn that did nothing was PASSED.
+    """
+    makefile = "include config.mk\nbuild:\n\t@true\nconfig.mk:\n\techo X=1 > config.mk\n"
+    ws = _repo(tmp_path, {"Makefile": makefile})
+    assert worker._verification_command(ws)[0] == FALLBACK
+    assert not (ws / "config.mk").exists()
+    ok, report = _verify(daemon, ws)
+    assert ok is False
+    assert "no changes detected" in report
+    assert _status(ws) == ""
+
+
+def test_detection_does_not_run_recursive_make_lines(tmp_path):
+    """A check target in an included file is found without running its recipe.
+
+    Under -n, make still runs recipe lines that use $(MAKE), so the dry run
+    used to create SIDE_EFFECT here.
+    """
+    rules = "check:\n\ttouch SIDE_EFFECT && $(MAKE) -C . build\nbuild:\n\t@true\n"
+    ws = _repo(tmp_path, {"Makefile": "include rules.mk\n", "rules.mk": rules})
+    assert worker._verification_command(ws)[0] == ["make", "check"]
+    assert not (ws / "SIDE_EFFECT").exists()
+
+
+def test_builtin_rule_is_not_a_check_target(daemon, tmp_path):
+    """make's built-in rule `%: %.sh` is not a test suite.
+
+    With a `check.sh` in the workspace, `make -n check` succeeded, `make check`
+    then only copied the script to a file named `check`, ran no tests, and the
+    turn was PASSED.
+    """
+    ws = _repo(tmp_path, {"Makefile": "build:\n\t@true\n", "check.sh": "#!/bin/sh\necho RUNNING TESTS\nexit 1\n"})
+    assert worker._verification_command(ws)[0] == FALLBACK
+    ok, report = _verify(daemon, ws)
+    assert ok is False
+    assert not (ws / "check").exists()
+    assert "no changes detected" in report
+
+
+@pytest.mark.parametrize(
+    "makefile",
+    ["build:\n\t@true\n%:\n\t@:\n", "build:\n\t@true\n.DEFAULT:\n\t@:\n", "build:\n\t@true\n%::\n\t@:\n"],
+    ids=["catch-all-pattern", "default-rule", "double-colon-catch-all"],
+)
+def test_catch_all_rule_is_not_a_check_target(tmp_path, makefile):
+    """A rule that matches every target makes `make check` succeed without testing anything."""
+    ws = _repo(tmp_path, {"Makefile": makefile})
+    assert worker._verification_command(ws)[0] == FALLBACK
+
+
+# ------------------------------------------------ review: the text scan was too loose
+@pytest.mark.parametrize(
+    "makefile",
+    [
+        "define HELP\ncheck: run the tests\nendef\nexport HELP\nhelp:\n\t@echo \"$$HELP\"\n",
+        "define OUTER\ndefine INNER\nendef\ncheck: still inside OUTER\nendef\nbuild:\n\t@true\n",
+        "override define HELP =\ncheck: text\nendef\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS = -q\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS := -q\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS += -q\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS ?= -q\nbuild:\n\t@true\n",
+        "check:: PYTEST_ARGS = -q\nbuild:\n\t@true\n",
+        "check: export PYTEST_ARGS=-q\nbuild:\n\t@true\n",
+        "check: override PYTEST_ARGS = -q\nbuild:\n\t@true\n",
+        "check: private PYTEST_ARGS = -q\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS != echo -q\nbuild:\n\t@true\n",
+        "X = one \\\n  check: two\nbuild:\n\t@true\n",
+        "build:\n\techo one \\\ncheck: part of the recipe\n",
+        "ifeq ($(A),check:)\nendif\nbuild:\n\t@true\n",
+        "\tcheck: a recipe-prefixed line\nbuild:\n\t@true\n",
+        "$(NAME): build\nbuild:\n\t@true\n",
+    ],
+    ids=[
+        "define-block", "nested-define", "override-define", "target-var", "target-var-simple", "target-var-append",
+        "target-var-conditional", "target-var-double-colon", "target-var-export", "target-var-override",
+        "target-var-private", "target-var-shell", "continued-assignment", "continued-recipe", "conditional",
+        "tab-line", "variable-target",
+    ],
+)
+def test_makefile_text_that_is_not_a_check_rule(tmp_path, makefile):
+    ws = _repo(tmp_path, {"Makefile": makefile})
+    assert worker._verification_command(ws)[0] == FALLBACK
+
+
+@pytest.mark.parametrize(
+    "makefile",
+    [
+        "define HELP\ncheck: text\nendef\ncheck:\n\t@true\n",
+        "lint \\\n  check: build\n\t@true\nbuild:\n\t@true\n",
+        "check: build ; @true\nbuild:\n\t@true\n",
+        "check: build # run the tests\n\t@true\nbuild:\n\t@true\n",
+        "lint check&: build\n\t@true\nbuild:\n\t@true\n",
+        "check: $(filter a=b,x)\n\t@true\n",
+        "endef\ncheck:\n\t@true\n",
+        "lint\\#one check: build\n\t@true\nbuild:\n\t@true\n",
+        "build:\n\t@true\ncheck: \\\n",
+    ],
+    ids=[
+        "after-define", "continued-targets", "inline-recipe", "trailing-comment", "grouped-targets", "var-in-prereqs",
+        "stray-endef", "escaped-hash", "continuation-at-end-of-file",
+    ],
+)
+def test_makefile_text_that_is_a_check_rule(tmp_path, makefile):
+    ws = _repo(tmp_path, {"Makefile": makefile})
+    assert worker._verification_command(ws)[0] == ["make", "check"]
+
+
+@needs_make
+@pytest.mark.parametrize(
+    "makefile",
+    [
+        "define HELP\ncheck: run the tests\nendef\nexport HELP\nhelp:\n\t@echo \"$$HELP\"\n",
+        "check: PYTEST_ARGS = -q\nbuild:\n\t@true\n",
+        "check: PYTEST_ARGS := -q\nbuild:\n\t@true\n",
+        "check: export PYTEST_ARGS=-q\nbuild:\n\t@true\n",
+        "X = one \\\n  check: two\nbuild:\n\t@true\n",
+        "check:\n\t@true\n",
+        "lint \\\n  check: build\n\t@true\nbuild:\n\t@true\n",
+        "include rules.mk\n",
+    ],
+    ids=["define-block", "target-var", "target-var-simple", "target-var-export", "continued-assignment",
+         "simple", "continued-targets", "included"],
+)
+def test_detection_agrees_with_make(tmp_path, makefile):
+    """Whenever detection chooses `make check`, make really has a check target, and the other way round."""
+    ws = _repo(tmp_path, {"Makefile": makefile, "rules.mk": "check:\n\t@true\n"})
+    chosen = worker._verification_command(ws)[0] == ["make", "check"]
+    run = subprocess.run(["make", "check"], cwd=ws, text=True, capture_output=True, env={**os.environ, "LC_ALL": "C"})
+    if chosen:
+        assert run.returncode == 0, run.stderr
+    else:
+        assert run.returncode != 0 and "No rule to make target" in run.stderr
+
+
+def test_makefile_lookup_follows_make_order(tmp_path):
+    """make reads GNUmakefile first and ignores Makefile when it exists; detection does the same."""
+    ws = _repo(tmp_path, {"GNUmakefile": "build:\n\t@true\n", "Makefile": "check:\n\t@true\n"})
+    assert worker._verification_command(ws)[0] == FALLBACK
+    ws2 = tmp_path / "gnu-only"
+    ws2.mkdir()
+    (ws2 / "GNUmakefile").write_text("check:\n\t@true\n", encoding="utf-8")
+    assert worker._verification_command(ws2)[0] == ["make", "check"]
+
+
+def test_lowercase_makefile_is_read(tmp_path):
+    ws = tmp_path / "lower"
+    ws.mkdir()
+    (ws / "makefile").write_text("check:\n\t@true\n", encoding="utf-8")
+    assert worker._verification_command(ws)[0] == ["make", "check"]
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"Makefile": "-include rules.mk\n", "rules.mk": "check:\n\t@true\n"},
+        {"Makefile": "sinclude rules.mk\n", "rules.mk": "check:\n\t@true\n"},
+        {"Makefile": "include a.mk b.mk\n", "a.mk": "build:\n\t@true\n", "b.mk": "check:\n\t@true\n"},
+        {"Makefile": "include mk/a.mk\n", "mk/a.mk": "include mk/b.mk\n", "mk/b.mk": "check:\n\t@true\n"},
+        {"Makefile": "include rules.mk # the rules\n", "rules.mk": "check:\n\t@true\n"},
+    ],
+    ids=["dash-include", "sinclude", "several-files", "nested-include", "commented-include"],
+)
+def test_included_check_target_is_found(tmp_path, files):
+    ws = _repo(tmp_path, files)
+    assert worker._verification_command(ws)[0] == ["make", "check"]
+
+
+def test_includes_that_are_not_followed(tmp_path):
+    """Only literal paths to files inside the workspace are read; nothing is expanded or run."""
+    outside = tmp_path / "outside.mk"
+    outside.write_text("check:\n\t@true\n", encoding="utf-8")
+    ws = _repo(
+        tmp_path,
+        {
+            "Makefile": "RULES = rules.mk\ninclude $(RULES)\ninclude *.mk\ninclude missing.mk\n"
+            "include ../outside.mk\ninclude " + str(outside) + "\ninclude subdir\ninclude loop.mk\n",
+            "rules.mk": "check:\n\t@true\n",
+            "loop.mk": "include loop.mk Makefile\n",
+            "subdir/keep.txt": "x\n",
+        },
+    )
+    assert worker._verification_command(ws)[0] == FALLBACK
+
+
+def test_unreadable_included_makefile_is_skipped(tmp_path, monkeypatch):
+    ws = _repo(tmp_path, {"Makefile": "include rules.mk\n", "rules.mk": "check:\n\t@true\n"})
+    real_read = Path.read_text
+
+    def fail_rules(self, *a, **k):
+        if self.name == "rules.mk":
+            raise PermissionError("denied")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", fail_rules)
+    assert worker._makefile_has_check_target(ws) is False
+
+
+def test_include_limit_stops_reading(tmp_path, monkeypatch):
+    """A long chain of includes is read only up to a fixed number of files."""
+    files = {"Makefile": "include m1.mk\n", "m1.mk": "include m2.mk\n", "m2.mk": "check:\n\t@true\n"}
+    ws = _repo(tmp_path, files)
+    assert worker._makefile_has_check_target(ws) is True
+    monkeypatch.setattr(worker, "_MAKEFILE_READ_LIMIT", 2)
+    assert worker._makefile_has_check_target(ws) is False
+
+
+# ------------------------------------------------ review: exit code 5 after the tests were removed
+def test_pytest_no_tests_after_deleting_the_suite_fails(daemon, tmp_path, monkeypatch):
+    """An agent that deletes every test must not get PASSED.
+
+    pytest exits 5 when it collects nothing. That was accepted whenever the
+    workspace had changes, and deleting the tests is a change.
+    """
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n", "tests/test_x.py": "def test_x():\n    assert False\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", sys.executable)
+    doc = _doc()
+    daemon._tasks["task-del"] = {}
+    daemon._record_turn_baseline("task-del", ws, doc)  # the turn starts with a test suite
+    assert daemon._tasks["task-del"]["python_test_suite"] is True
+    shutil.rmtree(ws / "tests")  # the agent removes every test
+    ok = daemon._verify(ws, "task-del", doc)
+    report = (daemon.state_dir / "tasks" / "task-del" / "verification.txt").read_text(encoding="utf-8")
+    assert ok is False
+    assert "pytest collected no tests although the project had a Python test suite" in report
+    assert "pytest found no tests to run" not in report
+
+
+def test_pytest_no_tests_with_suite_recorded_directly_fails(daemon, tmp_path, monkeypatch):
+    """The recorded turn-start value decides, not the workspace as the agent left it."""
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", sys.executable)
+    (ws / "work.txt").write_text("done\n", encoding="utf-8")
+    daemon._tasks["task-r"] = {"base_head": daemon._base_head(ws), "python_test_suite": True}
+    assert daemon._verify(ws, "task-r", _doc()) is False
+
+
+def test_python_test_suite_survives_a_daemon_restart(tmp_path, monkeypatch):
+    """The turn-start value is kept in a claim, so a restarted daemon still uses it."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.setenv("MAESTRO_PYTHON", sys.executable)
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n", "tests/test_x.py": "def test_x():\n    pass\n"})
+    first = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        first._tasks["task-s"] = {}
+        first._record_turn_baseline("task-s", ws, _doc())
+        assert first.maestro._claims("task-s")["task_python_test_suite"] == "true"
+    finally:
+        first.stop()
+    shutil.rmtree(ws / "tests")
+    second = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        second._tasks["task-s"] = {}  # the in-memory record lost the value
+        assert second._verify(ws, "task-s", _doc()) is False
+    finally:
+        second.stop()
+
+
+def test_python_test_suite_claim_false_allows_no_tests(daemon, tmp_path, monkeypatch):
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", sys.executable)
+    daemon._tasks["task-f"] = {}
+    daemon._record_turn_baseline("task-f", ws, _doc())
+    assert daemon.maestro._claims("task-f")["task_python_test_suite"] == "false"
+    daemon._tasks["task-f"].pop("python_test_suite")  # only the claim is left
+    (ws / "work.txt").write_text("done\n", encoding="utf-8")
+    assert daemon._verify(ws, "task-f", _doc()) is True
+
+
+def test_unknown_python_test_suite_counts_as_having_one(daemon, tmp_path, monkeypatch):
+    """A task with no recorded value (started by an older Maestro) does not accept exit code 5."""
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", sys.executable)
+    (ws / "work.txt").write_text("done\n", encoding="utf-8")
+    daemon._tasks["task-u"] = {"base_head": daemon._base_head(ws)}
+    assert daemon._verify(ws, "task-u", _doc()) is False
+
+
+def test_turn_baseline_skips_the_test_suite_scan_for_other_modes(daemon, tmp_path, monkeypatch):
+    """Only auto-detected verification uses the value, so other modes do not scan the project."""
+    ws = _repo(tmp_path, {"tests/test_x.py": "def test_x():\n    pass\n"})
+
+    def no_scan(_root):
+        raise AssertionError("the test suite scan must not run")
+
+    monkeypatch.setattr("maestro.daemon._has_python_test_suite", no_scan)
+    for mode, extra in (("command", {"request": "true"}), ("none", {})):
+        daemon._tasks["task-m"] = {}
+        daemon._record_turn_baseline("task-m", ws, _doc(verification=mode, **extra))
+        assert "python_test_suite" not in daemon._tasks["task-m"]
+        assert daemon._tasks["task-m"]["base_head"]
+
+
+def test_turn_baseline_without_a_record_still_writes_claims(daemon, tmp_path):
+    ws = _repo(tmp_path, {})
+    daemon._record_turn_baseline("task-none", ws, _doc())
+    claims = daemon.maestro._claims("task-none")
+    assert claims["task_base_head"] and claims["task_python_test_suite"] == "false"
+
+
+def test_run_turn_records_the_python_test_suite(tmp_path, monkeypatch):
+    """A real delegated turn records the value before the agent runs."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    ws = _repo(tmp_path, {"test/test_x.py": "def test_x():\n    pass\n"})
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        started = d.delegate(_doc(verification="auto", target_agent="nonexistent-agent-xyz"), str(ws))
+        d.wait(started["task_id"], timeout=30)
+        assert d._tasks[started["task_id"]]["python_test_suite"] is True
+    finally:
+        d.stop()
+
+
+# ------------------------------------------------ review: test suite layouts that were missed
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"test/test_x.py": "def test_x():\n    pass\n"},
+        {"src/pkg/tests/__init__.py": ""},
+        {"pkg/tests/helpers.py": ""},
+        {"conftest.py": ""},
+        {"src/pkg/test_core.py": ""},
+        {"pkg/core_test.py": ""},
+    ],
+    ids=["test-dir", "src-package-tests", "package-tests", "root-conftest", "test-prefix-file", "test-suffix-file"],
+)
+def test_python_test_suite_layouts_are_found(tmp_path, files):
+    ws = _repo(tmp_path, files)
+    assert worker._has_python_test_suite(ws) is True
+    plain = tmp_path / "plain"  # the same layout outside git uses the directory walk
+    for name, text in files.items():
+        path = plain / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    assert worker._has_python_test_suite(plain) is True
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        {".hidden/tests/test_x.py": ""},
+        {"node_modules/pkg/tests/test_x.py": ""},
+        {"env1/pyvenv.cfg": "home = /usr\n", "env1/lib/tests/test_x.py": ""},
+        {"venv/lib/tests/test_x.py": ""},
+        {"lib/site-packages/pkg/test_x.py": ""},
+        {"src/pkg/conftest.py": "", "src/pkg/core.py": "", "docs/testing.md": ""},
+    ],
+    ids=["hidden-dir", "node-modules", "pyvenv-cfg", "venv-name", "site-packages", "no-tests"],
+)
+def test_python_test_suite_ignores_environments(tmp_path, files):
+    ws = _repo(tmp_path, files)  # every file is tracked, because there is no .gitignore
+    assert worker._has_python_test_suite(ws) is False
+    plain = tmp_path / "plain"
+    for name, text in files.items():
+        path = plain / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    assert worker._has_python_test_suite(plain) is False
+
+
+def test_python_test_suite_sees_untracked_files(tmp_path):
+    """git ls-files also lists new files that are not ignored."""
+    ws = _repo(tmp_path, {})
+    (ws / "pkg").mkdir()
+    (ws / "pkg" / "test_new.py").write_text("", encoding="utf-8")
+    assert worker._has_python_test_suite(ws) is True
+
+
+def test_python_test_suite_walk_is_bounded(tmp_path, monkeypatch):
+    """The directory walk outside git gives up after a fixed number of entries."""
+    for i in range(10):
+        (tmp_path / f"file{i}.txt").write_text("", encoding="utf-8")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "test_x.py").write_text("", encoding="utf-8")
+    assert worker._has_python_test_suite(tmp_path) is True
+    monkeypatch.setattr(worker, "_TEST_SUITE_WALK_LIMIT", 5)
+    assert worker._has_python_test_suite(tmp_path) is False
+
+
+def test_python_test_suite_walk_skips_unreadable_directories(tmp_path, monkeypatch):
+    (tmp_path / "locked").mkdir()
+    real_scandir = os.scandir
+
+    def fail_locked(path):
+        if str(path).endswith("locked"):
+            raise PermissionError("denied")
+        return real_scandir(path)
+
+    monkeypatch.setattr(worker.os, "scandir", fail_locked)
+    assert worker._has_python_test_suite(tmp_path) is False
+
+
+@pytest.mark.parametrize("failure", ["missing-git", "timeout"])
+def test_python_test_suite_falls_back_to_the_walk_when_git_fails(tmp_path, monkeypatch, failure):
+    ws = _repo(tmp_path, {"pkg/test_x.py": ""})
+
+    def broken_git(*_a, **_k):
+        if failure == "missing-git":
+            raise FileNotFoundError("git")
+        raise subprocess.TimeoutExpired("git", 10)
+
+    monkeypatch.setattr(worker.subprocess, "run", broken_git)
+    assert worker._has_python_test_suite(ws) is True
+
+
+def test_missing_pytest_with_singular_test_dir_fails_verification(daemon, tmp_path, monkeypatch):
+    """A test/ directory is a test suite, so a missing pytest fails verification instead of skipping it."""
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n", "test/test_x.py": "def test_x():\n    assert False\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", str(_python_without_pytest(tmp_path)))
+    (ws / "work.py").write_text("x = 1\n", encoding="utf-8")
+    ok, report = _verify(daemon, ws)
+    assert ok is False
+    assert "pytest was not found" in report
+
+
+def test_turn_baseline_outside_git_records_only_the_test_suite(daemon, tmp_path):
+    """A workspace that is not a git repository has no HEAD, but its test suite is still recorded."""
+    plain = tmp_path / "plain"
+    (plain / "tests").mkdir(parents=True)
+    daemon._tasks["task-plain"] = {}
+    daemon._record_turn_baseline("task-plain", plain, _doc())
+    assert daemon._tasks["task-plain"] == {"python_test_suite": True}
