@@ -459,6 +459,162 @@ def test_run_key_navigation(tmp_path):
         server.server_close()
 
 
+def test_run_arrow_keys_move_the_selection_instead_of_quitting(tmp_path):
+    server, url = _sse_server(
+        tmp_path,
+        [
+            {"id": "task-2", "status": {"state": "completed"}, "metadata": {"title": "Two"}},
+            {"id": "task-1", "status": {"state": "working"}, "metadata": {"title": "One"}},
+        ],
+        b"",
+    )
+    try:
+        out = io.StringIO()
+        # Down arrow, then up arrow, then q. Before the fix the first arrow's
+        # ESC byte quit the dashboard, and q was never read.
+        stdin = _PipeStdin(b"\x1b[B\x1b[Aq", delay_s=0.3)
+        rc = tui.run(url, stdin=stdin, stdout=out, is_tty=lambda: True)
+        assert rc == 0
+        assert os.read(stdin.fileno(), 16) == b""  # every key, including q, was consumed
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_read_key_escape_sequences():
+    def read(data: bytes, close: bool = True) -> bytes:
+        r, w = os.pipe()
+        os.write(w, data)
+        if close:
+            os.close(w)
+        try:
+            return tui._KeyReader(r).read()
+        finally:
+            os.close(r)
+            if not close:
+                os.close(w)
+
+    assert read(b"j") == b"j"
+    assert read(b"\x1b[A") == tui._ARROW_UP
+    assert read(b"\x1b[B") == tui._ARROW_DOWN
+    assert read(b"\x1bOA") == tui._ARROW_UP  # application cursor mode
+    assert read(b"\x1bOB") == tui._ARROW_DOWN
+    assert read(b"\x1bOP") == b"\x1bOP"  # F1 in application mode: not an arrow, ignored by the loop
+    assert read(b"\x1b[C") == b"\x1b[C"  # right arrow: not used, ignored by the loop
+    assert read(b"\x1b", close=False) == b"\x1b"  # a lone Esc: nothing follows
+    assert read(b"\x1b") == b"\x1b"  # Esc, then end of input
+    assert read(b"\x1b[") == b"\x1b["  # ESC [ and then end of input
+
+
+def _timed_reads(first: bytes, later: bytes, count: int) -> list[bytes]:
+    """Write ``first`` now and ``later`` after a delay, then read ``count`` keys.
+
+    The delay is much longer than the escape wait, so ``later`` arrives as a
+    separate key press. The reads run in a thread so that a reader which
+    blocks shows up as a test failure instead of a hang.
+    """
+    r, w = os.pipe()
+    os.write(w, first)
+    timer = threading.Timer(0.5, lambda: os.write(w, later))
+    timer.start()
+    keys: list[bytes] = []
+    reader = tui._KeyReader(r)
+    thread = threading.Thread(target=lambda: keys.extend(reader.read() for _ in range(count)), daemon=True)
+    thread.start()
+    thread.join(5)
+    timer.join()
+    os.close(w)
+    os.close(r)
+    return keys
+
+
+def test_read_key_incomplete_escape_bracket_does_not_block():
+    """ESC [ with no third byte is returned at once, and the next key is read on its own.
+
+    Before the fix the third byte was read without a timeout, so the next q
+    was read as ESC [ q and ignored instead of quitting.
+    """
+    assert _timed_reads(b"\x1b[", b"q", 2) == [b"\x1b[", b"q"]
+
+
+def test_read_key_incomplete_escape_o_does_not_block():
+    assert _timed_reads(b"\x1bO", b"q", 2) == [b"\x1bO", b"q"]
+
+
+def test_read_key_esc_followed_by_another_key_is_a_lone_esc():
+    """Esc Esc gives two Esc keys, and Esc x gives Esc and then x.
+
+    Before the fix ESC and the next byte came back together as one unknown
+    key, so Esc did not quit and the following key was lost.
+    """
+    r, w = os.pipe()
+    os.write(w, b"\x1b\x1b\x1bxj")
+    os.close(w)
+    reader = tui._KeyReader(r)
+    try:
+        assert [reader.read() for _ in range(5)] == [b"\x1b", b"\x1b", b"\x1b", b"x", b"j"]
+        assert not reader.pending
+        assert reader.read() == b""
+    finally:
+        os.close(r)
+
+
+def test_key_reader_reports_a_kept_byte_as_pending():
+    r, w = os.pipe()
+    os.write(w, b"\x1bx")
+    os.close(w)
+    reader = tui._KeyReader(r)
+    try:
+        assert not reader.pending
+        assert reader.read() == b"\x1b"
+        assert reader.pending
+        assert reader.read() == b"x"
+        assert not reader.pending
+    finally:
+        os.close(r)
+
+
+def test_run_reads_a_kept_key_without_waiting_for_more_input(tmp_path, monkeypatch):
+    """A byte kept back by the key reader is handled even though stdin has nothing more to read.
+
+    The dashboard quits on Esc, so a real kept byte never reaches the loop.
+    This test uses a reader that keeps q back after j instead. The loop must
+    take q from the reader rather than wait on stdin, where nothing else
+    will arrive, because the write end of the pipe stays open.
+    """
+    server, url = _sse_server(
+        tmp_path,
+        [{"id": "task-1", "status": {"state": "working"}, "metadata": {"title": "One"}}],
+        b"",
+    )
+    read_fd, write_fd = os.pipe()
+
+    class _Stdin:
+        def fileno(self) -> int:
+            return read_fd
+
+    class _KeepQ(tui._KeyReader):
+        def read(self) -> bytes:
+            key = super().read()
+            if key == b"j":
+                self._kept = b"q"
+            return key
+
+    monkeypatch.setattr(tui, "_KeyReader", _KeepQ)
+    result: dict[str, int] = {}
+    try:
+        thread = threading.Thread(target=lambda: result.update(rc=tui.run(url, stdin=_Stdin(), stdout=io.StringIO(), is_tty=lambda: True)), daemon=True)
+        thread.start()
+        time.sleep(0.3)
+        os.write(write_fd, b"j")
+        thread.join(5)
+        assert result.get("rc") == 0
+    finally:
+        os.close(write_fd)
+        server.shutdown()
+        server.server_close()
+
+
 def test_run_stream_close_with_stdin_open(tmp_path):
     server, url = _sse_server(tmp_path, [], b"", close_after_connect=True)
     try:
@@ -746,7 +902,10 @@ def test_run_uses_detected_terminal_width(tmp_path, monkeypatch):
         rc = tui.run(url, stdin=_PipeStdin(b"q", delay_s=0.5), stdout=out, is_tty=lambda: True)
         assert rc == 0
         text = out.getvalue()
-        assert "X" * 14 in text and "X" * 40 not in text  # title truncated for width 60
+        # The list row truncates the title to width - 46 = 14 characters. The
+        # detail pane below may show all 40, because it allows width - 12.
+        rows = [ln for ln in _plain_lines(text) if "task-1" in ln]
+        assert rows and all("X" * 14 in ln and "X" * 15 not in ln for ln in rows)
         nonempty = [ln for ln in _plain_lines(text) if ln.strip()]
         assert all(len(ln) <= 60 for ln in nonempty)
     finally:

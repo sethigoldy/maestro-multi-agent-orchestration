@@ -1416,6 +1416,38 @@ def test_followup_depth_guard_applies_after_restart(daemon, tmp_path, binpath):
         d2.stop()
 
 
+def test_followup_on_a_migrated_task_without_a_workspace_claim(daemon, tmp_path, binpath):
+    """``maestro task continue`` works on a task migrated from the legacy journal.
+
+    The migration writes the task's workspace into its registry record and
+    writes a ``task_workspace`` claim only when the old journal had one.
+    Before the fix the daemon rebuilt a record only from that claim, so the
+    follow-up failed with "Unknown task reference".
+    """
+    log = tmp_path / "prompts.log"
+    _prompt_capture_bin(binpath, log)
+    ws = _git_repo(tmp_path)
+    (ws / "legacy-notes.txt").write_text("left by the legacy run\n", encoding="utf-8")
+    tid = "task-20240101-000000-1e9ac1"
+    # The same registry record and claims that the legacy migration writes.
+    daemon.maestro._write_registry_record({
+        "number": 1, "task_id": tid, "title": "Legacy task", "created_at": "2024-01-01T00:00:00+00:00",
+        "workspace": str(ws), "project_root": str(daemon.maestro.project_root), "legacy_task_number": 3,
+    })
+    daemon.maestro._write_claim(tid, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(tid, "task_number", "1")
+    daemon.maestro._write_claim(tid, "task_title", "Legacy task")
+    assert "task_workspace" not in daemon.maestro._claims(tid)
+
+    daemon.followup(tid, "Carry on with the legacy work")
+    assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+    assert daemon._tasks[tid]["workspace"] == str(ws)
+    # The knowledge snapshot was projected from the same workspace, so it
+    # lists the file the legacy run left there.
+    prompts = _prompts(log)
+    assert len(prompts) == 1 and "legacy-notes.txt" in prompts[0]
+
+
 def test_followup_continuation_disabled_via_config(daemon, tmp_path, binpath):
     log = tmp_path / "prompts.log"
     _prompt_capture_bin(binpath, log)
