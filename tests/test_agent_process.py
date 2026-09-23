@@ -428,8 +428,9 @@ def test_login_env_falls_back_to_plain_env(tmp_path, monkeypatch, capsys, env_ze
     fake_env = fakebin / "env"
     fake_env.write_text(f"#!/bin/sh\ncase \"$1\" in -0) {env_zero};; esac\nexec /usr/bin/env \"$@\"\n", encoding="utf-8")
     fake_env.chmod(0o755)
+    runs = tmp_path / "runs"
     shell = tmp_path / "shell"
-    shell.write_text(f"#!/bin/sh\nexport PATH={fakebin}:$PATH\nexport API_KEY=from-profile\necho banner\nexec /bin/sh -c \"$2\"\n", encoding="utf-8")
+    shell.write_text(f"#!/bin/sh\necho run >> {runs}\nexport PATH={fakebin}:$PATH\nexport API_KEY=from-profile\necho banner\nexec /bin/sh -c \"$2\"\n", encoding="utf-8")
     shell.chmod(0o755)
     monkeypatch.setenv("SHELL", str(shell))
     env = base_mod.capture_login_env()
@@ -437,3 +438,110 @@ def test_login_env_falls_back_to_plain_env(tmp_path, monkeypatch, capsys, env_ze
     assert "banner" not in env
     err = capsys.readouterr().err
     assert err.count("warning") == 1 and "multi-line values may be cut" in err
+    assert runs.read_text().count("run") == 1  # one login shell, not two
+
+
+def _login_shell(tmp_path: Path, body: str) -> Path:
+    """A fake login shell: records each run in "runs", runs body, then the command."""
+    shell = tmp_path / "shell"
+    shell.write_text(f"#!/bin/sh\necho run >> {tmp_path / 'runs'}\n{body}\nexec /bin/sh -c \"$2\"\n", encoding="utf-8")
+    shell.chmod(0o755)
+    return shell
+
+
+def _env_without_zero(tmp_path: Path) -> Path:
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    fake_env = fakebin / "env"
+    fake_env.write_text("#!/bin/sh\ncase \"$1\" in -0) echo 'env: illegal option -- 0' >&2; exit 1;; esac\nexec /usr/bin/env \"$@\"\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    return fakebin
+
+
+def test_login_env_fallback_works_with_a_profile_slower_than_half_the_timeout(tmp_path, monkeypatch, capsys):
+    # The profile takes 2 s of a 4 s limit. A second login shell for the
+    # fallback would get less than 2 s and time out, leaving the snapshot empty.
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    fakebin = _env_without_zero(tmp_path)
+    shell = _login_shell(tmp_path, f"sleep 2\nexport PATH={fakebin}:$PATH\nexport API_KEY=from-profile")
+    monkeypatch.setenv("SHELL", str(shell))
+    env = base_mod.capture_login_env(timeout_s=4.0)
+    assert env.get("API_KEY") == "from-profile"
+    assert (tmp_path / "runs").read_text().count("run") == 1
+    assert "multi-line values may be cut" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("shell_body", [
+    "exit 1",  # like SHELL=/usr/bin/false or /sbin/nologin
+    "exit 0",  # a profile that exits before the command runs
+])
+def test_login_env_without_the_marker_is_not_blamed_on_env(tmp_path, monkeypatch, capsys, shell_body):
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    monkeypatch.setenv("SHELL", str(_login_shell(tmp_path, shell_body)))
+    assert base_mod.capture_login_env() == {}
+    err = capsys.readouterr().err
+    assert err.count("warning") == 1
+    assert "could not capture the login environment" in err and "env -0" not in err
+    assert (tmp_path / "runs").read_text().count("run") == 1  # not run a second time
+
+
+def test_login_env_that_prints_nothing_is_reported(tmp_path, monkeypatch, capsys):
+    # Both env -0 and plain env print nothing: nothing can be captured.
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    (fakebin / "env").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fakebin / "env").chmod(0o755)
+    monkeypatch.setenv("SHELL", str(_login_shell(tmp_path, f"export PATH={fakebin}:$PATH")))
+    assert base_mod.capture_login_env() == {}
+    assert "could not capture the login environment" in capsys.readouterr().err
+
+
+def test_login_env_timeout_is_reported(tmp_path, monkeypatch, capsys):
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    monkeypatch.setenv("SHELL", str(_login_shell(tmp_path, "sleep 5")))
+    assert base_mod.capture_login_env(timeout_s=0.3) == {}
+    err = capsys.readouterr().err
+    assert err.count("warning") == 1 and "could not capture the login environment" in err
+
+
+class _IgnoresAbortRpc(_SlowRpc):
+    """Reads and ignores every command, including the abort."""
+
+    def build_command(self, prompt, workspace, task_id, settings):
+        return ["readrpc", "--go"]
+
+
+def test_rpc_agent_that_ignores_the_abort_is_stopped_when_the_grace_ends(binpath, tmp_path, monkeypatch):
+    # The agent reads its input (so the abort is written) but ignores it, and
+    # keeps running after stdin closes. It must be stopped when the cancel
+    # grace ends, not after a further wait for it to exit on its own.
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_RPC_CANCEL_GRACE_S", 1.0)
+    _fake_bin(binpath, "readrpc", "echo started\nwhile read l; do echo \"got $l\"; done\nsleep 30")
+    canceled_at: list[float] = []
+
+    def _cancel():
+        if not canceled_at:
+            canceled_at.append(time.monotonic())
+        return True
+
+    result = _IgnoresAbortRpc(AgentSpec(name="readrpc", kind="generic")).run(
+        "p", tmp_path, "t", timeout=60, log_dir=tmp_path / "logs", should_cancel=_cancel,
+    )
+    assert result.ok is False and "canceled" in (result.error or "")
+    assert time.monotonic() - canceled_at[0] < 4  # the 1 s grace plus the group stop, not 1 s + 5 s
+    assert '"abort"' in Path(result.output_path).read_text(encoding="utf-8")  # the abort was delivered

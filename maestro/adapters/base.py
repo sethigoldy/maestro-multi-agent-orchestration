@@ -33,6 +33,7 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: means "not captured yet"; an empty dict means "captured, nothing found".
 _LOGIN_ENV_CACHE: dict[str, str] | None = None
 _ENV_MARKER = "__MAESTRO_ENV__"
+_ENV_PLAIN_MARKER = "__MAESTRO_ENV_PLAIN__"
 # After an agent's own process exits, how long to keep reading output that a
 # child it left running may still hold open.
 _EXIT_GRACE_S = 2.0
@@ -52,20 +53,26 @@ def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
 
     The daemon may be started from a context that lacks variables the user's
     shell profile exports — API keys above all (launchd, a GUI app, an old
-    terminal). Once per process we run ``$SHELL -lc`` with a command that
-    prints a marker and then ``env -0``, so spawned agents see the same
-    defaults as an interactive session. ``env -0`` separates variables with
-    NUL, so a value that spans several lines (a PEM key) stays whole, and the
-    marker skips anything the profile itself prints first. Values are decoded
-    like ``os.environ`` (surrogateescape), so bytes that are not UTF-8 reach
-    the agent unchanged.
+    terminal). Once per process we run the login shell once, as
+    ``$SHELL -lc``, with a command that prints a marker, then ``env -0``, then
+    a second marker, then plain ``env``, so spawned agents see the same
+    defaults as an interactive session. Only ``;`` joins the commands, so the
+    same text works in sh, bash, zsh and fish.
 
-    If ``env -0`` fails or prints nothing after the marker (an ``env`` without
-    ``-0``), the shell is run a second time with plain ``env``, which is parsed
-    line by line, and a warning that multi-line values may be cut is printed to
-    stderr. Both runs share one timeout. Set ``MAESTRO_LOGIN_ENV=0`` to disable.
-    Any other failure (missing shell, timeout, no marker) degrades to the empty
-    dict: the daemon's own environment still flows through unchanged.
+    ``env -0`` separates variables with NUL, so a value that spans several
+    lines (a PEM key) stays whole, and the first marker skips anything the
+    profile itself prints first. When ``env -0`` fails or prints nothing (an
+    ``env`` without ``-0``), the plain ``env`` listing after the second marker
+    is read line by line instead, and a warning that multi-line values may be
+    cut is printed to stderr. Values are decoded like ``os.environ``
+    (surrogateescape), so bytes that are not UTF-8 reach the agent unchanged.
+
+    Set ``MAESTRO_LOGIN_ENV=0`` to disable. When nothing can be captured (the
+    shell is missing or times out, the first marker never appears because the
+    shell did not run the command, or neither listing has anything), a warning
+    that the login environment could not be captured is printed to stderr and
+    the result is the empty dict: the daemon's own environment still flows
+    through unchanged.
     """
     global _LOGIN_ENV_CACHE
     if _LOGIN_ENV_CACHE is not None:
@@ -73,28 +80,36 @@ def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
     env: dict[str, str] = {}
     if os.environ.get("MAESTRO_LOGIN_ENV", "1") != "0":
         shell = (os.environ.get("SHELL") or "").strip() or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
+        problem: str | None = None
         try:
             timeout = timeout_s if timeout_s is not None else float(os.environ.get("MAESTRO_LOGIN_ENV_TIMEOUT_S", "10"))
-            deadline = time.monotonic() + timeout
             # Bytes, not text: text mode would also turn "\r\n" in a value into "\n".
-            proc = subprocess.run([shell, "-lc", f"printf '\\0{_ENV_MARKER}\\0'; env -0"], capture_output=True, timeout=timeout)
+            # Both markers are wrapped in NUL, which no variable can contain.
+            proc = subprocess.run(
+                [shell, "-lc", f"printf '\\0{_ENV_MARKER}\\0'; env -0; printf '\\0{_ENV_PLAIN_MARKER}\\0'; env"],
+                capture_output=True, timeout=timeout,
+            )
             _, found, listing = proc.stdout.rpartition(f"\0{_ENV_MARKER}\0".encode())
-            if proc.returncode == 0 and found and listing:
-                entries = listing.split(b"\0")
-            else:
+            zero_listing, _, plain_listing = listing.partition(f"\0{_ENV_PLAIN_MARKER}\0".encode())
+            entries: list[bytes] = []
+            if not found:
+                problem = f"the shell did not run the command (exit code {proc.returncode})"
+            elif zero_listing:
+                entries = zero_listing.split(b"\0")
+            elif plain_listing:
                 print(f"[maestro] warning: `env -0` did not work in the login shell {shell}; reading plain `env` output instead, so multi-line values may be cut", file=sys.stderr)
-                proc = subprocess.run(
-                    [shell, "-lc", f"printf '\\n{_ENV_MARKER}\\n'; env"],
-                    capture_output=True, timeout=max(0.0, deadline - time.monotonic()),
-                )
-                _, found, listing = proc.stdout.rpartition(f"\n{_ENV_MARKER}\n".encode())
-                entries = listing.split(b"\n") if found else []
+                entries = plain_listing.split(b"\n")
+            else:
+                problem = "neither `env -0` nor `env` printed anything"
             for entry in entries:
                 key, sep, value = os.fsdecode(entry).partition("=")
                 if sep and _ENV_KEY_RE.match(key):
                     env[key] = value
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
             env = {}
+            problem = str(exc)
+        if problem is not None:
+            print(f"[maestro] warning: could not capture the login environment from {shell}: {problem}; agents get only the daemon's own environment", file=sys.stderr)
     _LOGIN_ENV_CACHE = env
     return env
 
@@ -640,6 +655,12 @@ class BaseAdapter:
                 # The agent never took its start command, or did not take the
                 # abort within the cancel grace. Closing stdin would wait
                 # behind that blocked write, so stop the agent instead.
+                _kill_group(process)
+                exit_code = process.poll()
+            elif cancel_grace_until is not None and process.poll() is None:
+                # Canceled, and still running when the cancel grace ended: it
+                # already had that grace to act on the abort, so it is stopped
+                # now instead of being given more time to exit on stdin EOF.
                 _kill_group(process)
                 exit_code = process.poll()
             else:

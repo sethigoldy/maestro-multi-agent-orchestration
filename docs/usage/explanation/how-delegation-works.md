@@ -187,13 +187,27 @@ process, and it waits at most five seconds for the output to close; a last
 line without a newline is then lost.
 
 A cancel reaches a running agent within about half a second, even while the
-agent prints nothing. For an RPC agent, Maestro first sends its abort command
-(unless the agent has not yet taken its start command, which would get mixed
-up with it) and gives the agent five seconds to stop. The abort is written
-from a separate thread, so an agent that has stopped reading its input cannot
-block the run; if the abort cannot be written within those five seconds,
-Maestro stops the process group. Agent output that is not valid UTF-8 is read
-with the bad bytes replaced, so it never stops a run.
+agent prints nothing. A spawned agent is then stopped straight away, as
+described above.
+
+An RPC agent first gets its abort command. If the agent is still taking its
+start command, Maestro waits up to one second for that write to finish, and
+sends no abort if it does not, because the two would get mixed up. From that
+point the agent has five seconds to stop and close its output. The abort is
+written from a separate thread, so an agent that has stopped reading its input
+cannot block the run. When the five seconds end and the agent is still running
+(whether it ignored the abort, never read it, or got none), Maestro stops its
+process group at once, without waiting any longer for it to exit on its own.
+That stop is the one described above: SIGTERM, up to five seconds for the
+agent's own process and two for the rest of the group, then SIGKILL. So an RPC
+agent that ignores the abort but exits on SIGTERM is stopped about five
+seconds after the cancel. The worst case, an agent that also ignores SIGTERM,
+is about fifteen seconds, plus up to one second when the start command was
+still being written. If the agent exits within the five seconds, only the
+processes it left behind are stopped.
+
+Agent output that is not valid UTF-8 is read with the bad bytes replaced, so
+it never stops a run.
 
 ## Verification: evidence, not vibes
 
