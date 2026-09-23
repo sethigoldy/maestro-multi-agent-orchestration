@@ -459,6 +459,48 @@ def test_run_key_navigation(tmp_path):
         server.server_close()
 
 
+def test_run_arrow_keys_move_the_selection_instead_of_quitting(tmp_path):
+    server, url = _sse_server(
+        tmp_path,
+        [
+            {"id": "task-2", "status": {"state": "completed"}, "metadata": {"title": "Two"}},
+            {"id": "task-1", "status": {"state": "working"}, "metadata": {"title": "One"}},
+        ],
+        b"",
+    )
+    try:
+        out = io.StringIO()
+        # Down arrow, then up arrow, then q. Before the fix the first arrow's
+        # ESC byte quit the dashboard, and q was never read.
+        stdin = _PipeStdin(b"\x1b[B\x1b[Aq", delay_s=0.3)
+        rc = tui.run(url, stdin=stdin, stdout=out, is_tty=lambda: True)
+        assert rc == 0
+        assert os.read(stdin.fileno(), 16) == b""  # every key, including q, was consumed
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_read_key_escape_sequences():
+    def read(data: bytes, close: bool = True) -> bytes:
+        r, w = os.pipe()
+        os.write(w, data)
+        if close:
+            os.close(w)
+        try:
+            return tui._read_key(r)
+        finally:
+            os.close(r)
+            if not close:
+                os.close(w)
+
+    assert read(b"j") == b"j"
+    assert read(b"\x1b[A") == tui._ARROW_UP
+    assert read(b"\x1b[B") == tui._ARROW_DOWN
+    assert read(b"\x1b", close=False) == b"\x1b"  # a lone Esc: nothing follows
+    assert read(b"\x1bx") == b"\x1bx"  # Alt+x: not an arrow, ignored by the loop
+
+
 def test_run_stream_close_with_stdin_open(tmp_path):
     server, url = _sse_server(tmp_path, [], b"", close_after_connect=True)
     try:

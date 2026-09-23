@@ -8,6 +8,7 @@ semantic versioning.
 
 ### Fixed
 
+- **Arrow keys quit the dashboard.** The help line says the arrow keys select a task, but an arrow key sends ESC [ A, and the dashboard quit on the first ESC byte. It now reads the whole sequence, so up and down arrows move the selection and a lone Esc still quits.
 - **The terminal dashboard no longer adds a duplicate row for every event.** `maestro dashboard` loaded the task list from `GET /tasks` but did not index those tasks by id. Every event, including the history the daemon replays on connect, therefore added a new untitled row at the top, and the original row never changed from its first state. The loaded tasks are now indexed, so each event updates the row of its task.
 - **The terminal cursor is visible again after you quit the dashboard.** On exit the dashboard wrote the escape sequence that hides the cursor instead of the one that shows it, so the shell was left without a cursor. It now writes the show-cursor sequence before it leaves the alternate screen.
 - **`maestro task tail 1` follows task number 1 instead of waiting forever.** The command passed the number straight to the event stream, which only matches full task ids, so no event ever arrived. It now asks the daemon to resolve the number or id first, and an unknown reference exits 2 with a message. `maestro task tail --all` also works now; before, it failed because a task reference was required even with `--all`. Giving neither a reference nor `--all`, or giving both, exits 2 with a message.

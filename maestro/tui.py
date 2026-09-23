@@ -180,6 +180,33 @@ def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, 
     return "\x1b[2J\x1b[H" + "\n".join(lines)
 
 
+_ARROW_UP = b"\x1b[A"
+_ARROW_DOWN = b"\x1b[B"
+# How long to wait for the rest of an escape sequence after an ESC byte. A
+# terminal sends an arrow key's three bytes together; a lone ESC is the Esc key.
+_ESCAPE_WAIT_S = 0.05
+
+
+def _read_key(fd: int) -> bytes:
+    """Read one key press from ``fd``.
+
+    Most keys are one byte. The arrow keys arrive as ESC [ A and ESC [ B; if
+    only the ESC byte were read, the dashboard would take it as the Esc key
+    and quit. So after an ESC byte this reads the rest of the sequence when
+    it follows at once, and returns it whole. Returns b"" at end of input.
+    """
+    key = os.read(fd, 1)
+    if key != b"\x1b":
+        return key
+    ready, _, _ = select.select([fd], [], [], _ESCAPE_WAIT_S)
+    if not ready:
+        return key  # the Esc key on its own
+    second = os.read(fd, 1)
+    if second != b"[":
+        return key + second
+    return key + second + os.read(fd, 1)
+
+
 class _State:
     """Mutable task table shared between the reader thread and the render loop."""
 
@@ -338,16 +365,16 @@ def run(
                 except KeyboardInterrupt:
                     break  # Ctrl-C (raw mode passes ^C through as a byte too)
                 if stdin_fd in ready:
-                    key = os.read(stdin_fd, 1)
+                    key = _read_key(stdin_fd)
                     if not key:
                         exit_code = 1  # stdin EOF (terminal closed)
                         break
                     if key in (b"q", b"\x1b", b"\x03"):
                         exit_code = 0
                         break
-                    if key == b"\x7f" or key == b"k":
+                    if key in (b"\x7f", b"k", _ARROW_UP):
                         state.selected = max(0, (state.selected or 0) - 1)
-                    elif key in (b"j", b"\n"):
+                    elif key in (b"j", b"\n", _ARROW_DOWN):
                         state.selected = min(len(state.tasks) - 1, (state.selected or 0) + 1)
                     else:
                         continue
