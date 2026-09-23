@@ -1,13 +1,29 @@
+"""The Maestro MCP server: the tools a host agent (Claude Code, Codex, ...) calls.
+
+The tools that start, wait for or change tasks go through ``get_daemon()``,
+which returns a client that forwards each call over HTTP to the daemon that
+owns the state directory. When no daemon owns it, the server starts a
+detached background daemon (the one ``maestro daemon start`` starts, with this
+server's environment), so the tasks keep running when this server exits. See
+:func:`maestro.daemon.get_daemon`. Only when a background daemon cannot be
+started does the daemon run inside this process; on exit the server stops
+that one, so its marker and locks are released and no task is left
+"working" with no process to finish it.
+"""
+
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import signal
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
+from . import daemon as _daemon
 from .core import Maestro
-from .daemon import get_daemon
+from .daemon import get_daemon, shutdown_daemon
 from .handoff import load_handoff_file, validate_handoff
 
 mcp = FastMCP("maestro")
@@ -72,8 +88,8 @@ def delegate(workspace: str, handoff_file: str, branch: str = "") -> str:
 
     Returns the final A2A task object (state, artifacts, workspace/branch
     metadata)."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         doc = load_handoff_file(handoff_file)
         if branch.strip():
             doc.branch = branch
@@ -83,7 +99,10 @@ def delegate(workspace: str, handoff_file: str, branch: str = "") -> str:
         return json.dumps({"error": str(exc)}, indent=2)
     if started.get("queued"):
         return json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line", "ts": started["ts"]}, indent=2)
-    final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    try:
+        final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    except ValueError as exc:  # the daemon went away and no replacement could be reached
+        return json.dumps({"error": str(exc), "task_id": started["task_id"]}, indent=2)
     timed_out = final["status"]["state"] not in {"completed", "failed", "canceled"} and final["status"]["state"] != "input-required"
     return json.dumps({"timed_out": bool(timed_out), **final}, indent=2)
 
@@ -92,11 +111,13 @@ def delegate(workspace: str, handoff_file: str, branch: str = "") -> str:
 def task_wait(workspace: str, task_id: str, timeout: float = 120.0) -> str:
     """Block until a task reaches a new terminal state or needs input (or the
     timeout expires). Use this to follow up on earlier delegations — never poll."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         final = d.wait(d.resolve(task_id), timeout=timeout)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
+    except ValueError as exc:  # the daemon this server forwards to stopped answering
+        return json.dumps({"error": str(exc)}, indent=2)
     return json.dumps(final, indent=2)
 
 
@@ -104,20 +125,18 @@ def task_wait(workspace: str, task_id: str, timeout: float = 120.0) -> str:
 def agents_list() -> str:
     """List every registered agent with its adapter kind, skills, defaults, and
     live availability (binary found? version?)."""
-    d = get_daemon()
-    out = []
-    for spec in d.registry.list():
-        status = d.registry.status(spec.name)
-        out.append({**spec.to_dict(redact=True), "status": status})
-    return json.dumps(out, indent=2)
+    try:
+        return json.dumps(get_daemon().agents(), indent=2)
+    except ValueError as exc:  # the daemon this server forwards to stopped answering
+        return json.dumps({"error": str(exc)}, indent=2)
 
 
 @mcp.tool()
 def cancel_task(workspace: str, task_id: str, reason: str = "") -> str:
     """Cancel a running (or queued-waiting) task. Partial work on the task branch
     is kept; the task is marked canceled with the reason."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         result = d.cancel(d.resolve(task_id), reason=reason)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
@@ -130,8 +149,8 @@ def cancel_task(workspace: str, task_id: str, reason: str = "") -> str:
 def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
     """Answer a question the agent asked mid-task (state 'input-required'). The
     agent resumes on its branch with the Q&A appended to its context."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         result = d.answer_question(d.resolve(task_id), answer)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
@@ -152,8 +171,8 @@ def rename_task_branch(workspace: str, task_id: str, branch: str) -> str:
     next turn creates, and the result has "pending": true. Only the local
     branch is renamed; a copy already pushed to a remote keeps its old name
     there."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         result = d.rename_branch(d.resolve(task_id), branch)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
@@ -181,20 +200,47 @@ def followup(workspace: str, task_id: str, instruction: str, context_mode: str =
     asked for), this sets the name the turn creates.
 
     Blocks until the follow-up turn finishes or needs input — no polling."""
-    d = get_daemon()
     try:
+        d = get_daemon()
         started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode, branch=branch.strip() or None)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
     except ValueError as exc:
         return json.dumps({"error": str(exc)}, indent=2)
-    final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    try:
+        final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
+    except ValueError as exc:  # the daemon went away and no replacement could be reached
+        return json.dumps({"error": str(exc), "task_id": started["task_id"]}, indent=2)
     timed_out = final["status"]["state"] not in {"completed", "failed", "canceled"} and final["status"]["state"] != "input-required"
     return json.dumps({"timed_out": bool(timed_out), **final}, indent=2)
 
 
+def _stop_daemon_on_exit() -> None:
+    """Stop this process's daemon when the server exits, including on SIGTERM.
+
+    A normal exit runs the atexit hook. SIGTERM would end the process without
+    it, so its handler stops the daemon first and then ends the process with
+    the default SIGTERM action, as before.
+    """
+    atexit.register(shutdown_daemon)
+
+    def _on_sigterm(signum: int, frame: object) -> None:
+        shutdown_daemon()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+
 def main() -> None:
-    mcp.run()
+    # Tasks must outlive this session: when no daemon owns the state
+    # directory, start a background daemon instead of one inside this process.
+    _daemon.BACKGROUND_OWNER = True
+    _stop_daemon_on_exit()
+    try:
+        mcp.run()
+    finally:
+        shutdown_daemon()
 
 
 if __name__ == "__main__":  # pragma: no cover

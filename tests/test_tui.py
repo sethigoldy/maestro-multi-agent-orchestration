@@ -797,15 +797,26 @@ def test_cli_main_uses_marker_token(tmp_path, monkeypatch):
         return 0
 
     monkeypatch.setattr(tui_mod, "run", fake_run)
+    from maestro import daemonctl
+
     home = tmp_path / "home"
     home.mkdir()
-    (home / "daemon.json").write_text(
-        json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.1", "token": "mk-token"}), encoding="utf-8"
-    )
-    monkeypatch.setenv("MAESTRO_HOME", str(home))
-    monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
-    assert tui_mod.main([]) == 0
-    assert calls == {"url": "http://127.0.0.1:8790", "token": "mk-token"}
+    # A live pid alone no longer confirms a daemon: this process holds the
+    # owner lock, as a running daemon does, and the marker says so.
+    lock_fd = daemonctl.acquire_owner_lock(home)
+    try:
+        (home / "daemon.json").write_text(
+            json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.1", "token": "mk-token", "owner_lock": True}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+        monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
+        # Nothing listens on the marker's port; this test is about where the
+        # token comes from, so the "does it answer HTTP" probe is stubbed.
+        monkeypatch.setattr(daemonctl, "probe", lambda url, *a, **k: True)
+        assert tui_mod.main([]) == 0
+        assert calls == {"url": "http://127.0.0.1:8790", "token": "mk-token"}
+    finally:
+        daemonctl.release_owner_lock(lock_fd)
 
 
 # ---------------------------------------------------------------- terminal width

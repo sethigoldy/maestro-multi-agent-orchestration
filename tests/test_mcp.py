@@ -25,10 +25,24 @@ def test_mcp_state_tools(monkeypatch):
 
 
 def test_mcp_main(monkeypatch):
+    """main() switches on the background daemon and installs exit handlers; none of that may outlive this test."""
+    import maestro.daemon as dm
+
     called = []
-    monkeypatch.setattr(mcp_server.mcp, "run", lambda: called.append(True))
+    registered: list = []
+    handlers: dict = {}
+    monkeypatch.setattr(mcp_server.mcp, "run", lambda: called.append(dm.BACKGROUND_OWNER))
+    monkeypatch.setattr(mcp_server.atexit, "register", lambda fn: registered.append(fn))
+    monkeypatch.setattr(mcp_server.signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
     assert mcp_server.main() is None
-    assert called == [True]
+    assert called == [True] and registered and handlers
+
+
+def test_background_daemon_mode_is_off_for_every_other_test():
+    """conftest keeps BACKGROUND_OWNER off, so no test starts a detached daemon by accident (test_mcp_main runs first)."""
+    import maestro.daemon as dm
+
+    assert dm.BACKGROUND_OWNER is False
 
 
 def test_mcp_followup_passes_context_mode(monkeypatch):

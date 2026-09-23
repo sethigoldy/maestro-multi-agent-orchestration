@@ -276,7 +276,12 @@ def test_mcp_agents_list_never_shows_a_token(monkeypatch, tmp_path):
     registry = AgentRegistry(tmp_path)
     registry.save(AgentSpec(name="remote-b", kind="a2a_remote", command="http://10.0.0.5:8790", token="sekrit"))
 
+    from maestro.daemon import MaestroDaemon
+
     class FakeDaemon:
+        # The real listing code, over this test's registry.
+        agents = MaestroDaemon.agents
+
         def __init__(self):
             self.registry = registry
 

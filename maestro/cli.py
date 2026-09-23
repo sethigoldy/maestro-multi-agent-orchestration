@@ -134,23 +134,24 @@ def _daemon_endpoint() -> tuple[str, str | None]:
     """Find the local broker and return ``(base_url, token)``.
 
     Resolution: ``MAESTRO_DAEMON_URL`` (with an optional ``MAESTRO_DAEMON_TOKEN``),
-    else the daemon.json marker written by whichever broker started last (a
-    standalone ``maestro-daemon`` or an MCP server's embedded daemon). A stale
-    marker from a dead process is rejected so callers get a clear error instead
-    of a connection failure mid-stream. Non-loopback daemons record their auth
-    token in the marker, so local CLI calls are authorized automatically.
+    else the daemon.json marker written by the daemon that owns the state
+    directory (a standalone ``maestro-daemon`` or an MCP server's daemon). The
+    marker is checked the same way ``maestro daemon status`` checks it: its
+    process must be alive, must be confirmed as the daemon that wrote the
+    marker, and must answer HTTP. A stale marker is rejected so callers get a
+    clear error instead of a connection failure mid-stream. Non-loopback
+    daemons record their auth token in the marker, so local CLI calls are
+    authorized automatically.
     """
+    from . import daemonctl
+
     env = os.environ.get("MAESTRO_DAEMON_URL", "").strip()
     if env:
         return env.rstrip("/"), os.environ.get("MAESTRO_DAEMON_TOKEN") or None
-    try:
-        info = json.loads((maestro_user_dir() / "daemon.json").read_text(encoding="utf-8"))
-        pid = int(info["pid"])
-        os.kill(pid, 0)  # liveness check; raises if the broker is gone
-        host = str(info.get("host") or "127.0.0.1")
-        return f"http://{host}:{int(info['port'])}", info.get("token") or None
-    except (OSError, ValueError, KeyError, TypeError):
-        raise ValueError("no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL") from None
+    info = daemonctl.status(maestro_user_dir())
+    if not info.running or not info.url:
+        raise ValueError("no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL")
+    return info.url, info.token or None
 
 
 def _daemon_url() -> str:
@@ -175,13 +176,27 @@ def _sse_events(url: str, path: str, token: str | None = None):
 
 
 def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int:
-    """Follow one task (or the global stream when task_id is None) live."""
-    path = f"/tasks/{task_id}/events" if task_id else "/events"
+    """Follow one task (or the global stream when task_id is None) live.
+
+    When the daemon drops this reader for falling too far behind, the stream
+    is followed again from a new subscription, and a note says that some
+    output lines may be missing. A task stream that ends without a final
+    state asks the daemon for the task's state (see
+    :func:`maestro.a2a_client.follow_task_events`).
+    """
+    from .a2a_client import follow_events, follow_task_events
+
+    if task_id:
+        events = follow_task_events(url, task_id, token=token, stream=_sse_events)
+    else:
+        events = follow_events(url, token=token, stream=_sse_events)
     final_state: str | None = None
     try:
-        for event, envelope in _sse_events(url, path, token=token):
+        for event, envelope in events:
             data = envelope.get("data") or {}  # TaskEvent.to_dict nests the payload under "data"
-            if event == "output":
+            if event == "overflow":
+                print("[tail] fell behind the daemon's event stream; reconnecting (some output lines may be missing)", flush=True)
+            elif event == "output":
                 print(data.get("line", ""), flush=True)
             elif event == "state":
                 state = data.get("state") or "?"
@@ -481,6 +496,11 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         return 0
     except (RuntimeError, TimeoutError) as exc:
         print(f"maestro: {exc}", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # Anything else (an unreadable state directory, a port that answers
+        # with something other than HTTP) is still reported as one line.
+        print(f"maestro: daemon {args.daemon_cmd} failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
 

@@ -55,10 +55,15 @@ def _daemon_status(state_dir: Path) -> dict[str, Any]:
     """Resolve the daemon endpoint like the CLI does and probe it once.
 
     Resolution order: ``MAESTRO_DAEMON_URL`` (+ optional ``MAESTRO_DAEMON_TOKEN``),
-    else the ``daemon.json`` marker (liveness-checked). The probe is a single
-    ``GET /tasks`` with a short timeout; 401 means reachable-but-unauthorized.
+    else the ``daemon.json`` marker, checked exactly as ``maestro daemon
+    status`` checks it (:func:`maestro.daemonctl.status`): the marker's process
+    must be alive and confirmed to be the daemon that wrote it. A stale marker
+    (dead process, a pid reused by another program, or an unreadable marker)
+    is reported like no marker, with ``stale_marker`` and a ``detail`` saying
+    why. The probe is a single ``GET /tasks`` with a short timeout; 401 means
+    reachable-but-unauthorized.
     """
-    import json
+    from . import daemonctl
 
     url: str | None = None
     token: str | None = None
@@ -67,16 +72,18 @@ def _daemon_status(state_dir: Path) -> dict[str, Any]:
         url = env_url.rstrip("/")
         token = os.environ.get("MAESTRO_DAEMON_TOKEN") or None
     else:
-        marker = state_dir / "daemon.json"
-        try:
-            info = json.loads(marker.read_text(encoding="utf-8"))
-            pid = int(info["pid"])
-            os.kill(pid, 0)  # liveness check; a stale marker is rejected
-            host = str(info.get("host") or "127.0.0.1")
-            url = f"http://{host}:{int(info['port'])}"
-            token = info.get("token") or None
-        except (OSError, ValueError, KeyError, TypeError):
-            url = None
+        info = daemonctl.status(state_dir)
+        if info.stale_marker:
+            return {
+                "reachable": False, "url": None, "auth": "none", "status": "no daemon configured",
+                "stale_marker": True, "detail": info.detail,
+            }
+        # A confirmed daemon (or no marker at all): its URL is probed below
+        # even when status found it not answering, so the report says
+        # "unreachable" for that URL. status only returns the token of a
+        # daemon that answers, and one that does not needs none.
+        url = info.url
+        token = info.token or None
     if not url:
         return {"reachable": False, "url": None, "auth": "none", "status": "no daemon configured"}
 
@@ -331,6 +338,8 @@ def format_doctor(report: dict[str, Any]) -> str:
         lines.append(f"  ✗ not reachable at {daemon.get('url')} ({daemon.get('status')})")
     else:
         lines.append("  ! no daemon running — start one with 'maestro-daemon' (expected before first start)")
+        if daemon.get("stale_marker"):
+            lines.append(f"      stale daemon marker: {daemon.get('detail')}")
 
     git = report.get("git") or {}
     lines.extend(["", "Git"])

@@ -77,6 +77,71 @@ def sse_events(url: str, path: str, token: str | None = None) -> Iterator[tuple[
             yield event, json.loads("\n".join(data_lines))
 
 
+_TERMINAL_STATES = ("completed", "failed", "canceled")
+
+
+def _events_with_reconnect(base_url: str, path: str, token: str | None, stream: Any) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield the events of one SSE path, subscribing again after an ``overflow`` event.
+
+    The daemon sends ``overflow`` and closes the stream when this reader fell
+    too far behind. A new subscription replays the daemon's recent events, so
+    events already yielded (by ``seq``) are skipped. The ``overflow`` event
+    itself is yielded so the caller can say that some events may be missing.
+    Ends when a stream closes without an overflow. ``stream`` is the SSE
+    reader to use (``sse_events`` or a wrapper of it).
+    """
+    last_seq = 0
+    while True:
+        overflowed = False
+        for event, envelope in stream(base_url, path, token=token):
+            if event == "overflow":
+                overflowed = True
+            else:
+                seq = envelope.get("seq") if isinstance(envelope, dict) else None
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+                    if seq <= last_seq:
+                        continue  # replayed after a reconnect: already yielded
+                    last_seq = seq
+            yield event, envelope
+        if not overflowed:
+            return
+
+
+def follow_events(base_url: str, token: str | None = None, *, stream: Any = None) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield every task's events from ``/events``, subscribing again after an overflow."""
+    yield from _events_with_reconnect(base_url, "/events", token, stream or sse_events)
+
+
+def follow_task_events(base_url: str, task_id: str, token: str | None = None, *, stream: Any = None) -> Iterator[tuple[str, dict[str, Any]]]:
+    """Yield one task's events until it reaches a terminal state.
+
+    Subscribes again when the daemon reports that this reader fell behind (an
+    ``overflow`` event). When the stream ends without a terminal state and
+    without an overflow, asks the daemon for the task with ``tasks/get``: a
+    terminal state found there is yielded as a final ``state`` event, and
+    otherwise the iteration just ends (the daemon is gone or the task still
+    runs), which the caller reports as a stream that closed early.
+    """
+    for event, envelope in _events_with_reconnect(base_url, f"/tasks/{task_id}/events", token, stream or sse_events):
+        yield event, envelope
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        if event == "state" and isinstance(data, dict) and data.get("state") in _TERMINAL_STATES:
+            return
+    try:
+        result = post_jsonrpc(base_url, "tasks/get", {"id": task_id}, token=token)
+    except ValueError:
+        return
+    task = (result or {}).get("task") or {}
+    state = (task.get("status") or {}).get("state")
+    if state not in _TERMINAL_STATES:
+        return
+    final: dict[str, Any] = {"state": state}
+    error = (task.get("metadata") or {}).get("error")
+    if error:
+        final["error"] = error
+    yield "state", {"task_id": task_id, "type": "state", "data": final, "seq": 0}
+
+
 def fetch_agent_card(base_url: str, *, timeout: float = 10, token: str | None = None) -> dict[str, Any]:
     """GET ``{base}/.well-known/agent.json`` and return the card as a dict."""
     url = f"{base_url}/.well-known/agent.json"

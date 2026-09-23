@@ -84,17 +84,54 @@ a dead process is reported as stopped — never as running.
 Only one daemon owns a state directory at a time. The owning daemon holds a
 lock file (`daemon.owner.lock`) for as long as it runs. A second
 `maestro-daemon` on the same state directory refuses to start and says which
-daemon owns it. The MCP server's built-in daemon does not refuse, because that
-would break the MCP tools whenever a background daemon is running: it runs its
-own tasks without an HTTP endpoint, prints a note on stderr, and leaves the
-owning daemon's marker and tasks alone. A daemon marks leftover "working" tasks
-as failed at startup only when no other daemon process is using the state
-directory, so it never fails tasks that another live daemon is still running.
+daemon owns it.
+
+**How the MCP server and the daemon relate.** The MCP server never runs
+tasks itself while a daemon owns the state directory. Every tool call goes to
+that daemon over its HTTP API, with the daemon's token when it has one. The
+tasks run in that daemon, so `maestro daemon stop`, the dashboard and
+`tasks/cancel` see and control them, and one workspace never has two active
+tasks. When no daemon owns the directory, the MCP server starts the same
+background daemon that `maestro daemon start` starts, and forwards to it. That
+daemon is a separate process: closing the session that started it does not
+stop it or the tasks other sessions sent to it.
+
+The background daemon runs with the environment of the process that started
+it: the MCP server's environment when an MCP server started it, or your
+shell's when you ran `maestro daemon start`. That environment includes the
+`PATH` used to find agent binaries and the `MAESTRO_*` settings. To give it a
+new environment, run `maestro daemon restart` from a shell that has the
+environment you want, or run `maestro daemon stop` and let the next MCP tool
+call start a new daemon with the MCP server's environment. Only when a
+background daemon cannot be started does the MCP server run the daemon inside
+its own process; it says so on stderr, and those tasks stop when that MCP
+server exits.
+
+If the daemon the MCP server uses stops answering but is still alive, a tool
+call waits and asks again with growing pauses for up to 20 seconds, and then
+returns an error that says to retry or run `maestro daemon restart`. It never
+starts a second daemon beside it. Once that daemon has exited, the next tool
+call starts a new one.
+
+Each task's record names the daemon process that runs it, by pid and start
+time. A daemon that starts alone in the state directory marks every leftover
+"working" or queued task as failed, because nothing else can still be running
+it. When other daemon processes share the directory, it marks such a task as
+failed only when the process in the record is certainly gone, and leaves it
+alone when that process still runs or cannot be checked. A daemon that is
+about to be refused as a second daemon marks nothing.
 
 `maestro daemon stop` signals a process only after confirming that it is the
-daemon that wrote the marker. If the daemon crashed and its pid now belongs to
-an unrelated process, `stop` removes the stale marker, does not signal that
-process, and says so.
+daemon that wrote the marker. A marker from 0.12.0 or earlier has no owner
+lock; it is confirmed when its port answers with a Maestro agent card and its
+pid runs a Maestro daemon or MCP server command, so a daemon started before an
+upgrade is still stopped. If the daemon crashed and its pid now belongs to an
+unrelated process, `stop` removes the stale marker, does not signal that
+process, and says so. Before it escalates from SIGTERM to SIGKILL it checks
+again that the pid still has the start time it had (when the start time
+cannot be read, it checks that the process still holds the owner lock), so a
+pid reused during the grace period is never killed. It never removes the
+marker while a daemon holds the owner lock.
 
 `maestro-daemon` remains the low-level **foreground** executable for
 development, debugging, service managers, and CI: it starts the same daemon in
@@ -500,7 +537,10 @@ a peer silent for ~15 seconds is marked **stale**.
 
 A daemon that listens on loopback only (the default, `127.0.0.1`) cannot be
 reached from another machine, so it does not announce itself or listen for
-peers unless you set `MAESTRO_DISCOVERY=1`. A daemon started with
+peers unless you set `MAESTRO_DISCOVERY=1`. Even then it announces itself only
+when `MAESTRO_DISCOVERY_IF` is a loopback address such as `127.0.0.1`, so only
+daemons on the same machine hear it. On any other interface it listens for
+peers but never announces `127.0.0.1` to the network. A daemon started with
 `--bind 0.0.0.0` or a LAN address runs discovery unless you set
 `MAESTRO_DISCOVERY=0`.
 
@@ -509,7 +549,17 @@ sent to the multicast group, never unicast packets aimed at the port. When
 `MAESTRO_DISCOVERY_IF` is `127.0.0.1`, it ignores announcements from other
 hosts. An announcement is dropped when its advertised host is not an IP
 address or its port is not a valid port, and names lose their control
-characters, so `maestro peers list` never prints terminal escape codes.
+characters, so `maestro peers list` never prints terminal escape codes. An
+announcement from another host is also dropped when it advertises a loopback
+address (such as `127.0.0.1` or `::1`), because that would point this machine
+at its own loopback services, or a link-local address other than the address
+it was sent from. A node on a link-local-only network, such as a Thunderbolt
+bridge, can therefore still announce its own `169.254.x.y` address. A host on
+the same network can fake the address a UDP packet comes from, so this check
+stops mistakes, not a determined neighbour. For that reason the well-known
+cloud metadata addresses (`169.254.169.254`, `169.254.170.2` and
+`fd00:ec2::254`) are always dropped, whoever announces them. Only an
+announcement sent from this machine may advertise a loopback address.
 `peers.json` holds at most 256 peers: a discovered peer that has not been heard
 for an hour is removed, and when the table is full the oldest discovered peers
 are dropped first. Manually added peers are never dropped. The file is
@@ -539,7 +589,7 @@ peers refresh automatically. To tune or disable discovery:
 |---|---|---|
 | `MAESTRO_DISCOVERY` | on beyond loopback, off on loopback | Set `0` to turn discovery off entirely. Set `1` to turn it on for a daemon that listens on loopback only |
 | `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
-| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored) |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored). A daemon bound to loopback announces itself only when this is a loopback address |
 | `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
 | `MAESTRO_NODE_NAME` | `maestro-node` | The name this daemon announces under |
 
@@ -890,7 +940,9 @@ reset; already-running tasks are unaffected.
 **`peers list` is empty on a LAN**
 The network likely blocks multicast — use `maestro peers add --name … --url …`.
 Check that your daemon is announcing at all: a daemon bound to `127.0.0.1`
-does not announce unless `MAESTRO_DISCOVERY=1` is set. Then set
+does not announce unless `MAESTRO_DISCOVERY=1` is set, and even then it
+announces only on a loopback `MAESTRO_DISCOVERY_IF`; bind the daemon to a LAN
+address or `0.0.0.0` so other machines can hear and reach it. Then set
 `MAESTRO_DISCOVERY=1`, `MAESTRO_DISCOVERY_TTL=0` and
 `MAESTRO_DISCOVERY_IF=127.0.0.1` to confirm loopback discovery works before
 debugging the network.

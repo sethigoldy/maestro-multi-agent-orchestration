@@ -16,7 +16,7 @@ version 0.13.0; verify with `maestro --version`.
 | Code | Meaning |
 |---|---|
 | `0` | Success |
-| `1` | `task tail <id>`: the followed task ended in a non-`completed` terminal state; a daemon connection failure for `dashboard`; `peers remove` for an unknown peer; `daemon status` when the daemon is **stopped**; a failed `daemon start`/`restart` (spawn/readiness failure); or `skill install`/`uninstall` when an agent operation fails |
+| `1` | `task tail <id>`: the followed task ended in a non-`completed` terminal state; a daemon connection failure for `dashboard`; `peers remove` for an unknown peer; `daemon status` when the daemon is **stopped**; a failed `daemon start`/`restart` (spawn/readiness failure); any unexpected error in a `daemon` subcommand, reported as one `maestro:` line on stderr; or `skill install`/`uninstall` when an agent operation fails |
 | `2` | Usage or runtime error. A message prefixed `maestro:` is printed to stderr (e.g. unknown task, missing daemon, invalid handoff) |
 | `130` | `task tail` interrupted by Ctrl-C |
 
@@ -27,8 +27,11 @@ the endpoint in this order:
 
 1. `MAESTRO_DAEMON_URL` (optionally with `MAESTRO_DAEMON_TOKEN`).
 2. The `daemon.json` marker written by the daemon that owns the state
-   directory (only one daemon can own it at a time). The marker's process is
-   liveness-checked and confirmed to be that daemon; a stale marker yields the error
+   directory (only one daemon can own it at a time). The marker is checked
+   exactly as `maestro daemon status` checks it: its process must be alive,
+   must be confirmed to be the daemon that wrote the marker, and must answer
+   HTTP. A pid that is merely alive is not enough, because it may have been
+   reused by another program after a crash. A stale marker yields the error
    `no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL`.
 
 Non-loopback daemons record their auth token in the marker, so local CLI calls
@@ -72,7 +75,7 @@ The lifecycle manager for the background daemon. It drives the same broker as
 | Subcommand | Behavior |
 |---|---|
 | `start` | Starts the daemon in a detached session (survives shell exit) and returns immediately. Output goes to `<state-dir>/daemon.log`. **Idempotent**: if a live, answering daemon already exists for this state directory it is reused — never duplicated (an advisory lock serializes concurrent starts). If a process exists but does not answer HTTP, `start` refuses rather than stacking a second daemon |
-| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. A process is signalled only when it is confirmed to be the daemon that wrote the marker (it holds `daemon.owner.lock`, or, for a marker from an older version, its endpoint answers with a Maestro agent card). If the daemon crashed and its pid now belongs to an unrelated process, `stop` removes the stale marker, does not signal that process, and says so. **Idempotent**: stopping when nothing is running is not an error |
+| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. A process is signalled only when it is confirmed to be the daemon that wrote the marker (it holds `daemon.owner.lock`, or, for a marker from an older version, its endpoint answers with a Maestro agent card; a card that names a pid and state directory must name the marker's pid and this state directory, and a card from 0.12.0 or earlier, which names neither, is accepted when the marker's pid runs a `maestro-daemon`, `maestro.daemon_main`, `maestro-mcp` or `maestro.mcp_server` command). If the daemon crashed and its pid now belongs to an unrelated process, `stop` removes the stale marker, does not signal that process, and says so. Before SIGKILL, `stop` checks that the pid still has the start time it had before SIGTERM (or, when the start time cannot be read, that it still holds `daemon.owner.lock`); if not, it leaves the process alone and says it was not force-killed. `stop` never removes the marker while a daemon holds `daemon.owner.lock`. **Idempotent**: stopping when nothing is running is not an error |
 | `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), *a live process that is not the daemon* (stale: the pid was reused), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
 | `restart` | `stop` + `start` with error handling |
 
@@ -161,7 +164,7 @@ the top-level options, so `maestro --workspace DIR task 1` runs
 |---|---|
 | `list` | Prints JSON array of tasks (`task_id`, number, title, phase, workspace). Without a scope flag or `$MAESTRO_WORKSPACE`: all user-level tasks. With `--project`: tasks of that project. With an explicit `--workspace`: the project's tasks if the path is a project root or a `.claude/worktrees` parent, else exactly that workspace |
 | `status` / `show` | Prints one task's state as JSON (see [Inspect tasks and artifacts](../how-to/inspect-tasks-and-artifacts.md#read-one-tasks-state) for the fields). Accepts a full task id or a numeric task number. Unknown references exit 2 |
-| `tail` | Live-follows one task's event stream over SSE (no polling). Accepts a full task id or a numeric task number; the daemon resolves the number to the task id before the stream starts. An unknown reference exits 2 with a message instead of waiting. If the task has already finished, including a task that finished in an earlier daemon run, tail prints its final state and exits at once. `--all` follows the global stream of every task and takes no task reference; with `--all` the exit code is always 0 (absent Ctrl-C). Giving neither a reference nor `--all`, or giving both, exits 2 |
+| `tail` | Live-follows one task's event stream over SSE (no polling). Accepts a full task id or a numeric task number; the daemon resolves the number to the task id before the stream starts. An unknown reference exits 2 with a message instead of waiting. If the task has already finished, including a task that finished in an earlier daemon run, tail prints its final state and exits at once. If tail falls so far behind that the daemon drops the stream (an `overflow` event), tail prints a note that some output lines may be missing, subscribes again and keeps following, without printing an event twice. If the stream ends without a final state, tail asks the daemon for the task (`tasks/get`) and prints its final state when the task has finished. `--all` follows the global stream of every task and takes no task reference; with `--all` the exit code is always 0 (absent Ctrl-C). Giving neither a reference nor `--all`, or giving both, exits 2 |
 | `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), the composed context entries (`context`, with their sources), accumulated usage, error, and parsed result files. Works after daemon restarts |
 | `receipt` | Prints the **execution receipt** — a human-readable summary (or stable JSON with `--json`) of what happened on one task: final state; per-attempt phase, agent, duration, cost, and ok/error; the deterministic verification result and command; work-mode gate verdicts and bounce count; totals (wall-clock or attempt-sum duration, aggregated cost when any attempt reported one), plus turn count, task-knowledge schema metadata, and continuation context stats for continued tasks. The receipt is a projection of the durable task state — it works for running, completed, failed, and canceled tasks alike, and after daemon restarts. If a daemon is reachable the receipt is served over its API (`GET /tasks/<id>/receipt`); otherwise it is built locally from the state directory. Unknown references exit 2 when no daemon can answer |
 | `continue` | Continues a finished task (completed/failed/canceled) with a new instruction: the same task id, workspace, branch, and routing resume — the follow-up turn runs under the handoff's fixer agent when one is pinned. `--context reuse` (default) injects the compact [task-knowledge snapshot](../reference/configuration.md#continuation--task-continuation-context); `--context fresh` starts a clean reasoning context. Blocks and streams the turn like `delegate` unless `--no-wait` prints the submission JSON and returns immediately. `--branch NAME` first renames the task's branch to NAME, with the same rules and refusals as `rename-branch`, and then runs the turn on it; for a task whose first turn could not create its branch, it sets the name this turn creates. Requires a reachable daemon; unknown tasks, exhausted delegation depth and a refused `--branch` exit 2 |
@@ -293,9 +296,13 @@ changes `PATH`. The report covers:
   the configuration is invalid, the directory is unusable, or the configured
   storage backend cannot be loaded (for example `[storage] backend = "memvara"`
   when the `memvara` package is not installed).
-- **Daemon** — reachability resolved like the CLI (env URL or liveness-checked
-  `daemon.json` marker), with auth status (`none`, `token`, or `missing` on a
-  401). A missing daemon is reported, not failed.
+- **Daemon** — reachability resolved like the CLI (env URL, or the
+  `daemon.json` marker checked as `maestro daemon status` checks it: the
+  marker's process must be alive and confirmed to be the daemon that wrote
+  it), with auth status (`none`, `token`, or `missing` on a 401). A stale
+  marker (dead process, or a pid now used by another program) is reported
+  like no daemon, with `stale_marker: true` and a `detail` saying why. A
+  missing daemon is reported, not failed.
 - **Git** — installed and versioned.
 - **Agents** — every known CLI kind (found/version/status) plus registered
   agents; missing optional agents are reported, never treated as failures.

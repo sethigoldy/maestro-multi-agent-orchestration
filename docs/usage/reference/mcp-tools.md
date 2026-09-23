@@ -8,6 +8,57 @@ input — they do not return a handle to poll.
 Task ids are of the form `task-YYYYMMDD-HHMMSS-xxxxxx`; numeric task numbers
 are accepted where a task id is expected (resolved against user-level state).
 
+## Which daemon runs the tasks
+
+The tools that start, wait for or change tasks (`delegate`, `task_wait`,
+`followup`, `answer_task_question`, `cancel_task`, `rename_task_branch`,
+`agents_list`) need a daemon. Only one daemon owns a state directory, and the
+MCP server never runs tasks beside it:
+
+- When a daemon owns the state directory (for example one started with
+  `maestro daemon start`), the MCP server sends every one of these tool calls
+  to that daemon over its HTTP API (JSON-RPC, with the daemon's token when it
+  has one). The tasks run in that daemon, so `maestro daemon stop`, the
+  dashboard and the daemon's `tasks/cancel` control them, and one workspace
+  never has two active tasks. Results and errors are the same as when the
+  daemon runs inside the MCP server.
+- When no daemon owns the state directory, the MCP server starts the same
+  detached background daemon that `maestro daemon start` starts and forwards
+  to it. The daemon is a separate process, so closing the session whose MCP
+  server started it stops neither the daemon nor any task, including tasks
+  that other sessions sent to it.
+- The background daemon runs with the environment of the process that
+  started it: the MCP server's environment here, including the `PATH` used to
+  find agent binaries and the `MAESTRO_*` settings. A daemon that was started
+  earlier, by `maestro daemon start` or by another MCP server, keeps its own
+  environment. To give it a new one, run `maestro daemon restart` from a shell
+  with the environment you want, or run `maestro daemon stop` and let the next
+  tool call start a new daemon with this MCP server's environment.
+- Only when a background daemon cannot be started does the MCP server run
+  the daemon inside its own process. It prints a note on stderr. That daemon
+  serves HTTP and owns the directory like any other, and it is stopped when
+  the MCP server exits (including on SIGTERM), which marks its running tasks
+  as failed.
+- If the daemon stops answering while it is still alive, a tool call waits
+  and asks again with growing pauses for up to 20 seconds, then returns
+  `{"error": …}` saying to retry or run `maestro daemon restart`. Once the
+  daemon has exited, the next tool call starts a new one. A blocking
+  `delegate`, `followup` or `task_wait` that is waiting at that moment carries
+  on waiting in the new daemon. One deadline covers the whole wait, however
+  often the daemon changes: when it passes, the wait returns the task as it
+  was last seen.
+- A daemon from Maestro 0.12.0 or earlier does not have the methods the MCP
+  server forwards its calls with. When such a daemon owns the state directory
+  (for example, another session still runs the older version), the MCP server
+  runs its tasks in a daemon inside its own process, without an HTTP endpoint
+  and without taking the directory over, as older versions did. It prints a
+  note on stderr. The older daemon cannot see or cancel those tasks. Restart
+  the older daemon with `maestro daemon restart`, or close the sessions that
+  still use the older version, to share one daemon again.
+
+`task_status` and `list_tasks` read the durable task state directly and do not
+need a daemon.
+
 ## Task object shape
 
 `delegate`, `task_wait`, and the cancel/answer tools resolve to an A2A task
