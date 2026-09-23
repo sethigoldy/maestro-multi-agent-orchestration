@@ -635,7 +635,12 @@ def test_post_jsonrpc_non_json_error_body(tmp_path):
         def log_message(self, *a): pass
 
         def do_POST(self):
+            # Read the request body before replying. Closing a socket that
+            # still holds unread data makes the kernel send a reset, and the
+            # client could then see "connection reset" instead of the reply.
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
             self.send_response(400)
+            self.send_header("Content-Length", "18")
             self.end_headers()
             self.wfile.write(b"plain text failure")
 
