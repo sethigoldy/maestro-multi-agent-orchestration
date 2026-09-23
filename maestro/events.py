@@ -24,7 +24,7 @@ def utcnow_iso() -> str:
 @dataclass
 class TaskEvent:
     task_id: str
-    type: str  # "state" | "output" | "question" | "usage" | "verify" | "artifact"
+    type: str  # "state" | "output" | "question" | "usage" | "verify" | "artifact" | "branch"
     data: dict[str, Any] = field(default_factory=dict)
     ts: str = field(default_factory=utcnow_iso)
     seq: int = 0

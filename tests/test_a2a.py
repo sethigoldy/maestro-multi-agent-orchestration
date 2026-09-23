@@ -52,7 +52,7 @@ class FakeDaemon:
         self.calls.append(("cancel", task_id, reason))
         return {"task_id": task_id, "state": "canceled"}
 
-    def followup(self, task_id, instruction, context_mode="reuse"):
+    def followup(self, task_id, instruction, context_mode="reuse", branch=None):
         if task_id == "task-shallow":
             raise ValueError("Max delegation depth exceeded")
         self.calls.append(("followup", task_id, instruction, context_mode))
