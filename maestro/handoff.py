@@ -64,6 +64,9 @@ class HandoffDoc:
     # [expectations]
     artifacts: list[str] = field(default_factory=lambda: ["code"])
     verification: str = "auto"
+    # The command run when verification == "command". None means the command
+    # is the request itself (the original shape of command mode).
+    verification_command: str | None = None
     commit_policy: str = "branch"
     # Name of the task branch. None means the default, maestro/<task_id>.
     branch: str | None = None
@@ -102,6 +105,7 @@ class HandoffDoc:
             "expectations": {
                 "artifacts": list(self.artifacts),
                 "verification": self.verification,
+                "verification_command": self.verification_command,
                 "commit_policy": self.commit_policy,
                 "branch": self.branch,
                 "budget_hint": self.budget_hint,
@@ -130,6 +134,11 @@ def validate_handoff(doc: HandoffDoc) -> HandoffDoc:
             raise ValueError("branch cannot be set when commit_policy='no-commit' (that policy creates no branch)")
     if doc.verification not in VERIFICATION_MODES:
         raise ValueError(f"verification must be one of {VERIFICATION_MODES}: {doc.verification!r}")
+    if doc.verification_command is not None:
+        if not isinstance(doc.verification_command, str) or not doc.verification_command.strip():
+            raise ValueError("verification_command must be a non-empty string when set")
+        if doc.verification != "command":
+            raise ValueError("verification_command requires verification = 'command'")
     if doc.max_depth_remaining < 0:
         raise ValueError("max_depth_remaining must be >= 0")
     if doc.max_bounces is not None and (isinstance(doc.max_bounces, bool) or not isinstance(doc.max_bounces, int) or doc.max_bounces < 0):
@@ -180,6 +189,7 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         explicit_target=bool(routing.get("explicit_target", "target_agent" in routing)),
         artifacts=[str(x) for x in expectations.get("artifacts", ["code"])],
         verification=str(expectations.get("verification") or "auto"),
+        verification_command=expectations.get("verification_command") or None,
         commit_policy=str(expectations.get("commit_policy") or "branch"),
         branch=expectations.get("branch") or None,
         budget_hint=expectations.get("budget_hint"),

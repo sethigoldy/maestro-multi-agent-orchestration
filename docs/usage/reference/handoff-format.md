@@ -23,7 +23,7 @@ with the task.
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `title` | string | — | yes | Short, non-empty summary of the work |
-| `request` | string | — | yes | The work order in prose. With `verification = "command"`, this field is instead interpreted as a shell command line (see below) |
+| `request` | string | — | yes | The work order in prose. With `verification = "command"` and no `verification_command`, this field is instead interpreted as a shell command line (see below) |
 | `design` | string | `""` | no | Authoritative design; multi-line text. Absent means the agent uses judgment within the request's scope |
 | `context_files` | list of strings | `[]` | no | Paths the agent should read for context |
 | `context_notes` | string | `""` | no | Free-form guidance about the context |
@@ -53,7 +53,8 @@ gate fields behaves exactly as before (deterministic verification only). See
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `artifacts` | list of strings | `["code"]` | no | What the work should produce (e.g. `"code"`, `"tests"`, `"docs"`) — guidance, not enforced |
-| `verification` | string | `"auto"` | no | One of: `auto`, `command`, `none`. `auto`: deterministic auto-detected check after the agent finishes. `command`: the `request` field is shlex-split and run as the check command. `none`: skipped |
+| `verification` | string | `"auto"` | no | One of: `auto`, `command`, `none`. `auto`: deterministic auto-detected check after the agent finishes. `command`: `verification_command` (or, when that is not set, the `request` field) is shlex-split and run as the check command. `none`: skipped |
+| `verification_command` | string or null | `null` | no | The check command for `verification = "command"`, for example `"pytest -q"`. Setting it lets `request` stay a prose work order. It must be a non-empty string and requires `verification = "command"`. Follow-ups keep running this command: when it is not set, the original `request` is carried forward as the command, so a follow-up's instruction is never run as a shell command |
 | `commit_policy` | string | `"branch"` | no | One of: `no-commit`, `branch`, `pr`. `branch`/`pr` create the task branch (named by `branch` below) and require a git workspace; `no-commit` works in place |
 | `branch` | string or null | `null` | no | The name of the task's git branch, for example `"feat/login-form"`. When it is not set, the branch is `maestro/<task-id>`. The branch must not exist yet, and its name must not clash with an existing branch as a folder. Git keeps a branch such as `feat/login` as a file inside a folder called `feat`, so when a branch `feat` exists, `feat/login` cannot be created, and when `feat/x` exists, `feat` cannot be created. Delegation is refused in both cases. It must be a valid git branch name, and it cannot be combined with `commit_policy = "no-commit"`. Every later turn of the task, including follow-ups, uses the same branch. To change the name after the task has run, or when its first turn could not create the branch, see `maestro task rename-branch` in the [CLI reference](cli.md#task). The name applies only to the workspace of the daemon that runs the task. When the task runs on a remote daemon (an `a2a_remote` agent), the handoff Maestro forwards to it has `branch` removed, because the remote gets a new request on every attempt and every turn and would otherwise refuse each one after the first as "already exists". The remote daemon puts its work on its own default branch, `maestro/<remote-task-id>` |
 | `budget_hint` | number or null | `null` | no | Must be positive when set. Recorded on the task for visibility; enforcement is via the `MAESTRO_BUDGET_*_USD` environment caps, not this field |
@@ -101,6 +102,7 @@ A handoff is rejected with a `ValueError` when any of these holds:
 - `commit_policy` is not one of `no-commit`, `branch`, `pr`
 - `branch` is set but is not a valid git branch name (for example it contains a space, `..`, `~`, `^`, `:`, `?`, `*`, `[` or `\`, starts with `-`, or ends with `/`, `.` or `.lock`), or it is set together with `commit_policy = "no-commit"`
 - `verification` is not one of `auto`, `command`, `none`
+- `verification_command` is set but empty, or set without `verification = "command"`
 - `max_depth_remaining` < 0
 - `budget_hint` is set and ≤ 0
 - any `fallback` entry is empty

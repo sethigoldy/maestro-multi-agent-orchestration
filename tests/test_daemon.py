@@ -1086,11 +1086,14 @@ def test_fifo_promotion_keeps_third_queued(daemon, tmp_path, binpath):
     assert second["queued"] and third["queued"]
     daemon.cancel(first["task_id"], reason="make room")
     # The second task is promoted; the third stays queued (workspace still busy).
+    # It leaves the queue as soon as it takes the slot, and its turn's thread
+    # then moves it on from "submitted"; wait for that.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if not daemon._tasks[second["task_id"]]["queued"]:
+        if daemon._tasks[second["task_id"]]["state"] != "submitted":
             break
         time.sleep(0.1)
+    assert daemon._tasks[second["task_id"]]["queued"] is False
     assert daemon._tasks[second["task_id"]]["state"] in ("working", "completed")
     assert daemon._tasks[third["task_id"]]["queued"] is True
     daemon.cancel(second["task_id"])
@@ -1141,8 +1144,10 @@ def test_record_transcript_helpers():
     record_transcript_append(rec, "q2")
     record_transcript_answer(rec, "a2")
     record_transcript_answer(rec, "a1")
-    record_transcript_answer(rec, "ignored")  # everything answered: loop exits without a break
-    assert [entry["answer"] for entry in rec["transcript"]] == ["a1", "a2"]
+    # Everything answered: the answer (to a park with no open entry) is added with its question.
+    record_transcript_answer(rec, "a3", question="q3")
+    record_transcript_answer(rec, "a4")
+    assert [(entry["question"], entry["answer"]) for entry in rec["transcript"]] == [("q1", "a1"), ("q2", "a2"), ("q3", "a3"), ("", "a4")]
     assert record_transcript(rec) == rec["transcript"]
 
 
@@ -1194,7 +1199,9 @@ def test_release_skips_busy_workspace_then_continues(daemon, tmp_path):
     daemon._release(a_id)  # frees ws1
     with daemon._lock:
         assert daemon._queue == [d_id, e_id]  # c promoted; d,e still queued (ws2 busy)
-        assert str(ws1) not in daemon._active  # _start_queued was stubbed: slot stays free
+        # The promoted task holds the slot from the moment it leaves the queue,
+        # so a rescan cannot promote a second task for the same workspace.
+        assert daemon._active[str(ws1)] == c_id
 
 
 # ------------------------------------------------------------------ M3: followup + guards
@@ -2463,7 +2470,7 @@ def test_crash_does_not_override_parked_state(daemon, tmp_path, binpath, monkeyp
     _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
     ws = _git_repo(tmp_path)
 
-    def park_then_boom(task_id, doc, workspace, agent_name, result):
+    def park_then_boom(task_id, doc, workspace, agent_name, result, turn_flag=None):
         daemon._set_state(task_id, "input-required", question="parked for test")
         raise RuntimeError("boom after park")
 
