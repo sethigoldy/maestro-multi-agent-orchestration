@@ -191,7 +191,7 @@ maestro agents status <name>
 
 | Subcommand | Behavior |
 |---|---|
-| `list` | JSON array of registered agent specs (user-level, `~/.maestro/registry.json`) |
+| `list` | JSON array of registered agent specs (user-level, `~/.maestro/agents/<name>.toml`) |
 | `add` | Registers an agent. `--kind` must be one of: `codex`, `claude_code`, `hermes`, `pi`, `cline`, `openhands`, `cursor`, `copilot`, `opencode`, `a2a_remote`, or `generic`. `--skill` is repeatable. For `generic`: `--command` is required in practice (supports `{prompt}` substitution); `--input-mode stdin` pipes the prompt instead; `--output-format jsonl` enables usage/cost parsing from JSON lines. For `a2a_remote`: `--command` is the daemon URL and `--token` its bearer token |
 | `remove` | Unregisters by name; exits 2 if not registered |
 | `discover` | Scans `PATH` for known agent CLIs and reports findings (does not register) |
@@ -258,6 +258,22 @@ Deletes terminal tasks (phases `COMPLETE`/`FAILED`; canceled tasks land in
 directory or registry record. `--dry-run` lists what would be deleted without
 deleting. Prints a JSON summary (`removed`, `kept`). Manual only — never runs
 automatically.
+
+It is safe to run while the daemon is working: gc removes each task under the
+same locks the daemon uses to register tasks and append claims, so nothing the
+daemon writes at that moment is lost. Before it removes a task, gc checks again
+under those locks that the task is still finished and still older than `N`
+days. If the task changed in the meantime (for example a follow-up started
+and set its status back to working), gc keeps it and counts it in `kept`. Removed task
+numbers are never given out again. gc is refused on the `memvara` storage
+backend, which keeps claims as history and cannot drop them yet; nothing is
+deleted in that case and the command exits 2.
+
+This safety depends on file locking. On Windows, where Python has no `fcntl`
+module, and on file systems that refuse `flock` (some NFS and SMB mounts),
+Maestro cannot take the locks. It then prints a warning once that names the
+lock file and carries on without the lock. In that case, stop the daemon
+before you run `maestro gc`.
 
 ## doctor
 

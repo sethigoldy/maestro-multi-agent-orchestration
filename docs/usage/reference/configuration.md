@@ -230,8 +230,11 @@ and current spend.
 
 ```text
 ~/.maestro/                        (or $MAESTRO_HOME)
-├── registry.json                  # registered agents
+├── agents/<name>.toml             # registered agents (mode 0600: may hold a remote token)
+├── registry.json                  # task registry: task numbers, titles, workspaces
+├── task-counter                   # highest task number ever given out (never reused)
 ├── state.jsonl                    # durable claim journal (append-only; subjects maestro:task:<id>)
+├── state.lock / registry.lock     # lock files; writers and gc take them
 ├── daemon.json                    # last-started broker marker: pid, host, port, token (when auth is on)
 ├── peers.json                     # discovered/registered peers
 ├── config.toml                    # user-level config
@@ -243,5 +246,51 @@ and current spend.
 ```
 
 State is user-level, not per-project: it survives worktree creation, switching,
-and deletion. Each task records the exact workspace it ran in and its project
-root. Project-level files are configuration only (`.maestro/config.toml`).
+and deletion.
+
+Each task records the exact workspace it ran in and its project root.
+Project-level files are configuration only (`.maestro/config.toml`).
+
+### When `registry.json` is missing or damaged
+
+When `registry.json` is missing, Maestro rebuilds the task registry from the
+task claims in `state.jsonl` and saves it, so the rebuild runs once and not on
+every `maestro task list`. The rebuild runs under the registry lock.
+
+When `registry.json` cannot be parsed, Maestro takes the registry lock and
+reads the file again, because another process may have repaired it in the
+meantime. If it is still damaged, Maestro moves it aside as
+`registry.corrupt-<time>.json`, where it is kept for inspection, and rebuilds
+the registry as above.
+
+The rebuild keeps every task that has at least one claim:
+
+- A task keeps the number in its `task_number` claim. A task without a usable
+  `task_number` claim gets the next number after the highest ever given out
+  (`task-counter`), and that number is saved as a claim, so a later rebuild
+  gives the same number.
+- The title comes from the `task_title` claim, or is the task id when there
+  is none. The workspace comes from the `task_workspace` claim, or is empty.
+- The claim journal stores no times, so `created_at` is taken from the date
+  and time in the task id (`task-YYYYMMDD-HHMMSS-…`), or else from the
+  modification time of the task's `tasks/<task-id>/` folder. It is empty when
+  neither is available.
+- A task imported from a legacy project journal keeps its
+  `legacy_task_number`. The number is saved as a claim during the import, so
+  this applies to tasks imported by this version or later.
+
+When `registry.json` exists but cannot be read at that moment (for example
+the process has too many open files, or no permission to read the file),
+Maestro stops with an error and changes nothing. It does not rebuild the
+registry and does not write over the file, because the file itself may be
+fine.
+
+### File locking
+
+Writers take `registry.lock` to change the task registry and `state.lock` to
+append to or rewrite `state.jsonl`. These are advisory `flock` locks. On
+Windows, where Python has no `fcntl` module, and on file systems that refuse
+`flock` (some NFS and SMB mounts), Maestro cannot take them. It prints a
+warning once that names the lock file and continues without the lock. In that
+case, run only one Maestro process that writes state at a time: stop the
+daemon before `maestro gc`.

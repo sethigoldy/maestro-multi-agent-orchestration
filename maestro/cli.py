@@ -11,7 +11,7 @@ from typing import Any
 
 from . import VERSION
 from .agents import AgentRegistry, AgentSpec, BUILTIN_ADAPTERS, GENERIC_KIND
-from .core import Maestro, maestro_user_dir
+from .core import Maestro, RegistryUnreadableError, maestro_user_dir
 
 
 def _workspace(value: str | None) -> Path:
@@ -545,24 +545,37 @@ def _cmd_gc(args: argparse.Namespace) -> int:
                     return None
             return None
 
+        def removable_age(task_id: str, record: dict[str, Any] | None) -> float | None:
+            """The task's age in days if gc should remove it (finished and older
+            than --days), otherwise None."""
+            if record is None:
+                return None
+            phase = str(m._claims(task_id).get("task_status") or "")
+            if phase not in {"COMPLETE", "FAILED"}:  # canceled tasks land in FAILED
+                return None
+            age = age_days_for(task_id, record)
+            return age if age is not None and age >= args.days else None
+
         removed: list[dict[str, Any]] = []
         kept = 0
         for record in m._registry_records():
             task_id = str(record.get("task_id") or "")
             if not task_id:
                 continue
-            phase = str(m._claims(task_id).get("task_status") or "")
-            terminal = phase in {"COMPLETE", "FAILED"}  # canceled tasks land in FAILED
-            age = age_days_for(task_id, record)
-            if not terminal or age is None or age < args.days:
+            age = removable_age(task_id, record)
+            if age is None:
                 kept += 1
                 continue
             if args.dry_run:
                 removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "dry_run": True})
                 continue
+            # The check is repeated under the locks: a claim written since the
+            # first check (a follow-up started, say) means the task is kept.
+            dropped = m.unregister_task(task_id, should_remove=lambda current, task_id=task_id: removable_age(task_id, current) is not None)
+            if dropped is None:
+                kept += 1
+                continue
             shutil.rmtree(state_dir / "tasks" / task_id, ignore_errors=True)
-            m._save_index([x for x in m._load_index() if str(x.get("task_id")) != task_id])
-            dropped = m.mem.forget(m._subject(task_id))
             removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "claims_dropped": dropped})
         print(json.dumps({"removed": removed, "kept": kept}, indent=2))
         return 0
@@ -809,6 +822,8 @@ def main(argv: list[str] | None = None) -> int:
             m.close()
     except KeyError as exc:
         print(f"maestro: {exc.args[0]}", file=sys.stderr); return 2
+    except RegistryUnreadableError as exc:
+        print(f"maestro: {exc}", file=sys.stderr); return 2
     except ValueError as exc:
         print(f"maestro: {exc}", file=sys.stderr); return 2
 
