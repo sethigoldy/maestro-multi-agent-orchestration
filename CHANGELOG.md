@@ -6,6 +6,12 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Choose the task branch name when you delegate.** Until now every task branch was called `maestro/<task-id>`, and the only way to follow a repository's naming convention was to rename the branch by hand afterwards. A handoff can now name the branch: `[expectations] branch = "feat/login-form"` in the file, `maestro delegate --branch feat/login-form` on the CLI, or `delegate(..., branch="feat/login-form")` over MCP (the flag and the MCP argument override the file). The name is checked against git's branch-name rules when the handoff is read, and delegation is refused if the branch already exists, so an agent never starts work on a branch that holds something else. Setting a branch together with `commit_policy = "no-commit"` is refused, because that policy creates no branch. Every later turn of the task, including follow-ups, stays on the named branch. If git cannot create the branch when the turn starts (for example, someone created it after delegation), the task fails with that reason instead of letting the agent work on whatever branch was checked out.
+
+- **Rename a task's branch after it has run.** `maestro task rename-branch <task> <new-name>`, the MCP tool `rename_task_branch`, and the A2A method `tasks/renameBranch` rename the git branch and update the task's durable record in one step. Before this, a branch renamed with `git branch -m` left `maestro task list`, `task status` and receipts showing the old, deleted name, and a follow-up would recreate the old branch from the current checkout. If the branch was already renamed by hand, the command only updates the record. The rename is refused while an agent is working on the task, when the new name already exists, and when neither name exists. It works after a daemon restart, and the CLI writes the state directory directly when no daemon is running. The daemon publishes a `branch` event so the terminal dashboard shows the new name straight away. Only the local branch is renamed; a copy already pushed to a remote keeps its old name.
+
 ## [0.12.0] — 2026-09-22
 
 ### Fixed

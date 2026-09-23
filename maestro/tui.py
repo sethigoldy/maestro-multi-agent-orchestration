@@ -211,6 +211,8 @@ class _State:
             merged = dict(task.get("usage") or {})
             merged.update(data)
             task["usage"] = merged
+        elif type_ == "branch":
+            task["branch"] = data.get("branch") or task.get("branch")
 
     def clamp_selection(self) -> None:
         if self.selected is not None and self.selected >= len(self.tasks):

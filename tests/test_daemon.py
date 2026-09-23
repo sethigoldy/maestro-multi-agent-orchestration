@@ -1583,7 +1583,7 @@ def test_mcp_tools_keep_stable_signatures():
     from maestro import mcp_server
 
     expected = {
-        "delegate": ["workspace", "handoff_file"],
+        "delegate": ["workspace", "handoff_file", "branch"],
         "task_status": ["workspace", "task_id"],
         "list_tasks": ["workspace"],
         "task_wait": ["workspace", "task_id", "timeout"],
@@ -1591,6 +1591,7 @@ def test_mcp_tools_keep_stable_signatures():
         "cancel_task": ["workspace", "task_id", "reason"],
         "answer_task_question": ["workspace", "task_id", "answer"],
         "followup": ["workspace", "task_id", "instruction", "context_mode"],
+        "rename_task_branch": ["workspace", "task_id", "branch"],
     }
     for name, params in expected.items():
         sig = list(inspect.signature(getattr(mcp_server, name)).parameters)

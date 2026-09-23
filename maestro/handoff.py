@@ -6,7 +6,8 @@ Every delegation between agents — human or machine — is normalized to this s
     [routing]       who does it     (target_agent, fallback, origin_agent, parent_task,
                                      plus work-mode pins: mode, review_agent, verify_agent,
                                      fix_agent, max_bounces — see maestro/modes.py)
-    [expectations]  what done looks like (artifacts, verification, commit_policy, budget_hint)
+    [expectations]  what done looks like (artifacts, verification, commit_policy, branch,
+                                          budget_hint)
     [constraints]   guardrails inherited from config (sensitive, max_depth_remaining)
 
 Plus an optional ``[[context]]`` array of typed context entries (see
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .branches import validate_branch_name
 from .context import parse_entry
 
 COMMIT_POLICIES = ("no-commit", "branch", "pr")
@@ -63,6 +65,8 @@ class HandoffDoc:
     artifacts: list[str] = field(default_factory=lambda: ["code"])
     verification: str = "auto"
     commit_policy: str = "branch"
+    # Name of the task branch. None means the default, maestro/<task_id>.
+    branch: str | None = None
     budget_hint: float | None = None
     # [constraints]
     sensitive: bool = False
@@ -99,6 +103,7 @@ class HandoffDoc:
                 "artifacts": list(self.artifacts),
                 "verification": self.verification,
                 "commit_policy": self.commit_policy,
+                "branch": self.branch,
                 "budget_hint": self.budget_hint,
             },
             "constraints": {
@@ -119,6 +124,10 @@ def validate_handoff(doc: HandoffDoc) -> HandoffDoc:
         raise ValueError("Handoff routing requires a target_agent")
     if doc.commit_policy not in COMMIT_POLICIES:
         raise ValueError(f"commit_policy must be one of {COMMIT_POLICIES}: {doc.commit_policy!r}")
+    if doc.branch is not None:
+        doc.branch = validate_branch_name(doc.branch)
+        if doc.commit_policy == "no-commit":
+            raise ValueError("branch cannot be set when commit_policy='no-commit' (that policy creates no branch)")
     if doc.verification not in VERIFICATION_MODES:
         raise ValueError(f"verification must be one of {VERIFICATION_MODES}: {doc.verification!r}")
     if doc.max_depth_remaining < 0:
@@ -172,6 +181,7 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         artifacts=[str(x) for x in expectations.get("artifacts", ["code"])],
         verification=str(expectations.get("verification") or "auto"),
         commit_policy=str(expectations.get("commit_policy") or "branch"),
+        branch=expectations.get("branch") or None,
         budget_hint=expectations.get("budget_hint"),
         sensitive=bool(constraints.get("sensitive", False)),
         max_depth_remaining=int(constraints.get("max_depth_remaining", 3)),
@@ -225,6 +235,7 @@ def from_legacy(payload: dict[str, Any]) -> HandoffDoc:
         # default instead of assuming a specific agent played that role.
         origin_agent=str(payload.get("supervisor") or "human"),
         commit_policy="branch",
+        branch=payload.get("branch") or None,
     )
     settings: dict[str, Any] = {}
     if payload.get("model"):
@@ -239,7 +250,7 @@ def load_handoff_file(path: "str | Path") -> HandoffDoc:
     """Load a staged handoff file in any supported shape.
 
     Accepts the 4-section document (JSON or TOML) and legacy 0.8.x JSON
-    (title/request/design_file/model/effort).
+    (title/request/design_file/model/effort, plus an optional branch).
     """
     p = Path(path).expanduser()
     if not p.is_file():

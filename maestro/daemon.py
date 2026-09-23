@@ -37,6 +37,7 @@ from .a2a import (
 )
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec
+from .branches import branch_exists, rename_task_branch
 from .context import RenderedContext, compose_context, entry_from_dict, render_context
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
@@ -650,6 +651,10 @@ class MaestroDaemon:
                     f"Workspace {ws} is not a git repository but commit_policy={doc.commit_policy!r} requires one; "
                     "run 'git init' there or set commit_policy='no-commit'"
                 )
+            if doc.branch and branch_exists(ws, doc.branch):
+                raise ValueError(
+                    f"Branch {doc.branch!r} already exists in {ws}; pick a new name for this task's branch"
+                )
         key = str(ws)
         self._enforce_budgets(doc.target_agent)
         task_id, record = self._make_record(doc, key)
@@ -818,7 +823,10 @@ class MaestroDaemon:
         turn = (record.get("turn") or 0) + 1 if record is not None else 1
         if record is not None:
             record["turn"] = turn  # follow-ups/answers are new turns; result files must not collide
-        branch = self._prepare_branch(workspace, task_id, doc.commit_policy)
+        branch = self._prepare_branch(
+            workspace, task_id, doc.commit_policy,
+            requested=doc.branch, recorded=(record or {}).get("branch"),
+        )
         if branch:
             record = self._tasks.get(task_id)
             if record is not None:
@@ -1302,15 +1310,30 @@ class MaestroDaemon:
         self.bus.publish(TaskEvent(task_id=task_id, type="verify", data={"ok": ok, "command": " ".join(test_cmd), "report": str(report_path)}))
         return ok
 
-    def _prepare_branch(self, workspace: Path, task_id: str, commit_policy: str) -> str | None:
+    def _prepare_branch(
+        self, workspace: Path, task_id: str, commit_policy: str,
+        requested: str | None = None, recorded: str | None = None,
+    ) -> str | None:
+        """Check out the task branch, creating it on the task's first turn.
+
+        The name is, in order: the branch already recorded for this task (a
+        later turn, possibly after a rename), the name the handoff asked for,
+        or the default ``maestro/<task_id>``. A branch the handoff asked for
+        must be created fresh; if git cannot create it, the turn fails rather
+        than letting the agent work on whatever branch is checked out.
+        """
         if commit_policy == "no-commit":
             return None
         probe = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--show-toplevel"], text=True, capture_output=True)
         if probe.returncode != 0:
             return None
-        branch = f"maestro/{task_id}"
+        branch = recorded or requested or f"maestro/{task_id}"
         created = subprocess.run(["git", "-C", str(workspace), "checkout", "-b", branch], text=True, capture_output=True)
         if created.returncode != 0:
+            if requested and not recorded:
+                raise RuntimeError(
+                    f"could not create the requested branch {branch!r}: {(created.stderr or created.stdout).strip()}"
+                )
             existing = subprocess.run(["git", "-C", str(workspace), "checkout", branch], text=True, capture_output=True)
             if existing.returncode != 0:
                 return None
@@ -1482,6 +1505,7 @@ class MaestroDaemon:
             artifacts=list(doc.artifacts),
             verification=doc.verification,
             commit_policy=doc.commit_policy,
+            branch=doc.branch,
             budget_hint=doc.budget_hint,
             sensitive=doc.sensitive,
             max_depth_remaining=max(0, doc.max_depth_remaining - 1),
@@ -1520,6 +1544,25 @@ class MaestroDaemon:
         thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
         thread.start()
         return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
+
+    def rename_branch(self, task_id: str, new_branch: str) -> dict[str, Any]:
+        """Rename a task's branch in git and in the task's record.
+
+        Refused while an agent is working on the task, because the agent's
+        checkout would change under it. See :func:`maestro.branches.rename_task_branch`
+        for the git side, including the case where the branch was already
+        renamed by hand.
+        """
+        record = self._tasks.get(task_id) or self._durable_record(task_id)
+        if record is None:
+            raise KeyError(f"Unknown task reference {task_id!r}")
+        if record["state"] in (STATE_SUBMITTED, STATE_WORKING):
+            raise ValueError(f"Task {task_id} is running (state={record['state']}); rename its branch after it finishes")
+        result = rename_task_branch(self.maestro, task_id, new_branch)
+        record["branch"] = result["branch"]
+        self._persist(task_id)
+        self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": result["old_branch"], "branch": result["branch"]}))
+        return result
 
     def _doc_from_record(self, record: dict[str, Any]) -> HandoffDoc:
         from .handoff import from_dict

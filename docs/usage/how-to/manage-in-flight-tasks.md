@@ -11,7 +11,8 @@ block until completion. For reading finished state, see
 |---|---|---|
 | Watch live output | `maestro task tail <id>` | (console/dashboard) |
 | Answer an agent question | — | `answer_task_question` |
-| Send a follow-up instruction | — | `followup` |
+| Send a follow-up instruction | `maestro task continue <id>` | `followup` |
+| Rename a finished task's branch | `maestro task rename-branch <id> <name>` | `rename_task_branch` |
 | Cancel the task | — | `cancel_task` |
 | Block until done or input needed | `maestro task tail <id>` (streams to the end) | `task_wait` |
 
@@ -87,6 +88,32 @@ Behavior and rules:
 
 Review the result of a follow-up exactly like the original task: status, audit,
 branch diff — see [Inspect tasks and artifacts](inspect-tasks-and-artifacts.md).
+
+## Rename a task's branch
+
+A finished or parked task keeps the branch it was given. To rename it:
+
+```bash
+maestro task rename-branch 3 feat/login-form
+```
+
+or, from an MCP client:
+
+```text
+rename_task_branch(workspace="/path/to/repo", task_id="3", branch="feat/login-form")
+```
+
+This renames the git branch and updates the task's record, so `task list`,
+`task status`, receipts and the next follow-up all use the new name. If you
+already ran `git branch -m` yourself, the command sees that the old branch is
+gone and the new one exists, and only updates the record.
+
+Rules:
+
+- The task must not be running. Wait for it to finish or park first.
+- The new name must not already exist.
+- Only the local branch is renamed. If you pushed the old branch, rename or
+  delete it on the remote yourself.
 
 ## Cancel a task
 

@@ -47,7 +47,7 @@ human-level phases is in [How delegation works](../explanation/how-delegation-wo
 ## delegate
 
 ```text
-delegate(workspace: str, handoff_file: str) -> str
+delegate(workspace: str, handoff_file: str, branch: str = "") -> str
 ```
 
 Loads the handoff file (4-section TOML/JSON or legacy 0.8.x JSON — see
@@ -74,12 +74,18 @@ optional `kind` and `phases`) to inject user-controlled context into the agent
 turns — see [Context injection in the README](../../../README.md#context-injection).
 Signature unchanged: the context lives in the file.
 
+`branch` names the task's git branch, for example `"feat/login-form"`. It
+overrides `[expectations] branch` in the handoff file. When neither is set, the
+branch is `maestro/<task-id>`. The branch must not exist yet; an invalid or
+existing name returns `{"error": …}` before any agent runs.
+
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
 - If the workspace already has an active task, returns immediately with
   `{"queued": true, "reason": "workspace already has an active task; this handoff is next in line", "ts": …}`.
 - Errors (unknown file, invalid handoff, self-delegation, depth exhausted,
-  budget cap, non-git workspace) return `{"error": "<message>"}`.
+  budget cap, non-git workspace, invalid or existing `branch`) return
+  `{"error": "<message>"}`.
 
 ## followup
 
@@ -106,6 +112,28 @@ to disable reuse or resize its budget.
 Errors: unknown task (`KeyError` text), empty instruction, task still active
 (`"…cancel it or answer its question before following up"`), depth exhausted —
 each returned as `{"error": …}`.
+
+## rename_task_branch
+
+```text
+rename_task_branch(workspace: str, task_id: str, branch: str) -> str
+```
+
+Renames a task's git branch and updates the task's record, so `list_tasks`,
+`task_status`, receipts and later `followup` turns all use the new name.
+Accepts a task id or a task number. If the branch was already renamed by hand
+with `git branch -m`, the call only updates the record.
+
+Returns `{"task_id": …, "old_branch": …, "branch": …, "git_renamed": true|false}`.
+`git_renamed` is `false` when only the record changed.
+
+Only the local branch is renamed. A copy already pushed to a remote keeps its
+old name there.
+
+Errors, each returned as `{"error": …}`: unknown task; the task is still
+running (`submitted` or `working`); the task has no branch (it has not started,
+or it uses `commit_policy = "no-commit"`); an invalid branch name; the new
+branch already exists; neither the old nor the new branch exists.
 
 ## task_wait
 

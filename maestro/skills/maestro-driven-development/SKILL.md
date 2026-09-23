@@ -234,7 +234,7 @@ project root), `--version`, `-h/--help`.
 
 ```text
 maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode NAME]
-                 [--fallback AGENT ...] [--design-file PATH] [--context TEXT ...]
+                 [--fallback AGENT ...] [--design-file PATH] [--branch NAME] [--context TEXT ...]
                  [--context-file PATH ...] [--skill DIR ...] [--no-wait]
 ```
 
@@ -242,6 +242,8 @@ maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode 
   the fly. Without `--target`/`--mode`, routing resolves from config `[defaults]`
   or parks with a question (section 3).
 - `--fallback`: repeatable fallback agents, tried in order when the target fails.
+- `--branch NAME`: name for the task's git branch (default `maestro/<task-id>`).
+  It must not exist yet. Same as `[expectations] branch` in a handoff file.
 - `--context TEXT` / `--context-file PATH` / `--skill DIR`: inject standing
   context into the agent turns (text entry, inlined file, or Agent Skills
   directory containing SKILL.md).
@@ -257,6 +259,8 @@ maestro task show <task-id>           # alias for status
 maestro task tail <task-id>           # live event stream (SSE, no polling)
 maestro task audit <task-id>          # durable audit record: attempts, usage, errors
 maestro task receipt <task-id>        # execution receipt: attempts, verification, gates, totals
+maestro task continue <task-id> --request "…"   # follow-up turn on the same task and branch
+maestro task rename-branch <task-id> <name>     # rename the task's branch in git and in its record
 ```
 
 ### Top-level commands
@@ -359,11 +363,13 @@ Relevant environment variables: `MAESTRO_HOME`, `MAESTRO_WORKSPACE`,
 When your environment exposes the Maestro MCP server, these tools are available
 (they target the daemon; always pass the workspace absolute path):
 
-- **`delegate(workspace, file)`** — submit a handoff file and **block until the
+- **`delegate(workspace, file, branch="")`** — submit a handoff file and **block until the
   task completes, fails, or needs input** (no polling). Returns the final A2A
   task object (state, artifacts, workspace/branch metadata). If the workspace
   already has an active task you get `{"queued": true, …}` immediately. Routing
   defaults and the input-required question behave exactly as in section 3.
+  `branch` names the task's git branch (default `maestro/<task-id>`); use it
+  when the repository has branch naming conventions, instead of renaming later.
 - **`followup(workspace, task_id, instruction, context_mode="reuse")`** — send a precise fix pass to a
   finished/failed task; blocks until that follow-up turn settles. `context_mode="reuse"` (default) injects the compact task-knowledge snapshot; `"fresh"` starts a clean reasoning context.
 - **`task_wait(workspace, task_id)`** — block on an earlier (e.g. queued or
@@ -377,6 +383,9 @@ When your environment exposes the Maestro MCP server, these tools are available
   input-required task (routing selection or sensitive-workspace approval) and
   resume it.
 - **`cancel_task(workspace, task_id)`** — cancel a running/queued task.
+- **`rename_task_branch(workspace, task_id, branch)`** — rename a finished task's
+  branch in git and in the task's record. If the branch was already renamed with
+  `git branch -m`, this only updates the record.
 
 ## 12. What you never do
 

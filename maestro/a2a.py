@@ -90,6 +90,8 @@ class A2ADispatcher:
             return self._cancel(request_id, params)
         if method == "tasks/followup":
             return self._followup(request_id, params)
+        if method == "tasks/renameBranch":
+            return self._rename_branch(request_id, params)
         return jsonrpc_error(request_id, ERR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
     def _send(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -177,6 +179,21 @@ class A2ADispatcher:
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         return jsonrpc_ok(request_id, {"task": self.daemon.status_a2a(result["task_id"])})
+
+    def _rename_branch(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        branch = params.get("branch")
+        if not isinstance(branch, str) or not branch.strip():
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.branch is required (non-empty string)")
+        try:
+            result = self.daemon.rename_branch(self.daemon.resolve(task_ref), branch)
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        except ValueError as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
+        return jsonrpc_ok(request_id, {"rename": result, "task": self.daemon.status_a2a(result["task_id"])})
 
 
 def new_message_id() -> str:
