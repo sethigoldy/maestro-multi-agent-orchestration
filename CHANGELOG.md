@@ -6,6 +6,15 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`maestro gc` could lose claims the daemon wrote while it ran.** gc rewrote the claim journal without a lock, so claims the daemon appended during the rewrite disappeared and a task's status went back to an older value. Appends and rewrites now take the same lock file, and rewrites use a unique temporary file.
+- **`maestro gc` could delete a task the daemon had just registered.** gc saved the task registry without the registry lock, and both writers used the same temporary file. gc now removes a task through one locked step.
+- **A damaged `registry.json` wiped the task list.** A registry that could not be parsed was read as empty, and the next registration wrote a registry holding only the new task, restarting numbering at 1. The damaged file is now moved aside and the registry is rebuilt from the task claims; a missing registry is rebuilt the same way.
+- **Task numbers were reused after gc.** The next number was the highest number in the registry plus one, so removing the newest task gave its number out again. The highest number ever given out is now kept in `task-counter`.
+- **`maestro gc` crashed on the memvara backend** after deleting the task's files, and crashed again on every later run. It is now refused before anything is changed.
+- **`maestro task list` got very slow as tasks accumulated** (85 seconds for 300 tasks), because it re-read the whole claim journal for every claim of every task. Parsed claims are now cached until the journal changes on disk, and the registry is read once per listing.
+
 ## [0.12.0] — 2026-09-22
 
 ### Fixed

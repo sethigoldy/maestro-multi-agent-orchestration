@@ -679,7 +679,8 @@ project or worktree:
 
 ```text
 ~/.maestro/                      (or $MAESTRO_HOME)
-├── registry.json                # registered agents
+├── agents/<name>.toml           # registered agents
+├── registry.json                # task registry: task numbers, titles, workspaces
 ├── state.jsonl                  # durable claim journal (task history)
 ├── daemon.json                  # which daemon is running (host, port, pid; token when auth is on)
 ├── peers.json                   # discovered/registered peers

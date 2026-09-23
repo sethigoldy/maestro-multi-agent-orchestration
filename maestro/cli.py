@@ -529,9 +529,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             if args.dry_run:
                 removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "dry_run": True})
                 continue
+            dropped = m.unregister_task(task_id)  # under the registry lock; claims dropped with it
             shutil.rmtree(state_dir / "tasks" / task_id, ignore_errors=True)
-            m._save_index([x for x in m._load_index() if str(x.get("task_id")) != task_id])
-            dropped = m.mem.forget(m._subject(task_id))
             removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "claims_dropped": dropped})
         print(json.dumps({"removed": removed, "kept": kept}, indent=2))
         return 0

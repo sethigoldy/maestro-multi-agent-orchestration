@@ -229,8 +229,11 @@ and current spend.
 
 ```text
 ~/.maestro/                        (or $MAESTRO_HOME)
-├── registry.json                  # registered agents
+├── agents/<name>.toml             # registered agents (mode 0600: may hold a remote token)
+├── registry.json                  # task registry: task numbers, titles, workspaces
+├── task-counter                   # highest task number ever given out (never reused)
 ├── state.jsonl                    # durable claim journal (append-only; subjects maestro:task:<id>)
+├── state.lock / registry.lock     # lock files; writers and gc take them
 ├── daemon.json                    # last-started broker marker: pid, host, port, token (when auth is on)
 ├── peers.json                     # discovered/registered peers
 ├── config.toml                    # user-level config
@@ -242,5 +245,10 @@ and current spend.
 ```
 
 State is user-level, not per-project: it survives worktree creation, switching,
-and deletion. Each task records the exact workspace it ran in and its project
+and deletion.
+
+If `registry.json` is damaged and cannot be read, Maestro moves it aside as
+`registry.corrupt-<time>.json` and rebuilds the task registry from the task
+claims in `state.jsonl`, so no task and no task number is lost. The same
+rebuild happens when `registry.json` is missing. Each task records the exact workspace it ran in and its project
 root. Project-level files are configuration only (`.maestro/config.toml`).

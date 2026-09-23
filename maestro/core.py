@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import threading
 import uuid
 import tomllib
 from contextlib import contextmanager
@@ -37,15 +39,68 @@ class _Episode:
     episode_ids: list[str]
 
 
+@contextmanager
+def _file_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive advisory lock on ``path`` (created if missing).
+
+    The lock is taken on a separate lock file, never on the data file itself,
+    so it still works after the data file is replaced by a rewrite.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    try:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        yield
+    finally:
+        try:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (ImportError, OSError):
+            pass
+        handle.close()
+
+
+def _replace_atomically(path: Path, text: str) -> None:
+    """Write ``text`` to a unique temporary file next to ``path``, then rename
+    it over ``path``. Two writers never share a temporary file."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _claim_line(claim: _Claim) -> str:
+    return json.dumps({"subject": claim.subject, "predicate": claim.predicate, "object": claim.object, "episode_ids": claim.episode_ids or []}, ensure_ascii=False) + "\n"
+
+
 class _FileState:
-    """Small append-only claim store at user scope."""
+    """Small append-only claim store at user scope.
+
+    Appends and rewrites (``forget``) take the same lock file, so a rewrite
+    never drops a claim another process appends while it runs. Parsed claims
+    are cached and re-read only when the journal changes on disk, because
+    listing tasks asks for many claims of many tasks.
+    """
 
     def __init__(self, state_dir: Path) -> None:
         self.path = state_dir / "state.jsonl"
+        self.lock_path = state_dir / "state.lock"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
+        self._cache_lock = threading.Lock()
+        self._cache_key: tuple[int, int, int] | None = None
+        self._cache_claims: list[_Claim] = []
+        self._cache_index: dict[tuple[str, str], list[_Claim]] = {}
 
-    def _read(self) -> list[_Claim]:
+    def _parse(self) -> list[_Claim]:
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -59,31 +114,49 @@ class _FileState:
                 continue
         return out
 
+    def _load(self) -> tuple[list[_Claim], dict[tuple[str, str], list[_Claim]]]:
+        """The parsed journal and a (subject, predicate) index, re-read only
+        when the file's inode, size or modification time changed."""
+        try:
+            st = self.path.stat()
+            key: tuple[int, int, int] | None = (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            key = None
+        with self._cache_lock:
+            if key is None or key != self._cache_key:
+                claims = self._parse()
+                index: dict[tuple[str, str], list[_Claim]] = {}
+                for claim in claims:
+                    index.setdefault((claim.subject, claim.predicate), []).append(claim)
+                self._cache_key, self._cache_claims, self._cache_index = key, claims, index
+            return self._cache_claims, self._cache_index
+
+    def _read(self) -> list[_Claim]:
+        return list(self._load()[0])
+
     def _append(self, claim: _Claim) -> None:
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"subject": claim.subject, "predicate": claim.predicate, "object": claim.object, "episode_ids": claim.episode_ids or []}, ensure_ascii=False) + "\n")
-            fh.flush()
+        with _file_lock(self.lock_path):
+            with self.path.open("a", encoding="utf-8") as fh:
+                fh.write(_claim_line(claim))
+                fh.flush()
 
     def remember(self, subject: str, predicate: str, object: str, **_: Any) -> None:
         self._append(_Claim(subject, predicate, str(object), [uuid.uuid4().hex]))
 
     def history(self, subject: str, predicate: str) -> list[_Claim]:
-        return [c for c in self._read() if c.subject == subject and c.predicate == predicate]
+        return list(self._load()[1].get((subject, predicate), []))
 
     def get_all(self) -> list[_Claim]:
         return self._read()
 
     def forget(self, subject: str) -> int:
         """Rewrite the journal without any claim for ``subject``; returns how many were dropped."""
-        lines = self._read()
-        kept = [c for c in lines if c.subject != subject]
-        dropped = len(lines) - len(kept)
-        if dropped:
-            tmp = self.path.with_suffix(".jsonl.tmp")
-            with tmp.open("w", encoding="utf-8") as fh:
-                for claim in kept:
-                    fh.write(json.dumps({"subject": claim.subject, "predicate": claim.predicate, "object": claim.object, "episode_ids": claim.episode_ids or []}, ensure_ascii=False) + "\n")
-            os.replace(tmp, self.path)
+        with _file_lock(self.lock_path):
+            lines = self._parse()
+            kept = [c for c in lines if c.subject != subject]
+            dropped = len(lines) - len(kept)
+            if dropped:
+                _replace_atomically(self.path, "".join(_claim_line(c) for c in kept))
         return dropped
 
     def add(self, content: str, role: str = "system", ts: datetime | None = None) -> _Episode:
@@ -190,22 +263,8 @@ class Maestro:
 
     @contextmanager
     def _task_lock(self) -> Iterator[None]:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.lock_path.open("a+")
-        try:
-            try:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            except (ImportError, OSError):
-                pass
+        with _file_lock(self.lock_path):
             yield
-        finally:
-            try:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except (ImportError, OSError):
-                pass
-            handle.close()
 
     def _load_config(self) -> dict[str, Any]:
         merged: dict[str, Any] = {}
@@ -313,18 +372,78 @@ class Maestro:
         return f"maestro:task:{task_id}"
 
     def _load_index(self) -> list[dict[str, Any]]:
+        """The task registry (registry.json).
+
+        A file that cannot be parsed is moved aside, never overwritten, and the
+        registry is rebuilt from the tasks' claims. Returning an empty list
+        instead would make the next registration write a registry holding only
+        the new task, deleting every other entry and restarting numbering.
+        """
         if not self.index_path.is_file():
-            return []
+            return self._index_from_claims()
         try:
             data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            return []
-        return data if isinstance(data, list) else []
+        except OSError:
+            return self._index_from_claims()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            data = None
+        if isinstance(data, list):
+            return data
+        aside = self.index_path.with_name(f"registry.corrupt-{self._now().strftime('%Y%m%dT%H%M%S%f')}.json")
+        try:
+            os.replace(self.index_path, aside)
+            print(f"[maestro] {self.index_path} could not be read; moved it to {aside} and rebuilt the task registry from task claims", file=sys.stderr)
+        except OSError:
+            pass  # another process moved it first
+        return self._index_from_claims()
+
+    def _index_from_claims(self) -> list[dict[str, Any]]:
+        """Registry records rebuilt from the durable task_number claims."""
+        prefix = self._subject("")
+        numbers: dict[str, int] = {}
+        for claim in self.mem.get_all():
+            if claim.predicate == "task_number" and claim.subject.startswith(prefix):
+                try:
+                    numbers[claim.subject[len(prefix):]] = int(claim.object)
+                except ValueError:
+                    continue
+        records = []
+        for task_id, number in numbers.items():
+            claims = self._claims(task_id)
+            workspace = claims.get("task_workspace") or ""
+            project_root = str(self._resolve_project_root(Path(workspace))) if workspace and Path(workspace).is_dir() else workspace
+            records.append({"number": number, "task_id": task_id, "title": claims.get("task_title") or task_id, "created_at": None, "workspace": workspace, "project_root": project_root})
+        return sorted(records, key=lambda x: int(x["number"]))
 
     def _save_index(self, items: list[dict[str, Any]]) -> None:
-        tmp = self.index_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(items, indent=2, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(self.index_path)
+        _replace_atomically(self.index_path, json.dumps(items, indent=2, ensure_ascii=False))
+        self._bump_task_counter(max([int(x.get("number", 0)) for x in items] + [0]))
+
+    def _read_task_counter(self) -> int:
+        try:
+            return int((self.user_state_dir / "task-counter").read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _bump_task_counter(self, number: int) -> None:
+        """Remember the highest task number ever given out, so a number is
+        never reused after gc removes the newest task."""
+        if number > self._read_task_counter():
+            _replace_atomically(self.user_state_dir / "task-counter", str(number))
+
+    def unregister_task(self, task_id: str) -> int:
+        """Remove a task from the registry and drop its claims (used by gc).
+
+        Everything happens under the registry lock, so a task registered by a
+        daemon at the same moment is never lost. Returns the number of claims
+        dropped. The memvara backend keeps claims as history and cannot drop
+        them, so it is refused before anything changes.
+        """
+        if self.config["storage_backend"] != "filesystem":
+            raise ValueError("Removing tasks is not supported on the memvara storage backend yet; nothing was changed")
+        with self._task_lock():
+            self._save_index([x for x in self._load_index() if str(x.get("task_id")) != task_id])
+            return self.mem.forget(self._subject(task_id))
 
     def _registry_records(self) -> list[dict[str, Any]]:
         if self.config["storage_backend"] == "filesystem":
@@ -431,13 +550,15 @@ class Maestro:
         return {"backend":self.config["storage_backend"],"imported_claims":imported,"marker":str(self.memvara_migration_marker),"migrated":self.memvara_migration_marker.exists()}
 
     def _new_task_number(self) -> int:
-        return max([int(x.get("number",0)) for x in self._registry_records()] + [0]) + 1
+        highest = max([int(x.get("number",0)) for x in self._registry_records()] + [self._read_task_counter()])
+        return highest + 1
 
     def _register_task(self, task_id: str, title: str, number: int, project_root: str | None = None) -> None:
         self._write_registry_record(self._registry_record(task_id, number, title, project_root=project_root))
+        self._bump_task_counter(number)
 
-    def resolve_task(self, ref: str) -> str:
-        ref=str(ref).strip(); items=self._registry_records()
+    def resolve_task(self, ref: str, records: list[dict[str, Any]] | None = None) -> str:
+        ref=str(ref).strip(); items=records if records is not None else self._registry_records()
         if ref.isdigit():
             number=int(ref)
             matches=[x for x in items if int(x.get("number",0))==number]
@@ -458,9 +579,13 @@ class Maestro:
             if parent.name==".maestro": return str(parent.parent)
         return None
 
-    def status(self, task_ref: str) -> dict[str, Any]:
-        task_id=self.resolve_task(task_ref)
-        index=next((x for x in self._registry_records() if str(x["task_id"])==task_id),None)
+    def status(self, task_ref: str, records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """One task's state. ``records`` is the registry when the caller has
+        already read it (list_tasks), so it is not re-read for every task."""
+        if records is None:
+            records=self._registry_records()
+        task_id=self.resolve_task(task_ref, records)
+        index=next((x for x in records if str(x["task_id"])==task_id),None)
         claims=self._claims(task_id)
         result={"task_id":task_id,"task_number":index.get("number") if index else None,"title":index.get("title") if index else None}
         result.update({"phase":claims.get("task_status"),"supervisor":claims.get("task_owner"),"implementer":claims.get("task_implementer"),"design":claims.get("task_design"),"result":claims.get("task_result"),"verification":claims.get("task_verification"),"workspace":claims.get("task_workspace") or (index or {}).get("workspace"),"model":claims.get("task_model"),"effort":claims.get("task_effort"),"origin_agent":claims.get("task_origin_agent"),"target_agent":claims.get("task_target_agent"),"branch":claims.get("task_branch")})
@@ -488,8 +613,9 @@ class Maestro:
 
     def list_tasks(self, *, workspace_filter: str | None = None, project_filter: str | None = None) -> list[dict[str, Any]]:
         output=[]
-        for item in self._registry_records():
-            try: record=self.status(str(item["task_id"]))
+        records=self._registry_records()
+        for item in records:
+            try: record=self.status(str(item["task_id"]), records)
             except KeyError: continue
             if workspace_filter and record.get("workspace") != str(Path(workspace_filter).expanduser().resolve()):  # pragma: no branch
                 continue
