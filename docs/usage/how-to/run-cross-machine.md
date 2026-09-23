@@ -114,6 +114,42 @@ http://10.0.0.5:8790/?token=<t>
 The token is captured into the browser session and stripped from the address
 bar.
 
+## Step 6 (optional) — Put the daemon behind a reverse proxy
+
+The daemon refuses a browser POST whose `Origin` header does not exactly match
+the address the request was sent to (its `Host` header). A reverse proxy that
+forwards `https://maestro.example.com` to the daemon usually changes the `Host`
+header to the daemon's own address, such as `127.0.0.1:8790`, while the browser
+still sends `Origin: https://maestro.example.com`. The daemon then refuses the
+console's POSTs with `HTTP 403 — cross-origin requests are not allowed`.
+
+List the proxy's public origin so the daemon accepts it:
+
+```bash
+maestro-daemon --port 8790 --allow-origin https://maestro.example.com
+```
+
+Repeat `--allow-origin` for more than one origin. For a daemon started with
+`maestro daemon start` or by the MCP server, which take no options, set the
+environment variable instead, as a comma-separated list:
+
+```bash
+export MAESTRO_DAEMON_ALLOWED_ORIGINS=https://maestro.example.com,https://maestro.internal:8443
+maestro daemon start
+```
+
+The `--allow-origin` option wins over the environment variable when both are
+given. Write each origin the way a browser sends it: `scheme://host[:port]`,
+with no path. An invalid entry stops the daemon from starting. Requests without
+an `Origin` header, such as the CLI, the MCP server and `curl`, are not
+affected.
+
+A daemon on loopback also refuses any `Host` header other than `127.0.0.1`,
+`localhost` or `::1`, so configure the proxy to send the daemon's own address
+as `Host` (for nginx, `proxy_pass http://127.0.0.1:8790;` without
+`proxy_set_header Host $host;`). A daemon bound beyond loopback accepts any
+`Host` but needs its token on every data request.
+
 ## Security notes
 
 - Treat the token as a credential: it gates every data endpoint of that

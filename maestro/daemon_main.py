@@ -10,11 +10,14 @@ import threading
 from typing import Any
 
 
-def run_daemon(state_dir: str | None = None, port: int = 0, bind: str = "127.0.0.1") -> dict[str, Any]:
-    """Start the daemon (HTTP on ``bind``; token-auth when non-loopback) and return its connection info."""
+def run_daemon(state_dir: str | None = None, port: int = 0, bind: str = "127.0.0.1", allowed_origins: list[str] | None = None) -> dict[str, Any]:
+    """Start the daemon (HTTP on ``bind``; token-auth when non-loopback) and return its connection info.
+
+    ``allowed_origins`` of None means the daemon reads MAESTRO_DAEMON_ALLOWED_ORIGINS.
+    """
     from .daemon import MaestroDaemon
 
-    daemon = MaestroDaemon(state_dir=state_dir, start_http=True, port=port, bind=bind)
+    daemon = MaestroDaemon(state_dir=state_dir, start_http=True, port=port, bind=bind, allowed_origins=allowed_origins)
     info: dict[str, Any] = {"pid": os.getpid(), "port": daemon.port, "bind": daemon.bind, "advertised_host": daemon.advertised_host, "state_dir": str(daemon.state_dir), "daemon": daemon}
     if daemon.token is not None:
         info["token"] = daemon.token
@@ -26,6 +29,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=0, help="Port to bind (0 = pick a free port)")
     parser.add_argument("--bind", default="127.0.0.1", help="Interface to listen on: 127.0.0.1 (default, local only), 0.0.0.0 (all interfaces — enables token auth), or an explicit IP")
     parser.add_argument("--state-dir", default=None, help="State directory (default: ~/.maestro or $MAESTRO_HOME)")
+    parser.add_argument("--allow-origin", action="append", default=None, metavar="ORIGIN", help="A browser origin, such as https://maestro.example.com, that may POST to the daemon besides its own address; use it for the public address of a reverse proxy. Repeat for more than one. Overrides $MAESTRO_DAEMON_ALLOWED_ORIGINS")
     return parser.parse_args(argv)
 
 
@@ -50,7 +54,7 @@ def run_forever(install_handlers: bool = True) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
-    info = run_daemon(state_dir=args.state_dir, port=args.port, bind=args.bind)
+    info = run_daemon(state_dir=args.state_dir, port=args.port, bind=args.bind, allowed_origins=args.allow_origin)
     daemon = info.pop("daemon")
     print(json.dumps(info, indent=2), flush=True)  # flushed: consumers wait for this line
     try:
