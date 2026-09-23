@@ -1459,9 +1459,11 @@ class MaestroDaemon:
         - ``base_head``: the HEAD commit, so new commits count as work.
         - ``python_test_suite``: whether the project had a Python test suite.
           Verification accepts pytest's "no tests collected" exit code only
-          when it did not, so an agent that deletes or hides every test does
-          not pass. Only auto-detected verification uses this value, so the
-          project is scanned only in that mode.
+          when it did not. When it did, the project is verified with pytest
+          even if pytest is missing or the tests are gone, so an agent that
+          deletes or hides every test does not pass. Only auto-detected
+          verification uses this value, so the project is scanned only in
+          that mode.
         """
         base_head = self._base_head(workspace)
         if base_head:
@@ -1476,18 +1478,20 @@ class MaestroDaemon:
                 record["python_test_suite"] = suite
             self.maestro._write_claim(task_id, "task_python_test_suite", "true" if suite else "false")
 
-    def _had_python_test_suite(self, task_id: str) -> bool:
+    def _recorded_python_test_suite(self, task_id: str) -> bool | None:
         """Whether the project had a Python test suite when the turn started.
 
-        When nothing was recorded (a task started by an older Maestro), the
-        answer is True, so pytest's "no tests collected" exit code is not
-        accepted without evidence that there were no tests to begin with.
+        The task record is read first, then the claim. None means nothing was
+        recorded, for example for a task started by an older Maestro.
         """
         record = self._tasks.get(task_id) or {}
         recorded = record.get("python_test_suite")
-        if recorded is None:
-            return self.maestro._claims(task_id).get("task_python_test_suite") != "false"
-        return bool(recorded)
+        if recorded is not None:
+            return bool(recorded)
+        claim = self.maestro._claims(task_id).get("task_python_test_suite")
+        if claim is None:
+            return None
+        return claim == "true"
 
     def _workspace_has_changes(self, workspace: Path, task_id: str) -> tuple[bool, str]:
         """Evidence that the turn produced work: working-tree changes or new commits."""
@@ -1527,7 +1531,10 @@ class MaestroDaemon:
             # The command is verification_command when set; otherwise the
             # original handoff carried it in request (M2 simplification).
             configured = shlex.split(doc.verification_command or doc.request)
-        test_cmd, note = _verification_command(workspace, configured)
+        # Whether the project had a Python test suite when the turn started.
+        # It is used only for auto-detection, and None means it is not known.
+        recorded_suite = self._recorded_python_test_suite(task_id) if configured is None else None
+        test_cmd, note = _verification_command(workspace, configured, had_test_suite=recorded_suite)
         # The auto-detected fallback is `git diff --check` plus a note. It passes
         # trivially on an untouched workspace, so it must never certify a turn
         # that left no changes behind — otherwise a zero-work turn (e.g. an agent
@@ -1555,9 +1562,11 @@ class MaestroDaemon:
         # treated like the `git diff --check` fallback: it passes only when the
         # turn left changes behind. When the project did have a test suite,
         # exit code 5 means the tests were removed or hidden, and it is a
-        # failure. An explicit command always keeps its exit code.
+        # failure. When nothing was recorded, exit code 5 is a failure too,
+        # because there is no evidence that the project had no tests. An
+        # explicit command always keeps its exit code.
         pytest_no_tests = configured is None and _pytest_found_no_tests(test_cmd, tests.returncode)
-        suite_vanished = pytest_no_tests and self._had_python_test_suite(task_id)
+        suite_vanished = pytest_no_tests and recorded_suite is not False
         no_tests = pytest_no_tests and not suite_vanished
         ok = diff.returncode == 0 and (tests.returncode == 0 or no_tests)
         no_changes_reason: str | None = None

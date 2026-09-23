@@ -745,10 +745,10 @@ explicit note, and it passes only if the agent left changes in the workspace.
 A Python project has a test suite when it has a `tests/` or `test/` directory
 anywhere (outside hidden directories, virtual environments and
 `node_modules`), a `conftest.py` at the root, a `test_*.py` or `*_test.py`
-file, or a pytest configuration. If such a project has no pytest in the
-selected interpreter, verification fails with a note that says how to fix it
-(set `MAESTRO_PYTHON`, or configure an explicit command); its tests are never
-skipped silently. If pytest collects no tests although the project had a test
+file, or a pytest configuration. If such a project, or a project that had a test
+suite when the turn started, has no pytest in the selected interpreter,
+verification fails with a note that says how to fix it (set `MAESTRO_PYTHON`,
+or configure an explicit command); its tests are never skipped silently. If pytest collects no tests although the project had a test
 suite when the turn started, verification fails too. The full report is saved
 per task (`verification.txt`). The
 handoff's `verification` field can switch this to an explicit command or skip

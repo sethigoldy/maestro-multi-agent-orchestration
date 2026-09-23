@@ -177,7 +177,7 @@ selected in this order — first match wins:
 | 5 | `go.mod` exists | `go test ./...` |
 | 6 | `Cargo.toml` exists | `cargo test` |
 | 7 | Python project (`pyproject.toml`, or `pytest.ini`/`tox.ini`/`setup.cfg`, or a `tests/` directory) and pytest imports in the selected interpreter | `<python> -m pytest` |
-| 8 | Python project with a test suite (see below), but pytest does not import in the selected interpreter | `<python> -m pytest`, which fails; see below |
+| 8 | Python project with a test suite now or when the turn started (see below), but pytest does not import in the selected interpreter | `<python> -m pytest`, which fails; see below |
 | 9 | fallback (including a Python project with no test suite and no pytest) | `git diff --check` |
 
 Details of each rule:
@@ -232,7 +232,13 @@ Details of each rule:
   directory tree and stops after 20,000 entries.
 - **pytest missing.** If a project with a Python test suite cannot run its
   tests because pytest is not installed in the selected interpreter,
-  verification fails. The report
+  verification fails. The project counts as having a test suite when it has
+  one now, or when it had one at the start of the turn (see "No tests
+  collected" below for how that is recorded). So an agent that deletes every
+  test still gets the failing pytest command, not the `git diff --check`
+  fallback. When nothing was recorded, for example for a task started by an
+  older Maestro or when `maestro doctor` shows the command, only the
+  workspace as it is now decides. The report
   names the interpreter and says how to fix it: set `MAESTRO_PYTHON` to the
   interpreter of the project's environment (for example a poetry or conda
   environment, or the main checkout's `.venv` when you work in a git

@@ -337,7 +337,18 @@ def _pytest_found_no_tests(command: list[str], returncode: int) -> bool:
     return command[1:] == ["-m", "pytest"] and returncode == PYTEST_NO_TESTS_EXIT_CODE
 
 
-def _verification_command(root: Path, configured: list[str] | None = None) -> tuple[list[str], str | None]:
+def _verification_command(
+    root: Path, configured: list[str] | None = None, had_test_suite: bool | None = None,
+) -> tuple[list[str], str | None]:
+    """Return the verification command for the workspace and an optional note for the report.
+
+    ``had_test_suite`` says whether the project had a Python test suite when
+    the turn started, before the agent ran. When it is True, the project is
+    verified with pytest even if the tests are gone now, so an agent cannot
+    avoid a failing check by deleting every test. When it is False or None
+    (not known, for example outside a turn), the workspace as it is now
+    decides.
+    """
     if configured:
         return list(configured), None
     if _makefile_has_check_target(root):
@@ -363,11 +374,11 @@ def _verification_command(root: Path, configured: list[str] | None = None) -> tu
     python_root = root / "pyproject.toml"
     pytest_configured = (root / "pytest.ini").exists() or (root / "tox.ini").exists() or (root / "setup.cfg").exists()
     has_tests = (root / "tests").is_dir()
-    if python_root.exists() or pytest_configured or has_tests:
+    if python_root.exists() or pytest_configured or has_tests or had_test_suite:
         python = _python_executable(root)
         if _pytest_importable(python, root):
             return [python, "-m", "pytest"], None
-        if _has_python_test_suite(root):
+        if had_test_suite or _has_python_test_suite(root):
             # Running pytest here fails with "No module named pytest", so the
             # task fails verification and the note explains how to fix it.
             # Falling back to `git diff --check` would skip the tests silently.

@@ -187,9 +187,10 @@ at all, the check degrades to the whitespace check with an explicit note, and
 that check alone passes only if the agent left changes in the workspace. When
 a project has tests but the test runner is not installed (for example, pytest
 is missing from the selected Python interpreter), verification fails and the
-report says how to fix it. When pytest collects no tests in a project that had
-a Python test suite at the start of the turn, verification fails too, so an
-agent cannot pass by deleting or hiding the tests. Maestro does not invent a
+report says how to fix it. When a project had a Python test suite at the start
+of the turn, verification fails if pytest then collects no tests, and it also
+fails if pytest is missing even though the tests are gone now, so an agent
+cannot pass by deleting or hiding the tests. Maestro does not invent a
 pass in any of these cases. The alternative — trusting agent
 self-reports — would make "completed" mean "the agent stopped", which in
 multi-agent chains is exactly where errors compound: each downstream consumer

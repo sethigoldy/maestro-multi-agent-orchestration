@@ -786,3 +786,72 @@ def test_turn_baseline_outside_git_records_only_the_test_suite(daemon, tmp_path)
     daemon._tasks["task-plain"] = {}
     daemon._record_turn_baseline("task-plain", plain, _doc())
     assert daemon._tasks["task-plain"] == {"python_test_suite": True}
+
+
+# ------------------------------------------------ pytest missing after the tests were removed
+@pytest.mark.parametrize(
+    "files",
+    [
+        {"pyproject.toml": "[project]\nname = 'x'\n", "tests/test_x.py": "def test_x():\n    assert False\n"},
+        {"tests/test_x.py": "def test_x():\n    assert False\n"},
+    ],
+    ids=["pyproject", "tests-dir-only"],
+)
+def test_missing_pytest_after_deleting_the_suite_fails(daemon, tmp_path, monkeypatch, files):
+    """An agent that deletes every test must not fall back to `git diff --check` when pytest is missing.
+
+    Detection used to look only at the workspace the agent left behind, so
+    with the tests gone it chose the fallback, and the deletion counted as
+    work. With only a tests/ directory, the project did not even look like a
+    Python project any more.
+    """
+    ws = _repo(tmp_path, files)
+    python = _python_without_pytest(tmp_path)
+    monkeypatch.setenv("MAESTRO_PYTHON", str(python))
+    doc = _doc()
+    daemon._tasks["task-gone"] = {}
+    daemon._record_turn_baseline("task-gone", ws, doc)
+    shutil.rmtree(ws / "tests")  # the agent removes every test and commits the removal
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "remove tests")
+    ok = daemon._verify(ws, "task-gone", doc)
+    report = (daemon.state_dir / "tasks" / "task-gone" / "verification.txt").read_text(encoding="utf-8")
+    assert ok is False
+    assert f"verification command: {python} -m pytest" in report
+    assert "pytest was not found" in report
+
+
+def test_verification_command_uses_the_recorded_test_suite(tmp_path, monkeypatch):
+    """The turn-start value decides when it is True; otherwise the workspace decides."""
+    python = _python_without_pytest(tmp_path)
+    monkeypatch.setenv("MAESTRO_PYTHON", str(python))
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n"})
+    assert worker._verification_command(ws, had_test_suite=True)[0] == [str(python), "-m", "pytest"]
+    assert worker._verification_command(ws, had_test_suite=False)[0] == FALLBACK
+    assert worker._verification_command(ws)[0] == FALLBACK  # unknown: the workspace decides
+    (ws / "tests").mkdir()
+    (ws / "tests" / "test_new.py").write_text("def test_new():\n    pass\n", encoding="utf-8")
+    # Tests the agent added are not skipped either.
+    assert worker._verification_command(ws, had_test_suite=False)[0] == [str(python), "-m", "pytest"]
+
+
+def test_recorded_suite_in_a_claim_is_used_for_missing_pytest(daemon, tmp_path, monkeypatch):
+    """After a restart only the claim is left, and it still decides."""
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n", "tests/test_x.py": "def test_x():\n    pass\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", str(_python_without_pytest(tmp_path)))
+    daemon._tasks["task-c"] = {}
+    daemon._record_turn_baseline("task-c", ws, _doc())
+    daemon._tasks["task-c"].pop("python_test_suite")
+    shutil.rmtree(ws / "tests")
+    _git(ws, "add", "-A")
+    _git(ws, "commit", "-qm", "remove tests")
+    assert daemon._verify(ws, "task-c", _doc()) is False
+
+
+def test_unknown_suite_keeps_the_workspace_decision_for_missing_pytest(daemon, tmp_path, monkeypatch):
+    """With no recorded value, a project without tests now still uses the fallback when pytest is missing."""
+    ws = _repo(tmp_path, {"pyproject.toml": "[project]\nname = 'x'\n"})
+    monkeypatch.setenv("MAESTRO_PYTHON", str(_python_without_pytest(tmp_path)))
+    (ws / "work.txt").write_text("done\n", encoding="utf-8")
+    daemon._tasks["task-old"] = {"base_head": daemon._base_head(ws)}
+    assert daemon._verify(ws, "task-old", _doc()) is True
