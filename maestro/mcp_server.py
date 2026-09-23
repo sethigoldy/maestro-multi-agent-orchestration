@@ -8,7 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from .core import Maestro
 from .daemon import get_daemon
-from .handoff import load_handoff_file
+from .handoff import load_handoff_file, validate_handoff
 
 mcp = FastMCP("maestro")
 
@@ -47,7 +47,7 @@ def list_tasks(workspace: str) -> str:
 
 
 @mcp.tool()
-def delegate(workspace: str, handoff_file: str) -> str:
+def delegate(workspace: str, handoff_file: str, branch: str = "") -> str:
     """Delegate a staged handoff to ANY registered agent and block until the work
     completes, fails, or needs input. No polling: this call resolves when done.
 
@@ -66,11 +66,18 @@ def delegate(workspace: str, handoff_file: str) -> str:
     agent — ask the user which agent and model to use, then call
     answer_task_question with e.g. 'codex' or 'agent=codex model=gpt-5.6-luna'.
 
+    branch: name for the task's git branch (for example 'feat/login-form').
+    It overrides [expectations] branch in the handoff file. When neither is
+    set the branch is 'maestro/<task_id>'. The branch must not exist yet.
+
     Returns the final A2A task object (state, artifacts, workspace/branch
     metadata)."""
     d = get_daemon()
     try:
         doc = load_handoff_file(handoff_file)
+        if branch.strip():
+            doc.branch = branch
+            doc = validate_handoff(doc)
         started = d.delegate(doc, workspace)
     except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)}, indent=2)
@@ -134,7 +141,29 @@ def answer_task_question(workspace: str, task_id: str, answer: str) -> str:
 
 
 @mcp.tool()
-def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str:
+def rename_task_branch(workspace: str, task_id: str, branch: str) -> str:
+    """Rename a finished (or parked) task's git branch and update the task's
+    record, so list_tasks, task_status, receipts and later follow-ups all show
+    the new name. Numeric task numbers such as '1' are accepted.
+
+    If the branch was already renamed by hand with 'git branch -m', this only
+    updates the record. If the task has no branch yet (for example its first
+    turn could not create the branch it asked for), this changes the name its
+    next turn creates, and the result has "pending": true. Only the local
+    branch is renamed; a copy already pushed to a remote keeps its old name
+    there."""
+    d = get_daemon()
+    try:
+        result = d.rename_branch(d.resolve(task_id), branch)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse", branch: str = "") -> str:
     """Send a follow-up instruction to a finished task (completed/failed/canceled).
     The same agent resumes on the same task branch with the new instruction —
     unless the task's handoff pins a fixer agent, in which case the follow-up
@@ -146,10 +175,15 @@ def followup(workspace: str, task_id: str, instruction: str, context_mode: str =
     history stays in the durable record and is never replayed. 'fresh' skips the
     snapshot for a clean reasoning context (same task/workspace/branch).
 
+    branch: optional new name for the task's branch. The branch is renamed
+    first, exactly as rename_task_branch does, and the turn then runs on it. If
+    the task has no branch yet (its first turn could not create the branch it
+    asked for), this sets the name the turn creates.
+
     Blocks until the follow-up turn finishes or needs input — no polling."""
     d = get_daemon()
     try:
-        started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode)
+        started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode, branch=branch.strip() or None)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
     except ValueError as exc:
