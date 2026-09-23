@@ -8,6 +8,36 @@ input — they do not return a handle to poll.
 Task ids are of the form `task-YYYYMMDD-HHMMSS-xxxxxx`; numeric task numbers
 are accepted where a task id is expected (resolved against user-level state).
 
+## Which daemon runs the tasks
+
+The tools that start, wait for or change tasks (`delegate`, `task_wait`,
+`followup`, `answer_task_question`, `cancel_task`, `rename_task_branch`,
+`agents_list`) need a daemon. Only one daemon owns a state directory, and the
+MCP server never starts a second one:
+
+- When a daemon already owns the state directory (for example one started with
+  `maestro daemon start`), the MCP server runs no tasks itself. It sends every
+  one of these tool calls to that daemon over its HTTP API (JSON-RPC, with the
+  daemon's token when it has one). The tasks run in that daemon, so
+  `maestro daemon stop`, the dashboard and the daemon's `tasks/cancel` control
+  them, and one workspace never has two active tasks. Agents then run with that
+  daemon's environment, not the MCP server's. Results and errors are the same
+  as when the MCP server runs the daemon itself.
+- When no daemon owns the state directory, the MCP server starts one in its
+  own process. That daemon serves HTTP and owns the directory like any other,
+  so the CLI and the dashboard reach it. It is stopped when the MCP server
+  exits, including on SIGTERM, which releases the directory and marks its
+  running tasks as failed.
+- If the daemon the MCP server sends calls to exits, the next tool call starts
+  a daemon in the MCP server, which takes ownership. A blocking `delegate`,
+  `followup` or `task_wait` that is waiting at that moment carries on waiting
+  in the new daemon. If the old daemon is still alive but no longer answers
+  HTTP, ownership cannot be taken: the MCP server's daemon then runs its tasks
+  without an HTTP endpoint and prints a note on stderr.
+
+`task_status` and `list_tasks` read the durable task state directly and do not
+need a daemon.
+
 ## Task object shape
 
 `delegate`, `task_wait`, and the cancel/answer tools resolve to an A2A task

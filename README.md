@@ -84,17 +84,35 @@ a dead process is reported as stopped — never as running.
 Only one daemon owns a state directory at a time. The owning daemon holds a
 lock file (`daemon.owner.lock`) for as long as it runs. A second
 `maestro-daemon` on the same state directory refuses to start and says which
-daemon owns it. The MCP server's built-in daemon does not refuse, because that
-would break the MCP tools whenever a background daemon is running: it runs its
-own tasks without an HTTP endpoint, prints a note on stderr, and leaves the
-owning daemon's marker and tasks alone. A daemon marks leftover "working" tasks
-as failed at startup only when no other daemon process is using the state
-directory, so it never fails tasks that another live daemon is still running.
+daemon owns it.
+
+**How the MCP server and the daemon relate.** The MCP server does not need a
+daemon of its own. When it starts and a daemon already owns the state
+directory (for example one started with `maestro daemon start`), the MCP
+server runs no tasks itself: every tool call goes to that daemon over its HTTP
+API, with the daemon's token when it has one. The tasks run in that daemon, so
+`maestro daemon stop`, the dashboard and `tasks/cancel` see and control them,
+and one workspace never has two active tasks. Agents then run with that
+daemon's environment (its `PATH` and `MAESTRO_*` variables), not the MCP
+server's. When no daemon owns the directory, the MCP server starts one inside
+its own process, and that daemon serves HTTP and owns the directory like any
+other. It is stopped when the MCP server exits, including on SIGTERM. If the
+daemon the MCP server was using exits, the next tool call starts a daemon
+inside the MCP server, which takes ownership. If that daemon is still alive
+but no longer answers HTTP, ownership cannot be taken; the MCP server's daemon
+then runs its tasks without an HTTP endpoint and says so on stderr.
+
+Each task's record names the daemon process that runs it, by pid and start
+time. When a daemon starts, it marks a leftover "working" or queued task as
+failed if that process is gone, and leaves the task alone while that process
+still runs, even if the process belongs to another daemon.
 
 `maestro daemon stop` signals a process only after confirming that it is the
 daemon that wrote the marker. If the daemon crashed and its pid now belongs to
 an unrelated process, `stop` removes the stale marker, does not signal that
-process, and says so.
+process, and says so. Before it escalates from SIGTERM to SIGKILL it checks
+again that the pid still has the start time it had, so a pid reused during the
+grace period is never killed.
 
 `maestro-daemon` remains the low-level **foreground** executable for
 development, debugging, service managers, and CI: it starts the same daemon in
@@ -500,7 +518,10 @@ a peer silent for ~15 seconds is marked **stale**.
 
 A daemon that listens on loopback only (the default, `127.0.0.1`) cannot be
 reached from another machine, so it does not announce itself or listen for
-peers unless you set `MAESTRO_DISCOVERY=1`. A daemon started with
+peers unless you set `MAESTRO_DISCOVERY=1`. Even then it announces itself only
+when `MAESTRO_DISCOVERY_IF` is a loopback address such as `127.0.0.1`, so only
+daemons on the same machine hear it. On any other interface it listens for
+peers but never announces `127.0.0.1` to the network. A daemon started with
 `--bind 0.0.0.0` or a LAN address runs discovery unless you set
 `MAESTRO_DISCOVERY=0`.
 
@@ -509,7 +530,12 @@ sent to the multicast group, never unicast packets aimed at the port. When
 `MAESTRO_DISCOVERY_IF` is `127.0.0.1`, it ignores announcements from other
 hosts. An announcement is dropped when its advertised host is not an IP
 address or its port is not a valid port, and names lose their control
-characters, so `maestro peers list` never prints terminal escape codes.
+characters, so `maestro peers list` never prints terminal escape codes. An
+announcement from another host is also dropped when it advertises a loopback
+or link-local address (such as `127.0.0.1`, `::1` or `169.254.169.254`),
+because that would point this machine at its own loopback services or at a
+cloud metadata endpoint. Only an announcement sent from this machine may
+advertise a loopback address.
 `peers.json` holds at most 256 peers: a discovered peer that has not been heard
 for an hour is removed, and when the table is full the oldest discovered peers
 are dropped first. Manually added peers are never dropped. The file is
@@ -539,7 +565,7 @@ peers refresh automatically. To tune or disable discovery:
 |---|---|---|
 | `MAESTRO_DISCOVERY` | on beyond loopback, off on loopback | Set `0` to turn discovery off entirely. Set `1` to turn it on for a daemon that listens on loopback only |
 | `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
-| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored) |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored). A daemon bound to loopback announces itself only when this is a loopback address |
 | `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
 | `MAESTRO_NODE_NAME` | `maestro-node` | The name this daemon announces under |
 
@@ -879,7 +905,9 @@ reset; already-running tasks are unaffected.
 **`peers list` is empty on a LAN**
 The network likely blocks multicast — use `maestro peers add --name … --url …`.
 Check that your daemon is announcing at all: a daemon bound to `127.0.0.1`
-does not announce unless `MAESTRO_DISCOVERY=1` is set. Then set
+does not announce unless `MAESTRO_DISCOVERY=1` is set, and even then it
+announces only on a loopback `MAESTRO_DISCOVERY_IF`; bind the daemon to a LAN
+address or `0.0.0.0` so other machines can hear and reach it. Then set
 `MAESTRO_DISCOVERY=1`, `MAESTRO_DISCOVERY_TTL=0` and
 `MAESTRO_DISCOVERY_IF=127.0.0.1` to confirm loopback discovery works before
 debugging the network.

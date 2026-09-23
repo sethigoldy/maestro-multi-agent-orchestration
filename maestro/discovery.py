@@ -22,6 +22,15 @@ Design notes:
 - Announcements are untrusted input. ``http_host`` must be an IP address,
   ``http_port`` must be a valid port, and names lose their control characters
   (so ``maestro peers list`` cannot be made to emit terminal escape codes).
+  An announcement from another host may not name a loopback or link-local
+  address (127.0.0.1, ::1, 169.254.169.254 and the like): a LAN host could
+  otherwise point this machine at its own loopback services or at a cloud
+  metadata endpoint. Only an announcement sent from a loopback address may
+  name a loopback host.
+- A node announces itself only on an interface that can reach the host it
+  advertises. A daemon reachable only on loopback announces when the
+  discovery interface is loopback too; on any other interface it listens for
+  peers but never announces 127.0.0.1 to the network.
 - ``peers.json`` holds at most ``MAX_PEERS`` entries: discovered peers unseen
   for ``PRUNE_AFTER_S`` are pruned and the oldest are dropped first; manually
   added peers are never dropped. The file is rewritten only when a peer is new
@@ -94,15 +103,45 @@ def _is_loopback(address: str) -> bool:
         return False
 
 
-def _url_host(host: str) -> str | None:
-    """``host`` formatted for a URL, or None when it is not a usable IP address."""
+def _is_local_only(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for an address that only makes sense on the machine or link it came from."""
+    return ip.is_loopback or ip.is_link_local
+
+
+def _url_host(host: str, sender: str) -> str | None:
+    """``host`` formatted for a URL, or None when it is not a usable IP address.
+
+    ``sender`` is the address the announcement came from. A loopback or
+    link-local host is usable only when the sender itself is on loopback, that
+    is, when the announcement came from this machine.
+    """
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
     if ip.is_multicast or ip.is_unspecified:
         return None
+    if _is_local_only(ip) and not _is_loopback(sender):
+        return None
     return f"[{ip}]" if ip.version == 6 else str(ip)
+
+
+def _announces_host(http_host: str, multicast_if: str) -> bool:
+    """Whether a node advertising ``http_host`` should announce on ``multicast_if``.
+
+    Peers on the network drop a loopback or link-local host sent by another
+    machine, and it would be wrong for them anyway, so such a host is
+    announced only on a loopback interface, where only this machine hears it.
+    """
+    if _is_loopback(multicast_if):
+        return True
+    try:
+        ip = ipaddress.ip_address(http_host)
+    except ValueError:
+        return True  # not an address at all: receivers drop it on their own
+    return not _is_local_only(ip)
 
 
 def discovery_interface_from_env() -> str:
@@ -269,6 +308,9 @@ class PresenceServer:
         self.http_host = http_host
         self.nonce = uuid.uuid4().hex[:12]
         self._loopback_only = _is_loopback(multicast_if)
+        # False for a loopback-only daemon on a network interface: it still
+        # records peers it hears, but never sends 127.0.0.1 to the network.
+        self.announces = _announces_host(http_host, multicast_if)
         self._sock: socket.socket | None = None  # receives group traffic
         self._send_sock: socket.socket | None = None  # sends announcements
         self._thread: threading.Thread | None = None
@@ -390,7 +432,7 @@ class PresenceServer:
             if data is not None:
                 self._handle(data, addr)
             now = time.monotonic()
-            if now >= next_announce:
+            if self.announces and now >= next_announce:
                 try:
                     self._send_sock.sendto(self._announcement(), (self.group, self.port))
                 except OSError:
@@ -417,9 +459,9 @@ class PresenceServer:
         host = payload.get("http_host")
         if not isinstance(host, str) or not host:
             host = addr[0]
-        url_host = _url_host(host)
+        url_host = _url_host(host, addr[0])
         if url_host is None:
-            return  # not an IP address: never record a URL built from it
+            return  # not a usable IP address for this sender: never record a URL built from it
         raw_name = payload.get("name")
         name = clean_text(raw_name, MAX_NAME_CHARS) if isinstance(raw_name, str) else ""
         name = name or f"node-{addr[0]}:{http_port}"

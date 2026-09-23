@@ -4,6 +4,15 @@ Implements just enough of the Agent2Agent protocol for Maestro nodes:
 Agent Card, ``message/send``, ``tasks/get``, ``tasks/cancel`` over JSON-RPC 2.0,
 and SSE encoding for task event streams. Conformance is verified against the
 published field shapes in tests; no framework dependency is pulled in.
+
+Maestro adds its own methods beside the A2A ones. ``tasks/followup`` and
+``tasks/renameBranch`` serve the CLI. ``tasks/delegate``, ``tasks/wait``,
+``tasks/resolve``, ``tasks/answer`` and ``agents/list`` serve an MCP server
+that forwards its tools to the daemon owning the state directory (see
+:mod:`maestro.daemon_client`). They return the results of the daemon's own
+methods (``delegate``, ``wait``, ``resolve``, ``answer_question``,
+``agents``), so a forwarding MCP server behaves like one that runs the daemon
+itself.
 """
 
 from __future__ import annotations
@@ -52,6 +61,11 @@ ERR_METHOD_NOT_FOUND = -32601
 ERR_INVALID_PARAMS = -32602
 ERR_INTERNAL = -32603
 ERR_TASK_NOT_FOUND = -32004
+
+# The longest one ``tasks/wait`` call blocks. A caller that wants to wait
+# longer calls again; that keeps each HTTP request short and lets the caller
+# notice a daemon that went away.
+MAX_RPC_WAIT_S = 60.0
 
 
 def _extract_handoff(message: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -116,6 +130,16 @@ class A2ADispatcher:
             return self._followup(request_id, params)
         if method == "tasks/renameBranch":
             return self._rename_branch(request_id, params)
+        if method == "tasks/delegate":
+            return self._delegate(request_id, params)
+        if method == "tasks/wait":
+            return self._wait(request_id, params)
+        if method == "tasks/resolve":
+            return self._resolve(request_id, params)
+        if method == "tasks/answer":
+            return self._answer(request_id, params)
+        if method == "agents/list":
+            return jsonrpc_ok(request_id, {"agents": self.daemon.agents()})
         return jsonrpc_error(request_id, ERR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
     def _send(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -184,7 +208,7 @@ class A2ADispatcher:
             return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
-        return jsonrpc_ok(request_id, {"task": self.daemon.status_a2a(result["task_id"])})
+        return jsonrpc_ok(request_id, {"cancel": result, "task": self.daemon.status_a2a(result["task_id"])})
 
     def _followup(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         task_ref = params.get("id")
@@ -205,7 +229,7 @@ class A2ADispatcher:
             return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
-        return jsonrpc_ok(request_id, {"task": self.daemon.status_a2a(result["task_id"])})
+        return jsonrpc_ok(request_id, {"followup": result, "task": self.daemon.status_a2a(result["task_id"])})
 
     def _rename_branch(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         task_ref = params.get("id")
@@ -221,6 +245,64 @@ class A2ADispatcher:
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         return jsonrpc_ok(request_id, {"rename": result, "task": self.daemon.status_a2a(result["task_id"])})
+
+    def _delegate(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        """Delegate a handoff exactly as the daemon's ``delegate`` does.
+
+        Unlike ``message/send``, the target agent is not replaced when it is
+        unknown here, and the result is the daemon's own delegate result
+        (task_id, queued, state, ts), so a forwarding MCP server behaves like
+        one that runs the daemon itself.
+        """
+        handoff = params.get("handoff")
+        if not isinstance(handoff, dict):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.handoff is required (the handoff document as an object)")
+        workspace = params.get("workspace")
+        if not isinstance(workspace, str) or not workspace:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.workspace is required (non-empty string)")
+        try:
+            from .handoff import from_dict
+
+            return jsonrpc_ok(request_id, self.daemon.delegate(from_dict(handoff), workspace))
+        except (ValueError, KeyError, OSError) as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
+
+    def _wait(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        """Block until the task is terminal or needs input, for at most MAX_RPC_WAIT_S seconds."""
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        timeout = params.get("timeout", MAX_RPC_WAIT_S)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.timeout must be a non-negative number of seconds")
+        try:
+            task = self.daemon.wait(self.daemon.resolve(task_ref), timeout=min(float(timeout), MAX_RPC_WAIT_S))
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        return jsonrpc_ok(request_id, {"task": task})
+
+    def _resolve(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        try:
+            return jsonrpc_ok(request_id, {"id": self.daemon.resolve(task_ref)})
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+
+    def _answer(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        answer = params.get("answer")
+        if not isinstance(answer, str):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.answer is required (string)")
+        try:
+            return jsonrpc_ok(request_id, self.daemon.answer_question(self.daemon.resolve(task_ref), answer))
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        except ValueError as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
 
 
 def new_message_id() -> str:

@@ -689,3 +689,81 @@ def test_peer_table_load_ignores_a_file_that_is_not_an_object(tmp_path):
     path = tmp_path / "peers.json"
     path.write_text("[1, 2]", encoding="utf-8")
     assert PeerTable(path).load() == {}
+
+
+# ------------------------------------------------ review follow-ups (PR #31)
+@pytest.mark.parametrize("http_host", ["127.0.0.1", "127.8.9.10", "::1", "169.254.169.254", "fe80::1", "::ffff:127.0.0.1", "::ffff:169.254.169.254"])
+def test_handle_rejects_loopback_and_link_local_hosts_from_another_host(tmp_path, http_host):
+    """Reviewer's r3b.py: a LAN host must not point peers at this machine's loopback or a metadata address."""
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "x", "http_port": 8790, "http_host": http_host}).encode(), ("192.168.1.50", 9786))
+    assert table.load() == {}
+
+
+def test_handle_accepts_a_loopback_host_from_a_loopback_sender(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "x", "http_port": 8790, "http_host": "127.0.0.1"}).encode(), ("127.0.0.1", 9786))
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "y", "http_port": 8791, "http_host": "10.9.9.9"}).encode(), ("192.168.1.50", 9786))
+    assert {key: peer["url"] for key, peer in table.load().items()} == {
+        "127.0.0.1:8790": "http://127.0.0.1:8790",
+        "192.168.1.50:8791": "http://10.9.9.9:8791",
+    }
+
+
+def test_handle_rejects_a_link_local_sender_address_used_as_the_host(tmp_path):
+    """An announcement without http_host falls back to the sender address, which is checked the same way."""
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "x", "http_port": 8790}).encode(), ("169.254.10.10", 9786))
+    assert table.load() == {}
+
+
+def _one_announce_tick(server: PresenceServer) -> _FakePresenceSocket:
+    sock = _FakePresenceSocket(recv_results=[socket.timeout()])  # one quiet tick, then the socket "closes"
+    server._sock = server._send_sock = sock
+    server._loop()
+    return sock
+
+
+def test_loopback_host_is_not_announced_on_a_network_interface(tmp_path):
+    """A daemon reachable only on 127.0.0.1 must not announce that address to the LAN."""
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="127.0.0.1")
+    assert server.announces is False
+    assert _one_announce_tick(server).sent == []
+
+
+def test_loopback_host_is_announced_on_the_loopback_interface(tmp_path):
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="127.0.0.1", http_host="127.0.0.1")
+    assert server.announces is True
+    sent = _one_announce_tick(server).sent
+    assert len(sent) == 1 and json.loads(sent[0][0])["http_host"] == "127.0.0.1"
+
+
+def test_reachable_host_is_announced_on_a_network_interface(tmp_path):
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="192.0.2.44")
+    assert server.announces is True
+    assert len(_one_announce_tick(server).sent) == 1
+
+
+def test_loopback_daemon_with_discovery_on_listens_but_does_not_announce(tmp_path, monkeypatch):
+    """MAESTRO_DISCOVERY=1 on a loopback daemon with the default interface: peers are heard, 127.0.0.1 is never sent."""
+    from maestro.daemon import MaestroDaemon
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.setenv("MAESTRO_DISCOVERY", "1")
+    monkeypatch.setenv("MAESTRO_DISCOVERY_IF", "0.0.0.0")
+    monkeypatch.setenv("MAESTRO_DISCOVERY_PORT", str(_ephemeral_udp_port()))
+    d = MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
+    try:
+        assert d._presence is not None and d._presence.announces is False
+    finally:
+        d.stop()
+
+
+def test_a_host_name_that_is_not_an_address_is_still_announced(tmp_path):
+    """Only addresses are judged here; receivers drop a host that is not an IP address on their own."""
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="maestro.local")
+    assert server.announces is True

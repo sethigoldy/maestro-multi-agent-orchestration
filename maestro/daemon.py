@@ -38,6 +38,7 @@ from .a2a import (
     sse_encode,
 )
 from . import daemonctl
+from .daemon_client import DaemonClient
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
 from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
@@ -325,16 +326,29 @@ class MaestroDaemon:
         self.sse_queue_max = 2048  # events one SSE client may fall behind before it is disconnected
         self.sse_write_timeout_s = 30.0  # an SSE client that accepts no data for this long is disconnected
         self._owner_lock_fd: int | None = None  # set while this daemon serves HTTP and owns daemon.json
+        # The process that runs this daemon's tasks, written into every task's
+        # runtime record. The start time tells this process apart from a later
+        # one that reuses its pid, so reconciliation can tell whether the
+        # runner of a leftover "working" task is still alive.
+        self._runner: dict[str, Any] = {"pid": os.getpid(), "started": daemonctl.process_start_token(os.getpid())}
         # Every daemon process that uses this state directory holds a shared
         # lock on it. Only a process that can briefly take that lock
-        # exclusively is alone here, and only then may it fail tasks that look
-        # interrupted: otherwise they may belong to another live daemon.
+        # exclusively is alone here. Task records written by older versions
+        # name no runner, so such a task may be failed only by a daemon that
+        # is alone: otherwise it may belong to another live daemon.
         self._users_lock_fd = daemonctl.open_lock(self.state_dir / daemonctl.USERS_LOCK_NAME)
-        alone = daemonctl.try_exclusive(self._users_lock_fd)
-        # A daemon from an older version holds no lock, so its answering marker is checked too.
-        if alone and daemonctl.live_owner(self.state_dir) is None:
-            self._reconcile_interrupted_tasks()
-        daemonctl.hold_shared(self._users_lock_fd)
+        try:
+            alone = daemonctl.try_exclusive(self._users_lock_fd)
+            # A daemon from an older version holds no lock, so its answering marker is checked too.
+            alone = alone and daemonctl.live_owner(self.state_dir) is None
+            self._reconcile_interrupted_tasks(alone=alone)
+            daemonctl.hold_shared(self._users_lock_fd)
+        except BaseException:
+            # Closing the descriptor drops the lock, whichever mode it was in,
+            # so a failed start never blocks the next daemon.
+            os.close(self._users_lock_fd)
+            self.maestro.close()
+            raise
         if start_http:
             try:
                 self.start_http(port)
@@ -462,7 +476,7 @@ class MaestroDaemon:
             self._owner_lock_fd = None
         os.close(self._users_lock_fd)
 
-    def _reconcile_interrupted_tasks(self) -> None:
+    def _reconcile_interrupted_tasks(self, *, alone: bool = True) -> None:
         """Fail tasks that a previous daemon process left mid-flight.
 
         A turn is an in-process thread. When the daemon dies (SIGKILL, OOM,
@@ -474,6 +488,14 @@ class MaestroDaemon:
         (they stay continuable via followup/task continue). Parked
         input-required tasks are left alone — they are legitimately waiting for
         an answer, not interrupted.
+
+        Whether a task is interrupted is decided by its own runner: the pid and
+        start time of the daemon process that ran it, recorded in its runtime
+        record. A task whose runner is still alive belongs to that process and
+        is left alone, even when this daemon is otherwise alone. A task from an
+        older version records no runner; it is failed only when ``alone`` is
+        True (the default), that is, when no other daemon process uses the
+        state directory.
         """
         try:
             records = self.maestro._registry_records()
@@ -501,6 +523,13 @@ class MaestroDaemon:
                 reason = "daemon restarted before the task started; re-delegate to run it."
             else:
                 continue  # completed/failed/canceled or parked input-required: leave as-is
+            runner = runtime.get("runner")
+            pid = runner.get("pid") if isinstance(runner, dict) else None
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                if daemonctl.runner_alive(runner):
+                    continue  # its daemon process still runs it
+            elif not alone:
+                continue  # no usable runner recorded: it may belong to another live daemon
             try:
                 record = self._durable_record(task_id)
                 if record is None:
@@ -854,6 +883,7 @@ class MaestroDaemon:
         if record is None:
             return
         snapshot = {k: v for k, v in record.items() if k != "transcript"}
+        snapshot["runner"] = self._runner
         self.maestro._write_claim(task_id, "task_runtime", json.dumps(snapshot, ensure_ascii=False))
         if doc is not None:
             self.maestro._write_claim(task_id, "task_origin_agent", doc.origin_agent)
@@ -2150,7 +2180,24 @@ class MaestroDaemon:
             {"id": spec.name, "name": spec.display_name or spec.name, "description": f"Delegable agent ({spec.kind})", "tags": list(spec.skills)}
             for spec in self.registry.list()
         ]
-        return agent_card(name="maestro-node", url=f"http://{self.advertised_host}:{self.port or 0}", skills=skills)
+        card = agent_card(name="maestro-node", url=f"http://{self.advertised_host}:{self.port or 0}", skills=skills)
+        # Which process serves this card and for which state directory. A
+        # daemon.json marker from an older version has no owner lock, so
+        # ``maestro daemon status/stop`` confirm its pid through these fields.
+        card["maestro"] = {"pid": os.getpid(), "state_dir": str(self.state_dir)}
+        return card
+
+    def agents(self) -> list[dict[str, Any]]:
+        """Every registered agent (tokens redacted) with its live availability."""
+        return [{**spec.to_dict(redact=True), "status": self.registry.status(spec.name)} for spec in self.registry.list()]
+
+    def current_state(self, task_id: str) -> str | None:
+        """The task's state without building its full status, or None for an unknown task."""
+        record = self._tasks.get(task_id)
+        if record is not None:
+            return str(record["state"])
+        claims = self.maestro._claims(task_id)
+        return _durable_state(claims, _runtime_from_claims(claims)) if claims else None
 
 
 def record_transcript(record: dict[str, Any] | None) -> list[dict[str, str]]:
@@ -2221,7 +2268,12 @@ def _allowed_origins_from_env() -> list[str]:
     return [item for item in (part.strip() for part in raw.split(",")) if item]
 
 
-MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024  # a JSON-RPC request larger than 8 MiB is refused unread
+MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024  # a JSON-RPC request larger than 8 MiB is refused unparsed
+# After refusing a body, the handler reads and discards up to this much of it
+# before closing. Closing a socket with unread data makes the kernel send a
+# reset, and the client then sees "connection reset" instead of the refusal.
+MAX_DRAIN_BYTES = 64 * 1024 * 1024
+DRAIN_TIMEOUT_S = 5.0  # the drain stops when the client sends nothing for this long
 
 
 def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
@@ -2297,6 +2349,35 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _refuse_body(self, code: int, obj: dict[str, Any], declared: int | None) -> None:
+            """Send a refusal for a request body that will not be read, then close cleanly.
+
+            The reply goes out first and the write side is shut down, so the
+            client can read it at once. The body is then read and thrown away,
+            ``declared`` bytes of it (or, when the length is unknown, until the
+            client stops sending), never more than MAX_DRAIN_BYTES and never
+            waiting more than DRAIN_TIMEOUT_S for the next chunk. Without this,
+            closing the socket with the body unread makes the kernel reset the
+            connection, and a client still sending sees a broken pipe or a
+            connection reset instead of this reply.
+            """
+            import socket
+
+            self.close_connection = True
+            self._send_json(code, obj)
+            try:
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+                self.connection.settimeout(DRAIN_TIMEOUT_S)
+                remaining = MAX_DRAIN_BYTES if declared is None else min(declared, MAX_DRAIN_BYTES)
+                while remaining > 0:
+                    chunk = self.rfile.read1(min(remaining, 65536))
+                    if not chunk:
+                        break  # the client closed its side
+                    remaining -= len(chunk)
+            except OSError:
+                pass  # timeout or reset: stop draining, the reply is already out
+
         def do_GET(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
             if not self._host_allowed():
@@ -2367,21 +2448,20 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             if refusal is not None:
                 self._send_json(403, {"error": refusal})
                 return
-            # Check the declared size before reading anything: a negative length
+            # Check the declared size before parsing anything: a negative length
             # would make the read wait until the client hangs up, and a huge one
-            # would be read into memory. The unread body is never parsed as a
-            # request because the connection is closed after the reply.
+            # would be read into memory. The refused body is read in chunks and
+            # thrown away (see _refuse_body), never parsed as a request, and the
+            # connection is closed after the reply.
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 length = -1
             if length < 0:
-                self.close_connection = True
-                self._send_json(400, {"error": "Content-Length must be a non-negative integer"})
+                self._refuse_body(400, {"error": "Content-Length must be a non-negative integer"}, None)
                 return
             if length > MAX_REQUEST_BODY_BYTES:
-                self.close_connection = True
-                self._send_json(413, {"error": f"request body is larger than the {MAX_REQUEST_BODY_BYTES}-byte limit"})
+                self._refuse_body(413, {"error": f"request body is larger than the {MAX_REQUEST_BODY_BYTES}-byte limit"}, length)
                 return
             try:
                 body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
@@ -2402,8 +2482,10 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             # A client that stops reading must not hold this thread or grow a
             # queue forever: writes give up after sse_write_timeout_s, and a
-            # client more than sse_queue_max events behind is disconnected. It
-            # can reconnect and catch up from the event bus's recent history.
+            # client more than sse_queue_max events behind is disconnected.
+            # Before that it is told why (see _overflowed below), because the
+            # events it missed are not all in the bus's replay buffer, which
+            # keeps only the newest 1000 events.
             self.connection.settimeout(daemon.sse_write_timeout_s)
             sub = daemon.bus.subscribe(maxsize=daemon.sse_queue_max)
             # A task stream starts at the task's latest turn (its most recent
@@ -2431,8 +2513,7 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                             return
                 while True:
                     if sub.overflowed:
-                        self.wfile.write(b": subscriber fell too far behind; reconnect to catch up\n\n")
-                        self.wfile.flush()
+                        self._overflowed(task_id)
                         break
                     event = sub.get(timeout=daemon.sse_heartbeat_s)
                     if event is None:
@@ -2450,33 +2531,124 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             finally:
                 sub.close()
 
+        def _overflowed(self, task_id: str | None) -> None:
+            """Tell a subscriber that fell too far behind why its stream ends.
+
+            A task stream whose task has finished meanwhile gets the final
+            state, which ends it normally. Otherwise the stream sends an
+            ``overflow`` event: the subscriber has missed events and must
+            re-subscribe, or ask for the task with ``tasks/get``, to learn how
+            the task ends. Maestro's own clients (``maestro task tail`` and the
+            a2a_remote adapter) re-subscribe.
+            """
+            if task_id is not None:
+                final = daemon.final_state_event(task_id)
+                if final is not None:
+                    self.wfile.write(sse_encode(final.type, final.to_dict()).encode("utf-8"))
+                    self.wfile.flush()
+                    return
+            data: dict[str, Any] = {"reason": "subscriber fell too far behind; events were dropped. Re-subscribe to keep following."}
+            if task_id is not None:
+                data["state"] = daemon.current_state(task_id)
+            event = TaskEvent(task_id=task_id or "", type="overflow", data=data)
+            self.wfile.write(sse_encode(event.type, event.to_dict()).encode("utf-8"))
+            self.wfile.flush()
+
     return Handler
 
 
-_instance: MaestroDaemon | None = None
+_instance: "MaestroDaemon | DaemonClient | None" = None
+_instance_kwargs: dict[str, Any] = {}
 _instance_lock = threading.Lock()
+SHUTDOWN_LOCK_WAIT_S = 5.0  # shutdown_daemon may run in a signal handler; it never waits longer
 
 
-def get_daemon(**kwargs: Any) -> MaestroDaemon:
-    """Process-wide daemon singleton (used by MCP tools and the CLI).
+def get_daemon(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
+    """Process-wide daemon for the MCP tools (and anything else in this process).
 
-    When another live daemon already owns the state directory (for example the
-    background daemon that ``maestro daemon start`` launched), this process
-    must not take over its marker or fail its tasks. The daemon returned here
-    then runs its own tasks without an HTTP endpoint and says so on stderr;
-    the tasks are still written to the shared state directory.
+    Only one daemon runs tasks for a state directory. When another daemon
+    already owns it and answers HTTP (for example the background daemon that
+    ``maestro daemon start`` launched), this returns a
+    :class:`~maestro.daemon_client.DaemonClient` that sends every call to that
+    owner, so its tasks, cancels and workspace queue stay in one process.
+    Otherwise this process starts its own daemon, which serves HTTP and owns
+    the directory.
+
+    Each call checks that the owner still answers. Once it has gone away, this
+    process starts its own daemon and takes ownership. If the owner is still
+    alive but does not answer HTTP, ownership cannot be taken, and the daemon
+    started here runs its tasks without an HTTP endpoint for the rest of this
+    process's life; a note on stderr says so.
     """
-    global _instance
+    global _instance, _instance_kwargs
     with _instance_lock:
+        if isinstance(_instance, DaemonClient) and not _instance.alive():
+            print(
+                f"maestro: the Maestro daemon at {_instance.url} stopped answering; this process now runs its own daemon.",
+                file=sys.stderr,
+                flush=True,
+            )
+            _instance = None
         if _instance is None:
-            try:
-                _instance = MaestroDaemon(**kwargs)
-            except daemonctl.DaemonAlreadyRunning as exc:
+            _instance_kwargs = dict(kwargs)
+            _instance = _open_daemon(**kwargs)
+        return _instance
+
+
+def _owner_client(state_dir: Path) -> "DaemonClient | None":
+    """A client for the daemon that owns ``state_dir`` and answers HTTP, or None."""
+    info = daemonctl.live_owner(state_dir)
+    if info is None or not info.running or not info.url:
+        return None
+    return DaemonClient(state_dir, info.url, info.token, info.pid, fallback=lambda: None)
+
+
+def _open_daemon(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
+    raw = kwargs.get("state_dir")
+    state_dir = Path(raw).expanduser() if raw else maestro_user_dir()
+    client = _owner_client(state_dir)
+    if client is None:
+        try:
+            return MaestroDaemon(**kwargs)
+        except daemonctl.DaemonAlreadyRunning as exc:
+            # Another daemon took the directory after the check above, or the
+            # owner is alive but does not answer HTTP.
+            client = _owner_client(state_dir)
+            if client is None:
                 print(
-                    f"maestro: {exc}. This process runs its own tasks without an HTTP endpoint "
-                    "and leaves that daemon's marker and tasks alone.",
+                    f"maestro: {exc}, but it does not answer HTTP. This process runs its own tasks without an HTTP "
+                    "endpoint and leaves that daemon's marker and tasks alone.",
                     file=sys.stderr,
                     flush=True,
                 )
-                _instance = MaestroDaemon(**{**kwargs, "start_http": False})
+                return MaestroDaemon(**{**kwargs, "start_http": False})
+    client._fallback = lambda: _replace_client(client)
+    return client
+
+
+def _replace_client(client: "DaemonClient") -> "MaestroDaemon | DaemonClient":
+    """The daemon to use after ``client``'s owner stopped answering (see DaemonClient.wait)."""
+    global _instance
+    with _instance_lock:
+        if _instance is client or _instance is None:
+            _instance = _open_daemon(**_instance_kwargs)
         return _instance
+
+
+def shutdown_daemon() -> None:
+    """Stop this process's daemon, if it runs one, releasing its marker and locks.
+
+    The MCP server calls this when it exits (normally, or on SIGTERM). A
+    daemon left running would keep "working" tasks that no process drives
+    any more. A client of another process's daemon has nothing to stop.
+    """
+    global _instance
+    locked = _instance_lock.acquire(timeout=SHUTDOWN_LOCK_WAIT_S)
+    try:
+        instance, _instance = _instance, None
+    finally:
+        if locked:
+            _instance_lock.release()
+    if isinstance(instance, MaestroDaemon):
+        instance.stop()
+

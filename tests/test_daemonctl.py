@@ -207,13 +207,14 @@ def test_status_running(tmp_path, monkeypatch):
 
 
 def test_status_running_with_token_and_custom_host(tmp_path, monkeypatch):
-    # A marker from an older daemon has no owner_lock field; its agent card confirms it.
+    # A marker from an older daemon has no owner_lock field; its agent card
+    # confirms it, and must name the marker's pid and this state directory.
     _write_marker(tmp_path, host="10.0.0.5", token="sekrit")
     seen = []
-    monkeypatch.setattr(daemonctl, "_answers_as_maestro", lambda url, token: seen.append((url, token)) or True)
+    monkeypatch.setattr(daemonctl, "_answers_as_maestro", lambda url, token, pid, state_dir: seen.append((url, token, pid, state_dir)) or True)
     monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
     info = daemonctl.status(state_dir=tmp_path)
-    assert info.running is True and seen == [("http://10.0.0.5:8790", "sekrit")]
+    assert info.running is True and seen == [("http://10.0.0.5:8790", "sekrit", os.getpid(), tmp_path)]
     assert info.url == "http://10.0.0.5:8790" and info.token == "sekrit"
 
 
@@ -674,7 +675,10 @@ def test_owner_lock_holder_and_acquire(tmp_path):
 
 
 class _CardHandler(http.server.BaseHTTPRequestHandler):
-    """Answers the agent card only with the right bearer token; other paths return a list."""
+    """Answers the agent card only with the right bearer token; other paths return a list.
+
+    The card names the daemon's pid (4242) and state directory (/srv/maestro-state).
+    """
 
     def do_GET(self):  # noqa: N802
         if self.path != "/.well-known/agent.json":
@@ -684,7 +688,10 @@ class _CardHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         else:
-            body = json.dumps({"name": "maestro-node", "url": "http://x", "capabilities": {}}).encode()
+            body = json.dumps({
+                "name": "maestro-node", "url": "http://x", "capabilities": {},
+                "maestro": {"pid": 4242, "state_dir": "/srv/maestro-state"},
+            }).encode()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)
@@ -700,10 +707,14 @@ def test_answers_as_maestro_checks_the_agent_card():
     plain = _ProbeServer()
     try:
         url = f"http://127.0.0.1:{server.server_address[1]}"
-        assert daemonctl._answers_as_maestro(url, "sekrit") is True
-        assert daemonctl._answers_as_maestro(url, None) is False  # 401 without the token
-        assert daemonctl._answers_as_maestro(plain.url(), None) is False  # answers, but not JSON
-        assert daemonctl._answers_as_maestro(f"http://127.0.0.1:{_closed_port()}", None) is False
+        state = Path("/srv/maestro-state")
+        assert daemonctl._answers_as_maestro(url, "sekrit", 4242, state) is True
+        assert daemonctl._answers_as_maestro(url, None, 4242, state) is False  # 401 without the token
+        # A Maestro card for another pid or another state directory is another daemon.
+        assert daemonctl._answers_as_maestro(url, "sekrit", 4243, state) is False
+        assert daemonctl._answers_as_maestro(url, "sekrit", 4242, Path("/srv/other-state")) is False
+        assert daemonctl._answers_as_maestro(plain.url(), None, 4242, state) is False  # answers, but not JSON
+        assert daemonctl._answers_as_maestro(f"http://127.0.0.1:{_closed_port()}", None, 4242, state) is False
     finally:
         server.shutdown()
         server.server_close()
@@ -724,9 +735,17 @@ def test_answers_as_maestro_rejects_json_that_is_not_a_card(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-    for body in (b"[1, 2]", b'{"name": "something else"}'):
+    card = {"name": "maestro-node", "url": "http://x", "capabilities": {}}
+    bodies = (
+        b"[1, 2]",
+        b'{"name": "something else"}',
+        json.dumps(card).encode(),  # a card from an older version names no pid or state directory
+        json.dumps({**card, "maestro": "not-an-object"}).encode(),
+        json.dumps({**card, "maestro": {"pid": 1, "state_dir": 7}}).encode(),
+    )
+    for body in bodies:
         monkeypatch.setattr(daemonctl.urllib.request, "urlopen", lambda request, timeout, body=body: _Resp(body))
-        assert daemonctl._answers_as_maestro("http://127.0.0.1:1", None) is False
+        assert daemonctl._answers_as_maestro("http://127.0.0.1:1", None, 1, Path("/x")) is False
 
 
 def test_older_marker_without_port_cannot_be_confirmed(tmp_path):
@@ -747,3 +766,160 @@ def test_live_owner_variants(tmp_path, monkeypatch):
     finally:
         os.close(fd)
     assert daemonctl.live_owner(tmp_path) is None  # nobody holds the lock: the marker is stale
+
+
+# ------------------------------------------------ review follow-ups (PR #31)
+class _BannerServer:
+    """A TCP server that answers every connection with one non-HTTP line, like an SSH server."""
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            try:
+                conn.settimeout(2)
+                conn.recv(4096)
+                conn.sendall(b"SSH-2.0-OpenSSH_9.0\r\n")
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def url(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def close(self):
+        self.sock.close()
+
+
+def test_a_non_http_reply_is_not_a_maestro_daemon():
+    """http.client raises BadStatusLine here, which is not a URLError; it must not escape."""
+    banner = _BannerServer()
+    try:
+        assert daemonctl.probe(banner.url()) is False
+        assert daemonctl._answers_as_maestro(banner.url(), None, os.getpid(), Path("/x")) is False
+    finally:
+        banner.close()
+
+
+def test_status_of_a_current_marker_whose_port_speaks_another_protocol(tmp_path):
+    banner = _BannerServer()
+    fd = _hold_owner_lock(tmp_path)
+    try:
+        _write_marker(tmp_path, port=banner.port, owner_lock=True)
+        info = daemonctl.status(tmp_path)
+        assert info.running is False and "does not answer" in info.detail
+    finally:
+        os.close(fd)
+        banner.close()
+
+
+@pytest.mark.parametrize("command", ["status", "start", "stop", "restart"])
+def test_cli_daemon_commands_report_unexpected_errors_without_a_traceback(state_home, monkeypatch, capsys, command):
+    import http.client
+
+    from maestro import cli
+
+    def boom(*args, **kwargs):
+        raise http.client.BadStatusLine("SSH-2.0-OpenSSH_9.0")
+
+    monkeypatch.setattr(daemonctl, command, boom)
+    rc = cli.main(["daemon", command])
+    err = capsys.readouterr().err
+    assert rc == 1 and err.startswith("maestro: ") and "Traceback" not in err
+    assert "BadStatusLine" in err
+
+
+def test_process_start_token_identifies_a_process():
+    sleeper = _unrelated_sleeper()
+    try:
+        token = daemonctl.process_start_token(sleeper.pid)
+        assert token and token == daemonctl.process_start_token(sleeper.pid)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert daemonctl.process_start_token(_dead_pid()) is None
+
+
+def test_process_start_token_without_ps(monkeypatch):
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("ps")
+
+    monkeypatch.setattr(daemonctl.subprocess, "run", missing)
+    assert daemonctl.process_start_token(os.getpid()) is None
+
+
+def test_runner_alive_variants():
+    sleeper = _unrelated_sleeper()
+    try:
+        token = daemonctl.process_start_token(sleeper.pid)
+        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": token}) is True
+        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": None}) is True  # no start time recorded
+        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": "Thu Jan  1 00:00:00 1970"}) is False  # pid reused
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert daemonctl.runner_alive({"pid": _dead_pid(), "started": None}) is False
+
+
+def test_stop_does_not_sigkill_a_process_it_can_no_longer_confirm(tmp_path, monkeypatch):
+    """The pid is re-confirmed before SIGKILL: after the grace period it may belong to another process."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "ignore-term"], start_new_session=True
+    )
+    try:
+        _wait_for_lock_holder(tmp_path, process.pid)
+        _write_marker(tmp_path, pid=process.pid, owner_lock=True)
+        tokens = iter(["started at 10:00:00", "started at 10:00:07"])  # the second read sees a different process
+        monkeypatch.setattr(daemonctl, "process_start_token", lambda pid: next(tokens), raising=False)
+        info = daemonctl.stop(state_dir=tmp_path, grace_s=0.5)
+        time.sleep(0.3)
+        assert process.poll() is None, "stop() sent SIGKILL to a process it could not confirm"
+        assert info.running is False and "not force-killed" in info.detail
+    finally:
+        process.kill()
+        process.wait()
+
+
+def test_stop_without_a_start_time_reconfirms_through_the_owner_lock(tmp_path, monkeypatch):
+    """When ps is unavailable, the owner lock is checked again before SIGKILL."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "ignore-term"], start_new_session=True
+    )
+    try:
+        _wait_for_lock_holder(tmp_path, process.pid)
+        _write_marker(tmp_path, pid=process.pid, owner_lock=True)
+        monkeypatch.setattr(daemonctl, "process_start_token", lambda pid: None, raising=False)
+        info = daemonctl.stop(state_dir=tmp_path, grace_s=0.5)
+        assert info.detail == "daemon stopped"
+        assert process.wait(timeout=5) != 0  # still the lock holder, so it was killed
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_stop_sigkills_a_confirmed_daemon_that_ignores_sigterm(tmp_path):
+    """With a real start time, the same process is confirmed again and killed."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "ignore-term"], start_new_session=True
+    )
+    try:
+        _wait_for_lock_holder(tmp_path, process.pid)
+        _write_marker(tmp_path, pid=process.pid, owner_lock=True)
+        info = daemonctl.stop(state_dir=tmp_path, grace_s=0.5)
+        assert info.detail == "daemon stopped"
+        assert process.wait(timeout=5) != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()

@@ -3,6 +3,10 @@
 Daemon-to-daemon delegation using the same protocol the local daemon serves
 (see :mod:`maestro.a2a`): Agent Card preflight, ``message/send`` for launch,
 then the per-task SSE stream for live output/usage until a terminal state.
+When the remote drops the stream because this reader fell behind, the stream
+is followed again from a new subscription; when it ends without a terminal
+state, the remote is asked for the task's state (see
+:func:`maestro.a2a_client.follow_task_events`).
 The registry spec's ``command`` field carries the remote base URL; an optional
 spec ``token`` is sent as a Bearer credential when the remote daemon requires
 one (non-loopback binds).
@@ -62,7 +66,7 @@ class A2ARemoteAdapter(BaseAdapter):
     ) -> AdapterResult:
         import time
 
-        from ..a2a_client import post_jsonrpc, sse_events
+        from ..a2a_client import follow_task_events, post_jsonrpc
 
         settings = dict(settings or {})
         base_url = self.api_base_url(settings)
@@ -113,7 +117,7 @@ class A2ARemoteAdapter(BaseAdapter):
 
         def _reader() -> None:
             try:
-                for item in sse_events(base_url, f"/tasks/{remote_id}/events", token=token):
+                for item in follow_task_events(base_url, str(remote_id), token=token):
                     event_q.put(item)
             except BaseException as exc:  # surfaced to the main loop below
                 event_q.put(exc)

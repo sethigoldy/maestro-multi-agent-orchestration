@@ -131,9 +131,14 @@ Why this shape:
 - **The daemon is one of several readers.** CLI commands, MCP tools, the web
   console, and a *new* daemon process all read the same journal. When a daemon
   restarts, tasks from earlier runs remain visible (their runtime snapshot was
-  journaled), and `daemon.json` — liveness-checked against the recorded pid —
-  tells clients which broker is actually alive instead of letting them talk to
-  a stale marker.
+  journaled), and `daemon.json` tells clients which broker is actually alive.
+  Clients confirm that the marker's process is the daemon that wrote it (it
+  holds the owner lock) and that it answers, instead of talking to a stale
+  marker. Each task's runtime snapshot also names the daemon process that runs
+  it (pid and start time), so a new daemon fails a leftover "working" task only
+  when that process is gone. The MCP server follows the same rule: when a
+  daemon already owns the state, it forwards its tool calls to that daemon
+  instead of running tasks itself.
 - **Append-only makes audits free.** `task audit`, budget accounting, and
   failure forensics all read the journal rather than reconstructing it.
 
