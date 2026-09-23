@@ -47,7 +47,7 @@ human-level phases is in [How delegation works](../explanation/how-delegation-wo
 ## delegate
 
 ```text
-delegate(workspace: str, handoff_file: str) -> str
+delegate(workspace: str, handoff_file: str, branch: str = "") -> str
 ```
 
 Loads the handoff file (4-section TOML/JSON or legacy 0.8.x JSON — see
@@ -74,17 +74,27 @@ optional `kind` and `phases`) to inject user-controlled context into the agent
 turns — see [Context injection in the README](../../../README.md#context-injection).
 Signature unchanged: the context lives in the file.
 
+`branch` names the task's git branch, for example `"feat/login-form"`. It
+overrides `[expectations] branch` in the handoff file. When neither is set, the
+branch is `maestro/<task-id>`. The branch must not exist yet, and its name must
+not clash with an existing branch as a folder (with a branch `feat` present,
+`feat/login` cannot be created, and the reverse). An invalid, existing or
+clashing name returns `{"error": …}` before any agent runs. The name applies to
+this daemon's workspace only: when the target is a remote daemon, the forwarded
+handoff leaves it out and the remote uses its own default branch.
+
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
 - If the workspace already has an active task, returns immediately with
   `{"queued": true, "reason": "workspace already has an active task; this handoff is next in line", "ts": …}`.
 - Errors (unknown file, invalid handoff, self-delegation, depth exhausted,
-  budget cap, non-git workspace) return `{"error": "<message>"}`.
+  budget cap, non-git workspace, invalid, existing or clashing `branch`) return
+  `{"error": "<message>"}`.
 
 ## followup
 
 ```text
-followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str
+followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse", branch: str = "") -> str
 ```
 
 Resumes a finished task (`completed`/`failed`/`canceled`) with a new
@@ -103,9 +113,50 @@ snapshot for a clean reasoning context (same task/workspace/branch). See
 [Configuration: `[continuation]`](./configuration.md#continuation--task-continuation-context)
 to disable reuse or resize its budget.
 
+`branch`: optional new name for the task's branch. The branch is renamed first,
+with the same rules as `rename_task_branch`, and the turn then runs on it. If
+the task has no branch yet (its first turn could not create the branch it asked
+for), this sets the name the turn creates. An empty string leaves the branch as
+it is.
+
 Errors: unknown task (`KeyError` text), empty instruction, task still active
-(`"…cancel it or answer its question before following up"`), depth exhausted —
-each returned as `{"error": …}`.
+(`"…cancel it or answer its question before following up"`), depth exhausted,
+any `rename_task_branch` refusal when `branch` is set — each returned as
+`{"error": …}`. A refused `branch` changes nothing and starts no turn. When
+two follow-ups for the same task arrive at the same moment, only one starts a
+turn; the other gets the "still active" error.
+
+## rename_task_branch
+
+```text
+rename_task_branch(workspace: str, task_id: str, branch: str) -> str
+```
+
+Renames a task's git branch and updates the task's record, so `list_tasks`,
+`task_status`, receipts and later `followup` turns all use the new name.
+Accepts a task id or a task number. If the branch was already renamed by hand
+with `git branch -m`, the call only updates the record.
+
+If the task has no branch yet, because it has not started or its first turn
+could not create the branch it asked for, the call changes the name that the
+next turn will create. The new name must be one that can be created, as at
+delegation.
+
+Returns `{"task_id": …, "old_branch": …, "branch": …, "git_renamed": true|false}`.
+`git_renamed` is `false` when only the record changed. When the task had no
+branch yet, the result also has `"pending": true`, and `old_branch` is the name
+the next turn would have created.
+
+Only the local branch is renamed. A copy already pushed to a remote keeps its
+old name there.
+
+Errors, each returned as `{"error": …}`: unknown task; the task is still
+running (`submitted` or `working`) or a turn is starting; the task uses
+`commit_policy = "no-commit"`, so it never has a branch; an invalid branch
+name; the new branch already exists or clashes with an existing branch as a
+folder; neither the old nor the new branch exists; the old
+branch is gone and git's reflog shows no rename from it to the new branch (the
+new branch may be unrelated to the task).
 
 ## task_wait
 
@@ -171,9 +222,14 @@ answer_task_question(workspace: str, task_id: str, answer: str) -> str
 ```
 
 Answers a question asked mid-task (state `input-required`). The agent resumes
-on its branch with the Q&A appended to its context. Returns
-`{"task_id": …, "state": "working"}`. Errors: unknown task, task not in
-`input-required`, empty answer — returned as `{"error": …}`.
+on its branch with the Q&A appended to its context. The answer starts a new
+turn, so the task moves to `submitted` straight away and then to `working`.
+Returns `{"task_id": …, "state": "working"}`, or
+`{"task_id": …, "state": "submitted", "queued": true}` when another task holds
+the workspace, or `{"task_id": …, "state": "input-required"}` when the task
+still has no agent chosen and now asks the routing question. Errors: unknown task, task not in `input-required`, empty
+answer, and an answer that lost a race (another answer given at the same
+moment, or a cancel, reached the task first) — returned as `{"error": …}`.
 
 ## Notes
 

@@ -30,6 +30,10 @@ _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: One-per-process snapshot of the user's login-shell environment. ``None``
 #: means "not captured yet"; an empty dict means "captured, nothing found".
 _LOGIN_ENV_CACHE: dict[str, str] | None = None
+_ENV_MARKER = "__MAESTRO_ENV__"
+# After an agent's own process exits, how long to keep reading output that a
+# child it left running may still hold open.
+_EXIT_GRACE_S = 2.0
 
 
 def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
@@ -50,9 +54,16 @@ def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
         shell = (os.environ.get("SHELL") or "").strip() or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
         try:
             timeout = timeout_s if timeout_s is not None else float(os.environ.get("MAESTRO_LOGIN_ENV_TIMEOUT_S", "10"))
-            proc = subprocess.run([shell, "-lc", "env"], capture_output=True, text=True, timeout=timeout)
-            for line in (proc.stdout or "").splitlines():
-                key, sep, value = line.partition("=")
+            # `env -0` separates variables with NUL, so a value that spans
+            # several lines (a PEM key) stays whole. The marker skips anything
+            # the profile itself prints before the variables.
+            proc = subprocess.run(
+                [shell, "-lc", f"printf '\\0{_ENV_MARKER}\\0'; env -0"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            )
+            _, found, listing = (proc.stdout or "").rpartition(f"\0{_ENV_MARKER}\0")
+            for entry in listing.split("\0") if found else []:
+                key, sep, value = entry.partition("=")
                 if sep and _ENV_KEY_RE.match(key):
                     env[key] = value
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -146,7 +157,7 @@ class BaseAdapter:
         probe_cmd = self.auth_probe()
         if probe_cmd:
             try:
-                probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=15)
+                probe = subprocess.run(probe_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
             except (OSError, subprocess.SubprocessError) as exc:
                 return AdapterPreflight(ok=False, binary=binary, version=version, error=f"Auth probe failed to run: {exc}")
             if probe.returncode != 0:
@@ -234,20 +245,16 @@ class BaseAdapter:
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                # Agent output is not always valid UTF-8 (a Latin-1 file, a
+                # binary test log). Strict decoding would kill the reader.
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
                 env=worker_environment(task_id),
             )
         except (OSError, ValueError) as exc:
             return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")
-        # Popen gets a stdin pipe exactly when we have a prompt to pipe, so the
-        # write below is unconditional once process.stdin exists.
-        if process.stdin is not None:
-            try:
-                process.stdin.write(stdin_data)  # type: ignore[arg-type]
-                process.stdin.close()  # EOF must be visible before we read the first output line
-            except (OSError, ValueError):
-                pass
         line_q: "_queue.Queue[str | None]" = _queue.Queue()
 
         def _reader() -> None:
@@ -258,24 +265,28 @@ class BaseAdapter:
             finally:
                 line_q.put(None)  # sentinel: stream closed
 
+        # Start reading before writing the prompt: an agent that prints a lot
+        # before it reads stdin would otherwise fill the output pipe while we
+        # block on a full input pipe, and neither side could move.
         reader = _threading.Thread(target=_reader, daemon=True)
         reader.start()
+        if process.stdin is not None:
+            _threading.Thread(target=_write_and_close, args=(process.stdin, stdin_data), daemon=True).start()
         deadline = started + timeout if timeout else None
+        idle = _exit_watch(process)
         try:
             lines: list[str] = []
             line_question: str | None = None
             while True:
-                remaining = (deadline - time.monotonic()) if deadline is not None else None
-                try:
-                    line = line_q.get(timeout=remaining)
-                except _queue.Empty:
+                outcome, line = _next_line(line_q, deadline, should_cancel, idle)
+                if outcome == "timeout":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} timed out after {timeout}s", duration_s=time.monotonic() - started)
-                if line is None:
-                    break
-                if should_cancel is not None and should_cancel():
+                if outcome == "cancel":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} was canceled", duration_s=time.monotonic() - started)
+                if outcome == "idle" or line is None:
+                    break  # output closed, or the agent exited and a child still holds it
                 lines.append(line.rstrip("\n"))
                 if log_path is not None:
                     with log_path.open("a", encoding="utf-8") as fh:
@@ -296,6 +307,7 @@ class BaseAdapter:
         except (OSError, ValueError) as exc:
             _kill_group(process)
             return AdapterResult(ok=False, error=f"Agent {self.kind!r} failed while streaming output: {exc}", duration_s=time.monotonic() - started)
+        _kill_leftovers(process)  # background children the agent left behind
         reader.join(timeout=5)
         output_text = "\n".join(lines)
         question = line_question or self.detect_question(output_text)
@@ -467,6 +479,8 @@ class BaseAdapter:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 start_new_session=True,
                 env=worker_environment(task_id),
             )
@@ -506,7 +520,6 @@ class BaseAdapter:
                 return "done"
             return ""
 
-        _send(self.rpc_start_command(prompt, task_id))
         line_q: "_queue.Queue[str | None]" = _queue.Queue()
 
         def _reader() -> None:
@@ -519,31 +532,36 @@ class BaseAdapter:
 
         reader = _threading.Thread(target=_reader, daemon=True)
         reader.start()
+        # Sent after the reader starts, in its own thread: the start command
+        # carries the whole prompt and must not block on a full pipe.
+        sender = _threading.Thread(target=_send, args=(self.rpc_start_command(prompt, task_id),), daemon=True)
+        sender.start()
         deadline = started + timeout if timeout else None
+        idle = _exit_watch(process)
         done = False
         cancel_grace_until: float | None = None
         try:
             lines: list[str] = []
             while True:
-                remaining = (deadline - time.monotonic()) if deadline is not None else None
-                if cancel_grace_until is not None:
-                    grace_left = cancel_grace_until - time.monotonic()
-                    remaining = grace_left if remaining is None else min(remaining, grace_left)
-                try:
-                    line = line_q.get(timeout=remaining)
-                except _queue.Empty:
-                    if cancel_grace_until is not None:
+                if cancel_grace_until is None:
+                    outcome, line = _next_line(line_q, deadline, should_cancel, idle)
+                else:  # already aborting: only the grace period (or the deadline) is left
+                    grace_deadline = cancel_grace_until if deadline is None else min(deadline, cancel_grace_until)
+                    outcome, line = _next_line(line_q, grace_deadline, None)
+                    if outcome == "timeout":
                         break  # abort grace expired; fall through to the kill path
+                if outcome == "timeout":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} timed out after {timeout}s", duration_s=time.monotonic() - started)
-                if line is None:
-                    break  # stream closed before the agent settled
-                if should_cancel is not None and should_cancel() and cancel_grace_until is None:
+                if outcome == "cancel":
                     abort = self.rpc_abort_command()
-                    if abort is not None:
+                    sender.join(timeout=1)  # never interleave the abort with the start command
+                    if abort is not None and not sender.is_alive():
                         _send(abort)
                     cancel_grace_until = time.monotonic() + 5
                     continue
+                if outcome == "idle" or line is None:
+                    break  # stream closed (or the agent exited) before it settled
                 lines.append(line.rstrip("\n"))
                 if log_path is not None:
                     with log_path.open("a", encoding="utf-8") as fh:
@@ -558,18 +576,26 @@ class BaseAdapter:
                 if action == "done":
                     done = True
                     break
-            try:
-                process.stdin.close()  # polite EOF; long-lived agents may exit on their own
-            except (OSError, ValueError):
-                pass
-            try:
-                exit_code = process.wait(timeout=5)
-            except subprocess.SubprocessError:
+            sender.join(timeout=1)
+            if sender.is_alive():
+                # The agent never took its start command. Closing stdin would
+                # wait behind that blocked write, so stop the agent instead.
                 _kill_group(process)
-                exit_code = None
+                exit_code = process.poll()
+            else:
+                try:
+                    process.stdin.close()  # polite EOF; long-lived agents may exit on their own
+                except (OSError, ValueError):
+                    pass
+                try:
+                    exit_code = process.wait(timeout=5)
+                except subprocess.SubprocessError:
+                    _kill_group(process)
+                    exit_code = None
         except (OSError, ValueError) as exc:
             _kill_group(process)
             return AdapterResult(ok=False, error=f"Agent {self.kind!r} failed while streaming output: {exc}", duration_s=time.monotonic() - started)
+        _kill_leftovers(process)
         reader.join(timeout=5)
         if cancel_grace_until is not None:
             return AdapterResult(
@@ -589,23 +615,104 @@ class BaseAdapter:
         )
 
 
-def _kill_group(process: subprocess.Popen) -> None:
+# How often a run checks for cancellation while the agent prints nothing.
+_CANCEL_POLL_S = 0.5
+
+
+def _next_line(
+    line_q: Any, deadline: float | None, should_cancel: Callable[[], bool] | None,
+    idle: Callable[[], bool] | None = None,
+) -> tuple[str, str | None]:
+    """Wait for the agent's next output line.
+
+    Returns ("line", text) with text None once the output has closed,
+    ("timeout", None) when the deadline passes, ("cancel", None) when
+    ``should_cancel`` reports a cancel, or ("idle", None) when ``idle``
+    returns True after a poll interval with no output. Cancellation is checked
+    at least every _CANCEL_POLL_S seconds, so an agent that is silent for a
+    long time (for example while it runs a test suite) is still stopped
+    promptly.
+    """
+    import queue as _queue
+    import time
+
+    while True:
+        if should_cancel is not None and should_cancel():
+            return "cancel", None
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return "timeout", None
+        wait = remaining
+        if should_cancel is not None or idle is not None:
+            wait = _CANCEL_POLL_S if wait is None else min(wait, _CANCEL_POLL_S)
+        try:
+            return "line", line_q.get(timeout=wait)
+        except _queue.Empty:
+            if idle is not None and idle():
+                return "idle", None
+
+
+def _write_and_close(stream: Any, data: str | None) -> None:
+    """Write the prompt to the agent's stdin and close it (EOF), ignoring a
+    pipe the agent already closed."""
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except (OSError, ProcessLookupError):
+        stream.write(data)
+        stream.close()
+    except (OSError, ValueError):
         pass
+
+
+def _exit_watch(process: subprocess.Popen) -> Callable[[], bool]:
+    """An ``idle`` check for _next_line: True once the agent's own process has
+    exited and _EXIT_GRACE_S has passed with no more output. A child the
+    agent started in the background can keep the output pipe open for ever;
+    without this the run would wait for that child instead of the agent."""
+    import time
+
+    exited_at: list[float] = []
+
+    def _idle() -> bool:
+        if process.poll() is None:
+            return False
+        if not exited_at:
+            exited_at.append(time.monotonic())
+        return time.monotonic() - exited_at[0] >= _EXIT_GRACE_S
+
+    return _idle
+
+
+def _signal_group(process: subprocess.Popen, sig: int) -> None:
+    # Agents start with start_new_session=True, so the process group id is
+    # the agent's pid. os.getpgid(pid) is not used: it fails once the agent
+    # itself has exited, even while children in its group are still running.
+    try:
+        os.killpg(process.pid, sig)
+    except OSError:
+        pass
+
+
+def _kill_group(process: subprocess.Popen) -> None:
+    _signal_group(process, signal.SIGTERM)
     try:
         process.wait(timeout=5)
     except subprocess.SubprocessError:
+        _signal_group(process, signal.SIGKILL)
         try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (OSError, ProcessLookupError):
+            process.wait(timeout=5)  # reap it
+        except subprocess.SubprocessError:
             pass
+    _signal_group(process, signal.SIGKILL)  # anything in the group that ignored SIGTERM
+
+
+def _kill_leftovers(process: subprocess.Popen) -> None:
+    """After a run ends normally, stop any process the agent left running in
+    its group. A task is a batch run; nothing it started should outlive it."""
+    _signal_group(process, signal.SIGKILL)
 
 
 def _probe_version(path: str) -> str | None:
     try:
-        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     output = (result.stdout or result.stderr or "").strip()

@@ -11,7 +11,8 @@ block until completion. For reading finished state, see
 |---|---|---|
 | Watch live output | `maestro task tail <id>` | (console/dashboard) |
 | Answer an agent question | — | `answer_task_question` |
-| Send a follow-up instruction | — | `followup` |
+| Send a follow-up instruction | `maestro task continue <id>` | `followup` |
+| Rename a finished task's branch | `maestro task rename-branch <id> <name>` | `rename_task_branch` |
 | Cancel the task | — | `cancel_task` |
 | Block until done or input needed | `maestro task tail <id>` (streams to the end) | `task_wait` |
 
@@ -59,8 +60,16 @@ appended to its context. Rules:
 
 - The task must be in `input-required`; answering anything else is an error.
 - The answer cannot be empty.
+- If two answers arrive at the same moment, only the first one starts the
+  task again; the other gets an error saying the task is no longer awaiting
+  that answer. The same error comes back when the task was canceled first.
 - Every Q&A pair is recorded in the task's transcript, so later follow-ups see
-  it too.
+  it too. This includes answers to a task parked by a work-mode gate or waiting
+  for approval: the park question and your answer both reach the agent.
+- A parked task keeps its workspace while it waits, but not across a daemon
+  restart. If another task took the workspace in the meantime, your answer is
+  accepted, the task moves to `submitted`, and it resumes when the workspace is
+  free (the call reports `"queued": true`).
 
 ## Send a follow-up instruction
 
@@ -79,7 +88,18 @@ Behavior and rules:
 - The call blocks until the follow-up turn finishes or needs input — no
   polling.
 - You cannot follow up while the task is still active; cancel it or answer its
-  question first.
+  question first. If two follow-ups arrive at the same moment, only one starts
+  a turn and the other gets this "still active" error.
+- A follow-up takes the task's workspace, like a new delegation. If another
+  task is working in the same workspace, the follow-up waits in the queue
+  (the call reports `"queued": true`) and starts when that task finishes, so
+  two agents never edit the same working tree at once.
+- A task that was canceled can be followed up normally. If the canceled turn
+  is still finishing in the background (for example, still running its
+  verification), it can no longer change the task's state, free the
+  workspace, or start another agent; only the follow-up's turn can.
+- With `verification = "command"`, every follow-up runs the task's original
+  verification command. The follow-up's instruction is never run as a command.
 - Each follow-up decrements `max_depth_remaining` by one (default 3), so
   follow-up chains cannot nest forever. When depth reaches zero, further
   nesting is refused.
@@ -87,6 +107,54 @@ Behavior and rules:
 
 Review the result of a follow-up exactly like the original task: status, audit,
 branch diff — see [Inspect tasks and artifacts](inspect-tasks-and-artifacts.md).
+
+## Rename a task's branch
+
+A finished or parked task keeps the branch it was given. To rename it:
+
+```bash
+maestro task rename-branch 3 feat/login-form
+```
+
+or, from an MCP client:
+
+```text
+rename_task_branch(workspace="/path/to/repo", task_id="3", branch="feat/login-form")
+```
+
+This renames the git branch and updates the task's record, so `task list`,
+`task status`, receipts and the next follow-up all use the new name. If you
+already ran `git branch -m` yourself, the command sees that the old branch is
+gone and the new one exists. It checks git's reflog to confirm the new branch
+was renamed from the task's branch, and then only updates the record. If git
+has no record of that rename, the command refuses, because the new branch may
+be unrelated to the task.
+
+You do not have to record a hand rename before the next follow-up. When a
+turn starts and the task's branch is missing, Maestro looks for the rename in
+git's reflog and, if exactly one branch was renamed from it, uses that branch
+and updates the record. If the branch was deleted instead, the turn fails
+rather than starting again on a new, empty branch; recreate the branch with
+`git branch <name> <commit>` and send the follow-up again.
+
+If the task has no branch yet, because its first turn could not create the
+branch it asked for, the same command changes the name that the next turn will
+create. You can also rename as part of the follow-up:
+
+```bash
+maestro task continue 3 --request "try again" --branch feat/login-form-2
+```
+
+Rules:
+
+- The task must not be running. Wait for it to finish or park first. A
+  follow-up or answer sent while a rename is under way waits for the rename
+  to finish.
+- The new name must not already exist, unless it is the task's branch that
+  you renamed by hand. It also must not clash with an existing branch as a
+  folder (`feat` and `feat/login` cannot both exist).
+- Only the local branch is renamed. If you pushed the old branch, rename or
+  delete it on the remote yourself.
 
 ## Cancel a task
 
@@ -97,7 +165,14 @@ cancel_task(workspace="/path/to/repo",
 ```
 
 - Works on running tasks and on queued-waiting tasks (it removes them from the
-  queue).
+  queue). A queued task that is canceled at the moment it is being started
+  stays canceled, runs no agent, and the workspace goes to the next queued
+  task.
+- The check that the task is still running and the cancel happen in one step.
+  A task that finishes at the same moment is either completed (and the cancel
+  reports that it already finished) or canceled, never both.
+- Canceling a task that waits for an answer also clears the question it was
+  waiting on, so a later follow-up does not inherit it.
 - Partial work stays on the task branch — nothing is rolled back.
 - The task is marked `canceled` with your reason; already-finished tasks cannot
   be canceled (they are terminal).

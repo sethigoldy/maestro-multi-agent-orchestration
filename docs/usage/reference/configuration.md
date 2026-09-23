@@ -189,19 +189,20 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for CLI task commands; an empty value scopes to the home directory |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Daemon endpoint for CLI daemon commands (e.g. another machine's) |
 | `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that endpoint; also the stable token a daemon uses when it generates one on a non-loopback bind |
+| `MAESTRO_DAEMON_ALLOWED_ORIGINS` | — | Comma-separated browser origins (`scheme://host[:port]`) that may POST to the daemon besides its own address, such as a reverse proxy's public address. `maestro-daemon --allow-origin` replaces it when given. An invalid entry stops the daemon from starting |
 | `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before moving to the next fallback (total attempts = 1 + N) |
 | `MAESTRO_BACKOFF_S` | `1.0` | Base seconds between retries; delay is linear: base × (attempt + 1) |
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP `delegate`/`followup` tools block for a task |
 | `MAESTRO_BUDGET_PER_AGENT_USD` | off | Cumulative USD cap per agent name (see Budget caps) |
 | `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap across all agents, reset at UTC midnight |
-| `MAESTRO_DISCOVERY` | `1` | Set `0` to disable P2P discovery entirely |
+| `MAESTRO_DISCOVERY` | on beyond loopback, off on loopback | Set `0` to disable P2P discovery entirely. A daemon that listens on loopback only runs discovery only when this is set to `1` (or `true`, `yes`, `on`) |
 | `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
-| `MAESTRO_DISCOVERY_IF` | default interface | Interface used for announcements (e.g. `127.0.0.1` for loopback only) |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface used for announcements (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored) |
 | `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
 | `MAESTRO_NODE_NAME` | `maestro-node` | Name this daemon announces under discovery |
 | `MAESTRO_STORAGE` | — | Storage backend fallback when no config file sets it |
 | `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort fallbacks when no config file sets them |
-| `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc env`) to spawned agents |
+| `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc 'env -0'`) to spawned agents. Values that span several lines, such as a PEM key, are kept whole, and anything the profile prints before the variables is ignored |
 | `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment |
 | `MAESTRO_CONTINUATION_MAX_TOKENS` | from `[continuation]` | Positive-integer override of the continuation context budget (see `[continuation]`) |
 | `MAESTRO_PYTHON` | — | Interpreter for verification's pytest probe (must be a file) |

@@ -38,7 +38,7 @@ def test_mcp_followup_passes_context_mode(monkeypatch):
         def resolve(self, ref):
             return f"resolved-{ref}"
 
-        def followup(self, task_id, instruction, context_mode="reuse"):
+        def followup(self, task_id, instruction, context_mode="reuse", branch=None):
             calls.append((task_id, instruction, context_mode))
             return {"task_id": task_id, "state": "submitted"}
 

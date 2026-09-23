@@ -41,7 +41,7 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _normalize_argv(argv: list[str]) -> list[str]:
-    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue"}
+    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue", "rename-branch"}
     if len(argv) >= 2 and argv[0] == "task":
         subcommand = argv[1]
         if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
@@ -199,6 +199,11 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
             target_agent=args.target or "codex", fallback=list(args.fallback),
             mode=args.mode, explicit_target=args.target is not None,
         )
+    if args.branch is not None:
+        from .handoff import validate_handoff
+
+        doc.branch = args.branch  # --branch overrides [expectations] branch in the file
+        doc = validate_handoff(doc)
     flag_entries: list[dict[str, Any]] = []
     for text in args.context:
         flag_entries.append({"label": f"context-{len(flag_entries) + 1}", "kind": "text", "text": text})
@@ -317,11 +322,10 @@ def _cmd_task_receipt(args: argparse.Namespace) -> int:
 
 def _cmd_task_continue(args: argparse.Namespace) -> int:
     url, token = _daemon_endpoint()
-    result = _post_jsonrpc(
-        url, "tasks/followup",
-        {"id": args.task_id, "instruction": args.request, "context_mode": args.context},
-        token=token,
-    )
+    params = {"id": args.task_id, "instruction": args.request, "context_mode": args.context}
+    if args.branch is not None:
+        params["branch"] = args.branch
+    result = _post_jsonrpc(url, "tasks/followup", params, token=token)
     task = (result or {}).get("task") or {}
     task_id = task.get("id")
     if not task_id:
@@ -332,6 +336,33 @@ def _cmd_task_continue(args: argparse.Namespace) -> int:
         return 0
     print(f"[task] {task_id} — continuation (context={args.context}) resuming", flush=True)
     return _stream_task(url, task_id, token=token)
+
+
+def _cmd_task_rename_branch(args: argparse.Namespace) -> int:
+    """Rename a task's branch through the running daemon, or directly in the
+    durable record when no daemon is running (nothing can be working then)."""
+    endpoint = _try_daemon_endpoint()
+    if endpoint is not None:
+        url, token = endpoint
+        result = _post_jsonrpc(url, "tasks/renameBranch", {"id": args.task_id, "branch": args.branch}, token=token)
+        rename = (result or {}).get("rename") or {}
+    else:
+        from .branches import rename_task_branch
+
+        m = Maestro(maestro_user_dir())
+        try:
+            rename = rename_task_branch(m, m.resolve_task(args.task_id), args.branch)
+        finally:
+            m.close()
+    if rename.get("pending"):
+        print(f"Task {rename['task_id']} has no branch yet; its next turn will create {rename['branch']} (instead of {rename['old_branch']})")
+    elif rename.get("git_renamed"):
+        print(f"Renamed branch {rename['old_branch']} -> {rename['branch']} for {rename['task_id']}")
+    elif rename.get("old_branch") == rename.get("branch"):
+        print(f"Task {rename['task_id']} is already on branch {rename['branch']}; nothing changed")
+    else:
+        print(f"Recorded branch {rename['branch']} for {rename['task_id']} (it was already renamed in git from {rename['old_branch']})")
+    return 0
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -585,6 +616,14 @@ def main(argv: list[str] | None = None) -> int:
     task_continue.add_argument("--context", choices=("reuse", "fresh"), default="reuse",
                                help="'reuse' injects the compact task-knowledge snapshot (default); 'fresh' starts a clean reasoning context")
     task_continue.add_argument("--no-wait", action="store_true", help="Return as soon as the turn is submitted (no SSE streaming)")
+    task_continue.add_argument("--branch", default=None, metavar="NAME",
+                               help="Rename the task's branch to NAME before this turn (same rules as 'task rename-branch')")
+    task_rename = task_sub.add_parser(
+        "rename-branch",
+        help="Rename a finished task's git branch and update its record (or record a rename already done with 'git branch -m')",
+    )
+    task_rename.add_argument("task_id")
+    task_rename.add_argument("branch", help="The new branch name")
 
     d = sub.add_parser("delegate", help="Delegate a handoff to any registered agent via the local daemon")
     d.add_argument("--file", default=None, help="Handoff document file (TOML or JSON)")
@@ -593,6 +632,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--target", default=None)
     d.add_argument("--mode", default=None, help="Work-mode preset name from config [modes] (pins implementer/reviewer/verifier/fixer)")
     d.add_argument("--fallback", action="append", default=[], help="Fallback agent (repeatable)")
+    d.add_argument("--branch", default=None, metavar="NAME",
+                   help="Name for the task's git branch (default maestro/<task_id>); must not exist yet")
     d.add_argument("--design-file", default=None, help="Design text file to attach")
     d.add_argument("--context", action="append", default=[], metavar="TEXT",
                    help="Context entry text injected into the agent's prompt (repeatable; label auto-numbered)")
@@ -706,6 +747,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_receipt(args)
         if args.cmd == "task" and args.task_cmd == "continue":
             return _cmd_task_continue(args)
+        if args.cmd == "task" and args.task_cmd == "rename-branch":
+            return _cmd_task_rename_branch(args)
         if args.cmd == "doctor":
             return _cmd_doctor(args)
         if args.cmd == "daemon":
@@ -739,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "agents":
             registry = AgentRegistry(maestro_user_dir())
             if args.agents_cmd == "list":
-                print(json.dumps([s.to_dict() for s in registry.list()], indent=2)); return 0
+                print(json.dumps([s.to_dict(redact=True) for s in registry.list()], indent=2)); return 0
             if args.agents_cmd == "add":
                 spec = AgentSpec(
                     name=args.name, kind=args.kind, display_name=args.display_name,
@@ -748,7 +791,7 @@ def main(argv: list[str] | None = None) -> int:
                     workspace_policy=args.workspace_policy, token=args.token,
                 )
                 registry.save(spec)
-                print(json.dumps(registry.get(args.name).to_dict(), indent=2)); return 0
+                print(json.dumps(registry.get(args.name).to_dict(redact=True), indent=2)); return 0
             if args.agents_cmd == "remove":
                 if not registry.remove(args.name):
                     raise ValueError(f"Agent not registered: {args.name}")

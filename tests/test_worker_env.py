@@ -23,6 +23,12 @@ from maestro.adapters.base import (
 )
 
 
+def _env_listing(*entries: str) -> str:
+    """Shell code printing what `$SHELL -lc` prints for the real command: a
+    marker, then NUL-separated NAME=value entries (the `env -0` format)."""
+    return "printf '\\0__MAESTRO_ENV__\\0'\n" + "\n".join(f"printf '%s\\0' '{e}'" for e in entries)
+
+
 def _fake_shell(path: Path, body: str) -> None:
     path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -37,10 +43,38 @@ def _reset_login_env_cache(monkeypatch):
 
 def test_capture_parses_key_value_lines(monkeypatch, tmp_path):
     shell = tmp_path / "fake-shell"
-    _fake_shell(shell, 'echo "hello world"\necho "MY_KEY=secret-value"\necho "not a var line"\necho "PATH=/usr/bin"\necho 12345')
+    # Profile output before the marker (a banner, even one shaped like a
+    # variable) is ignored; entries that are not NAME=value are skipped.
+    _fake_shell(shell, 'echo "hello world"\necho "BANNER=not-a-variable"\n' + _env_listing("MY_KEY=secret-value", "not a var line", "PATH=/usr/bin", "12345"))
     monkeypatch.setenv("SHELL", str(shell))
     env = capture_login_env()
     assert env == {"MY_KEY": "secret-value", "PATH": "/usr/bin"}
+
+
+def test_capture_keeps_multi_line_values_whole(monkeypatch, tmp_path):
+    shell = tmp_path / "fake-shell"
+    _fake_shell(shell, _env_listing("PEM_KEY=-----BEGIN KEY-----\nFAKE=continuation\n-----END KEY-----", "OTHER=1"))
+    monkeypatch.setenv("SHELL", str(shell))
+    env = capture_login_env()
+    assert env == {"PEM_KEY": "-----BEGIN KEY-----\nFAKE=continuation\n-----END KEY-----", "OTHER": "1"}
+
+
+def test_capture_runs_env_through_the_real_shell(monkeypatch, tmp_path):
+    shell = tmp_path / "login-shell"
+    # A login shell that prints a banner, then runs the command it was given.
+    _fake_shell(shell, 'echo "Welcome"\nexec /bin/sh -c "$2"')
+    monkeypatch.setenv("SHELL", str(shell))
+    monkeypatch.setenv("MULTI_LINE_VALUE", "first\nsecond")
+    env = capture_login_env()
+    assert env["MULTI_LINE_VALUE"] == "first\nsecond"
+    assert "Welcome" not in "".join(env)
+
+
+def test_capture_without_the_marker_returns_empty(monkeypatch, tmp_path):
+    shell = tmp_path / "fake-shell"
+    _fake_shell(shell, 'echo "K=1"')  # a shell that ignored the command
+    monkeypatch.setenv("SHELL", str(shell))
+    assert capture_login_env() == {}
 
 
 def test_capture_missing_shell_returns_empty(monkeypatch, tmp_path):
@@ -72,7 +106,7 @@ def test_capture_disabled_by_env_flag(monkeypatch):
 def test_capture_caches_result(monkeypatch, tmp_path):
     counter = tmp_path / "runs"
     shell = tmp_path / "counting-shell"
-    _fake_shell(shell, 'echo "K=1"\necho run >> "$COUNTER_FILE"')
+    _fake_shell(shell, _env_listing("K=1") + '\necho run >> "$COUNTER_FILE"')
     monkeypatch.setenv("SHELL", str(shell))
     monkeypatch.setenv("COUNTER_FILE", str(counter))
     first = capture_login_env()
@@ -83,7 +117,7 @@ def test_capture_caches_result(monkeypatch, tmp_path):
 
 def test_worker_env_layers_login_defaults_under_daemon_env(monkeypatch, tmp_path):
     shell = tmp_path / "fake-shell"
-    _fake_shell(shell, 'echo "GROVE_API_KEY=from-profile"\necho "PATH=/profile/bin"')
+    _fake_shell(shell, _env_listing("GROVE_API_KEY=from-profile", "PATH=/profile/bin"))
     monkeypatch.setenv("SHELL", str(shell))
     monkeypatch.setenv("PATH", "/daemon/bin")  # daemon value wins on conflict
     env = worker_environment("t-1")
@@ -102,7 +136,7 @@ def test_spawn_agent_sees_profile_variable(monkeypatch, tmp_path):
     (bindir / "probe-agent").write_text('#!/bin/sh\necho "GROVE=$GROVE_API_KEY"\n', encoding="utf-8")
     (bindir / "probe-agent").chmod(0o755)
     shell = tmp_path / "fake-shell"
-    _fake_shell(shell, 'echo "GROVE_API_KEY=profile-secret"')
+    _fake_shell(shell, _env_listing("GROVE_API_KEY=profile-secret"))
     monkeypatch.setenv("SHELL", str(shell))
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     result = GenericAdapter(AgentSpec(name="probe", kind="generic", command="probe-agent {prompt}")).run(
