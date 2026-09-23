@@ -92,7 +92,7 @@ a task cycle (see [Work modes in the README](../../../README.md#work-modes) and
 | `implementer` | string | — (required) | The agent that implements; becomes the task's target when the handoff sets no explicit target |
 | `verifier` | string | omitted | Optional LLM verification gate turn; deterministic verification always runs first and can never be overridden by it |
 | `reviewer` | string | omitted | LLM review gate turn over the diff of requested changes |
-| `fixer` | string | `implementer` | Agent for auto-fix bounces after a failed gate |
+| `fixer` | string | the task's implementer | Agent for auto-fix bounces after a failed gate. When omitted, fixes go to the agent that implements the task: the handoff's explicit target if it names one, otherwise this preset's `implementer` |
 | `max_bounces` | integer ≥ 0 | `2` | Cap on auto-fix bounces; `0` parks on the first issue |
 
 Validation at load: `[modes]` must be a table of preset tables, each with an
@@ -129,6 +129,11 @@ table is an error. Entry keys:
 Standing entries are composed into every task at delegate time; per-task
 `[[context]]` handoff entries override them by label. Skill paths are checked
 at delegate time (missing directory or `SKILL.md` fails the delegation).
+When a turn starts, each skill is copied into the task directory. If the skill
+cannot be found or copied at that point, the turn still runs, and its context
+block says that the skill is unavailable and why. When two labels reduce to the
+same file name (for example `code review` and `code/review`), the later entry
+is staged under a numbered name, so neither copy overwrites the other.
 Precedence follows the config chain: a project's `[context.<label>]` table
 wins over the user-level one for that label. Validation at load is strict —
 invalid entries raise, like `[modes]`. `maestro config` lists every defined
@@ -215,8 +220,11 @@ Caps are per-daemon: set them in the environment where the daemon starts.
 
 - `MAESTRO_BUDGET_PER_AGENT_USD` — cumulative USD cap per agent name, across
   all tasks.
-- `MAESTRO_BUDGET_DAILY_USD` — cumulative USD cap across all agents for tasks
-  started today (UTC).
+- `MAESTRO_BUDGET_DAILY_USD` — cumulative USD cap across all agents for
+  attempts that finished today (UTC). Each attempt is dated by its own finish
+  time, so a follow-up turn today on a task started earlier counts toward
+  today's spend. An attempt recorded without a finish time is dated by the
+  task's start time.
 
 Spend is computed from attempt usage: each attempt records the usage its agent
 produced (`total_cost_usd`), so attribution is per agent and failed attempts

@@ -172,6 +172,31 @@ def _slug(label: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-") or "entry"
 
 
+def _staged_names(entries: list[ContextEntry]) -> list[str]:
+    """Give every entry a file-system name that no other entry shares.
+
+    Different labels can reduce to the same slug ("code review" and "code/review"
+    both become "code-review"), and one staged copy would then overwrite the
+    other. The first entry keeps the plain slug; each later clash gets a numeric
+    suffix. Names are compared without case, because the default macOS file
+    system treats "Review" and "review" as the same directory. The result is
+    parallel to ``entries`` and depends only on their order, so every phase of
+    a task stages an entry under the same name.
+    """
+    taken: set[str] = set()
+    names: list[str] = []
+    for entry in entries:
+        base = _slug(entry.label)
+        name = base
+        suffix = 2
+        while name.casefold() in taken:
+            name = f"{base}-{suffix}"
+            suffix += 1
+        taken.add(name.casefold())
+        names.append(name)
+    return names
+
+
 def _resolve_path(raw: str, workspace: Path) -> Path:
     path = Path(raw).expanduser()
     if not path.is_absolute():
@@ -179,8 +204,39 @@ def _resolve_path(raw: str, workspace: Path) -> Path:
     return path
 
 
-def _render_entry(entry: ContextEntry, workspace: Path, task_dir: Path) -> tuple[str, Path | None]:
-    """Render one entry into its prompt part; returns (part_text, staged_skill_path|None)."""
+def skill_problem(entry: ContextEntry, workspace: Path) -> str | None:
+    """Return why a skill entry cannot be used, or None when it can.
+
+    A relative path resolves against the task workspace, exactly as it does when
+    the skill is staged, so the check and the copy always look at the same place.
+    """
+    path = _resolve_path(entry.path or "", workspace)
+    if not path.is_dir():
+        return f"directory not found: {path}"
+    if not (path / "SKILL.md").is_file():
+        return f"no SKILL.md in {path}"
+    return None
+
+
+def check_skill_entries(entries: list[ContextEntry], workspace: Path) -> None:
+    """Delegate-time check (C4): raise ValueError for the first unusable skill entry.
+
+    Call this with the task workspace so that relative skill paths are checked
+    against the same directory that :func:`render_context` later copies from.
+    """
+    for entry in entries:
+        if entry.kind != "skill":
+            continue
+        problem = skill_problem(entry, workspace)
+        if problem is not None:
+            raise ValueError(f"Skill context {entry.label!r}: {problem}")
+
+
+def _render_entry(entry: ContextEntry, workspace: Path, task_dir: Path, name: str) -> tuple[str, Path | None]:
+    """Render one entry into its prompt part; returns (part_text, staged_skill_path|None).
+
+    ``name`` is the entry's unique staged name from :func:`_staged_names`.
+    """
     if entry.kind == "text":
         return f"[{entry.label}] ({entry.source})\n{entry.text}\n", None
     path = _resolve_path(entry.path or "", workspace)
@@ -192,15 +248,22 @@ def _render_entry(entry: ContextEntry, workspace: Path, task_dir: Path) -> tuple
         if len(data.encode("utf-8")) <= FILE_INLINE_LIMIT:
             return f"[{entry.label}] ({entry.source})\n{data}\n", None
         task_dir.mkdir(parents=True, exist_ok=True)
-        artifact = task_dir / f"context-{_slug(entry.label)}.txt"
+        artifact = task_dir / f"context-{name}.txt"
         artifact.write_text(data, encoding="utf-8")
         return f"[{entry.label}] ({entry.source})\n(file too large to inline; full content at {artifact})\n", None
     # skill: stage a hermetic copy (D2) under the Claude Code discovery layout.
-    skills_root = task_dir / "context" / "skills"
-    staged = skills_root / ".claude" / "skills" / _slug(entry.label)
-    if staged.exists():
-        shutil.rmtree(staged)  # re-renders (follow-ups) must see the current bytes
-    shutil.copytree(path, staged)
+    # A skill that is missing or cannot be copied degrades to a note (C3).
+    staged = task_dir / "context" / "skills" / ".claude" / "skills" / name
+    problem = skill_problem(entry, workspace)
+    if problem is None:
+        try:
+            if staged.exists():
+                shutil.rmtree(staged)  # re-renders (follow-ups) must see the current bytes
+            shutil.copytree(path, staged)
+        except OSError as exc:
+            problem = f"it could not be copied into the task directory: {exc}"
+    if problem is not None:
+        return f'Skill "{entry.label}" is unavailable ({problem}); continue without it.\n', None
     return f'Skill "{entry.label}" is available at {staged} — read its SKILL.md and follow it.\n', staged
 
 
@@ -219,14 +282,15 @@ def render_context(
     Entries that would push the rendered total past TOTAL_CONTEXT_LIMIT are dropped
     and listed in a trailing note (C3).
     """
-    applicable = [e for e in entries if phase in e.phases]
+    names = _staged_names(entries)
+    applicable = [(entry, name) for entry, name in zip(entries, names) if phase in entry.phases]
     user_parts: list[str] = []
     system_parts: list[str] = []
     skills_root: Path | None = None
     dropped: list[str] = []
     total = 0
-    for entry in applicable:
-        part, staged = _render_entry(entry, workspace, task_dir)
+    for entry, name in applicable:
+        part, staged = _render_entry(entry, workspace, task_dir, name)
         if staged is not None and skills_root is None:
             skills_root = task_dir / "context" / "skills"
         goes_system = adapter_kind == "claude_code" and entry.source != "handoff" and entry.kind != "skill"

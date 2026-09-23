@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orch
 4. **installs the global `maestro-driven-development` skill** into every
    detected agent, using each agent's own global instruction/skill mechanism
    (e.g. `~/.claude/skills/…` for Claude Code, a managed block in
-   `~/.codex/instructions.md` for Codex, a global rule for Cursor).
+   `~/.codex/AGENTS.md` for Codex, a global rule for Cursor).
 5. **starts the daemon in the background** (`maestro daemon start`) and
    verifies it is healthy before printing a summary of what it did.
 

@@ -111,8 +111,10 @@ def expand(preset: ModePreset, doc) -> object:
     document named a target explicitly (``doc.explicit_target``). Once the preset
     pins the implementer, the target counts as explicitly chosen (the user
     configured that mode), so downstream routing resolution must not second-guess
-    it. When the preset has no fixer, the fix slot defaults to the implementer
-    (safe default: no implicit expensive spend).
+    it. When the preset has no fixer, the fix slot defaults to the agent that
+    actually implements this task (``doc.target_agent`` after the step above),
+    which is the preset's implementer only when the document named no target.
+    That keeps fixes with the agent that wrote the code and adds no implicit spend.
     """
     if not doc.explicit_target:
         doc.target_agent = preset.implementer
@@ -122,7 +124,7 @@ def expand(preset: ModePreset, doc) -> object:
     if doc.verify_agent is None and preset.verifier is not None:
         doc.verify_agent = preset.verifier
     if doc.fix_agent is None:
-        doc.fix_agent = preset.fixer or preset.implementer
+        doc.fix_agent = preset.fixer or doc.target_agent
     if doc.max_bounces is None:
         doc.max_bounces = preset.max_bounces
     return doc

@@ -81,8 +81,14 @@ maestro agents add --name mytool --kind generic \
 ```
 
 - `{prompt}` in the command is replaced with the work order (title, request,
-  design, expectations). If your prompt is long or contains shell metacharacters,
-  pipe it instead: `--input-mode stdin` and drop `{prompt}` from the command.
+  design, expectations). `{workspace}` is replaced with the task workspace path
+  and `{task_id}` with the task id. Maestro first splits the command into
+  arguments with shell quoting rules, and then replaces each placeholder inside
+  the one argument that holds it. A value that contains spaces or quotes, such
+  as `/Users/me/My Projects/app`, therefore stays a single argument, and text
+  inside the prompt is never treated as a placeholder. No shell runs the
+  command. If your prompt is long, pipe it instead: `--input-mode stdin` and
+  drop `{prompt}` from the command.
 - `--output-format jsonl` makes Maestro parse `cost_usd` / usage hints from JSON
   lines automatically — this is how budget caps see costs for that agent.
   Other formats: `text` (default), `rpc`.

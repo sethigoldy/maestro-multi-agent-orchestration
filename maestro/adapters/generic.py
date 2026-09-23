@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 from pathlib import Path
 from typing import Any
 
 from ..agents import AgentSpec
 from .base import AdapterPreflight, BaseAdapter
+
+#: The placeholders a generic command template may use.
+_PLACEHOLDER_RE = re.compile(r"\{(prompt|workspace|task_id)\}")
 
 
 class GenericAdapter(BaseAdapter):
@@ -52,14 +56,24 @@ class GenericAdapter(BaseAdapter):
         return super().preflight()
 
     def build_command(self, prompt: str, workspace: Path, task_id: str, settings: dict[str, Any]) -> list[str]:
+        """Split the registry template into arguments, then fill placeholders.
+
+        The template is split with shell rules first, and each placeholder is
+        then replaced inside the single argument that holds it. Substituted
+        values are never split or re-scanned, so a workspace path with spaces or
+        an apostrophe stays one argument, and a prompt that happens to contain
+        the text ``{workspace}`` is passed through unchanged. In ``stdin`` mode
+        the prompt is piped, so ``{prompt}`` is left as written.
+        """
         assert self.spec is not None and self.spec.command
-        template = self.spec.command
-        if self.input_mode() == "stdin":
-            rendered = template.replace("{workspace}", str(workspace)).replace("{task_id}", task_id)
-        else:
-            # Quote the prompt so it survives shlex.split as a single argument.
-            rendered = template.replace("{prompt}", shlex.quote(prompt)).replace("{workspace}", shlex.quote(str(workspace))).replace("{task_id}", task_id)
-        return shlex.split(rendered)
+        try:
+            words = shlex.split(self.spec.command)
+        except ValueError as exc:
+            raise ValueError(f"Agent {self.spec.name!r} has an invalid command template ({exc}): {self.spec.command!r}") from exc
+        values = {"workspace": str(workspace), "task_id": task_id}
+        if self.input_mode() != "stdin":
+            values["prompt"] = prompt
+        return [_PLACEHOLDER_RE.sub(lambda match: values.get(match.group(1), match.group(0)), word) for word in words]
 
     def parse_line(self, line: str) -> dict[str, Any] | None:
         if self.spec is None or self.spec.output_format != "jsonl":

@@ -1,0 +1,620 @@
+"""Regression tests for library correctness fixes.
+
+Each test in this file reproduces one confirmed bug. They are grouped by the
+module that holds the fix, and each group names the bug it covers.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tomllib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+
+from maestro.adapters import ClineAdapter, CopilotAdapter, CursorAdapter, GenericAdapter, HermesAdapter, PiAdapter
+from maestro.agents import AgentRegistry, AgentSpec, _dump_toml, _toml_scalar
+
+
+# ---------------------------------------------------------------------------
+# Bug 1: a per-task model or effort override must beat the registry default.
+# The daemon merges the handoff override into ``settings``, so the adapters
+# must read ``settings`` first and fall back to the registry spec.
+# ---------------------------------------------------------------------------
+
+_OVERRIDE_ADAPTERS = [
+    (CopilotAdapter, "copilot", "--model"),
+    (CursorAdapter, "cursor", "--model"),
+    (HermesAdapter, "hermes", "-m"),
+    (ClineAdapter, "cline", "--model"),
+    (PiAdapter, "pi", "--model"),
+]
+
+
+@pytest.mark.parametrize("adapter_cls,kind,flag", _OVERRIDE_ADAPTERS)
+def test_task_model_override_beats_registry_model(tmp_path, adapter_cls, kind, flag):
+    adapter = adapter_cls(AgentSpec(name="a", kind=kind, model="registry-model"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {"model": "task-model"})
+    assert cmd[cmd.index(flag) + 1] == "task-model"
+    assert "registry-model" not in cmd
+
+
+@pytest.mark.parametrize("adapter_cls,kind,flag", _OVERRIDE_ADAPTERS)
+def test_registry_model_used_when_task_sets_none(tmp_path, adapter_cls, kind, flag):
+    adapter = adapter_cls(AgentSpec(name="a", kind=kind, model="registry-model"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {})
+    assert cmd[cmd.index(flag) + 1] == "registry-model"
+
+
+@pytest.mark.parametrize("adapter_cls,kind,flag", [(HermesAdapter, "hermes", "--reasoning"), (ClineAdapter, "cline", "--thinking")])
+def test_task_effort_override_beats_registry_effort(tmp_path, adapter_cls, kind, flag):
+    adapter = adapter_cls(AgentSpec(name="a", kind=kind, effort="low"))
+    cmd = adapter.build_command("do it", tmp_path, "t1", {"effort": "high"})
+    assert cmd[cmd.index(flag) + 1] == "high"
+    assert "low" not in cmd
+    fallback = adapter.build_command("do it", tmp_path, "t1", {})
+    assert fallback[fallback.index(flag) + 1] == "low"
+
+
+# ---------------------------------------------------------------------------
+# Bug 2: the generic command template must survive real paths and prompts.
+# ---------------------------------------------------------------------------
+
+def _generic(command: str, input_mode: str = "arg") -> GenericAdapter:
+    return GenericAdapter(AgentSpec(name="g", kind="generic", command=command, input_mode=input_mode))
+
+
+def test_generic_stdin_mode_keeps_workspace_with_spaces_as_one_argument():
+    adapter = _generic("mytool --dir {workspace} --id {task_id}", input_mode="stdin")
+    cmd = adapter.build_command("ignored", Path("/Users/me/My Projects/app"), "t1", {})
+    assert cmd == ["mytool", "--dir", "/Users/me/My Projects/app", "--id", "t1"]
+
+
+def test_generic_stdin_mode_accepts_workspace_with_apostrophe():
+    adapter = _generic("mytool --dir {workspace}", input_mode="stdin")
+    cmd = adapter.build_command("ignored", Path("/Users/me/it's here"), "t1", {})
+    assert cmd == ["mytool", "--dir", "/Users/me/it's here"]
+
+
+def test_generic_stdin_mode_leaves_prompt_placeholder_alone():
+    adapter = _generic("mytool {prompt}", input_mode="stdin")
+    assert adapter.build_command("the prompt", Path("/w"), "t1", {}) == ["mytool", "{prompt}"]
+
+
+def test_generic_arg_mode_does_not_substitute_inside_the_prompt():
+    adapter = _generic("mytool {prompt} --cwd {workspace} --id {task_id}")
+    prompt = "Edit the file in {workspace} for task {task_id}; keep 'quotes' and \"doubles\"."
+    cmd = adapter.build_command(prompt, Path("/w s"), "t1", {})
+    assert cmd == ["mytool", prompt, "--cwd", "/w s", "--id", "t1"]
+
+
+def test_generic_arg_mode_substitutes_placeholders_inside_an_argument():
+    adapter = _generic("mytool --prompt={prompt} --at='{workspace}/sub'")
+    cmd = adapter.build_command("hi there", Path("/a b"), "t1", {})
+    assert cmd == ["mytool", "--prompt=hi there", "--at=/a b/sub"]
+
+
+def test_generic_template_with_broken_quoting_raises_a_clear_error():
+    adapter = _generic("mytool 'unclosed {prompt}")
+    with pytest.raises(ValueError, match="command template"):
+        adapter.build_command("p", Path("/w"), "t1", {})
+
+
+def test_generic_binary_honours_shell_quoting():
+    assert _generic("'/opt/My Tools/agent' --flag {prompt}").binary() == "/opt/My Tools/agent"
+
+
+def test_generic_binary_with_broken_quoting_is_unknown():
+    adapter = _generic("'/opt/My Tools/agent --flag")
+    assert adapter.binary() is None
+    assert adapter.preflight().ok is False
+
+
+def test_generic_binary_of_a_blank_template_is_unknown():
+    assert _generic("   ").binary() is None
+
+
+def test_generic_template_run_with_spaced_workspace(tmp_path):
+    """End to end: a fake CLI receives the workspace as exactly one argument."""
+    bindir = tmp_path / "bin dir"
+    bindir.mkdir()
+    out = tmp_path / "args.txt"
+    tool = bindir / "tool"
+    tool.write_text(
+        '#!/bin/sh\n[ "$1" = "--go" ] || exit 0\nshift\nfor a in "$@"; do printf "%s\\n" "$a"; done > "' + str(out) + '"\n',
+        encoding="utf-8",
+    )
+    tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+    workspace = tmp_path / "My Projects" / "it's app"
+    workspace.mkdir(parents=True)
+    adapter = _generic(f"'{tool}' --go --dir {{workspace}}", input_mode="stdin")
+    result = adapter.run("the prompt", workspace, "t1", settings={}, timeout=30, log_dir=tmp_path / "logs")
+    assert result.ok, result.error
+    assert out.read_text(encoding="utf-8").splitlines() == ["--dir", str(workspace)]
+
+
+# ---------------------------------------------------------------------------
+# Bug 3: from_dict must reject wrong types with ValueError.
+# ---------------------------------------------------------------------------
+
+def _payload(**sections):
+    data = {"handoff": {"title": "t", "request": "r"}, "routing": {}, "expectations": {}, "constraints": {}}
+    for name, values in sections.items():
+        data.setdefault(name, {})
+        if isinstance(values, dict) and isinstance(data[name], dict):
+            data[name].update(values)
+        else:
+            data[name] = values
+    return data
+
+
+@pytest.mark.parametrize(
+    "section,key",
+    [("routing", "fallback"), ("handoff", "context_files"), ("expectations", "artifacts")],
+)
+def test_from_dict_rejects_a_plain_string_where_a_list_is_required(section, key):
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match=key):
+        from_dict(_payload(**{section: {key: "claude"}}))
+
+
+def test_from_dict_rejects_non_string_list_items():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="fallback"):
+        from_dict(_payload(routing={"fallback": ["claude", 3]}))
+
+
+def test_from_dict_null_max_depth_is_a_value_error():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="max_depth_remaining"):
+        from_dict(_payload(constraints={"max_depth_remaining": None}))
+    with pytest.raises(ValueError, match="max_depth_remaining"):
+        from_dict(_payload(constraints={"max_depth_remaining": "many"}))
+
+
+@pytest.mark.parametrize(
+    "key", ["mode", "target_agent", "origin_agent", "review_agent", "verify_agent", "fix_agent", "parent_task_id"]
+)
+def test_from_dict_rejects_non_string_routing_fields(key):
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match=key):
+        from_dict(_payload(routing={key: ["a", "b"]}))
+
+
+def test_from_dict_null_title_or_request_counts_as_missing():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="non-empty title"):
+        from_dict(_payload(handoff={"title": None}))
+    with pytest.raises(ValueError, match="non-empty request"):
+        from_dict(_payload(handoff={"request": None}))
+
+
+def test_from_dict_rejects_non_string_text_fields():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="design"):
+        from_dict(_payload(handoff={"design": {"a": 1}}))
+    with pytest.raises(ValueError, match="verification"):
+        from_dict(_payload(expectations={"verification": ["auto"]}))
+
+
+def test_from_dict_null_optional_text_fields_use_defaults():
+    from maestro.handoff import from_dict
+
+    doc = from_dict(_payload(handoff={"design": None, "context_notes": None}, routing={"target_agent": None, "fallback": None}))
+    assert doc.design == "" and doc.context_notes == "" and doc.target_agent == "codex" and doc.fallback == []
+
+
+def test_from_dict_rejects_wrong_container_types():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="context"):
+        from_dict(_payload(context="not a list"))
+    with pytest.raises(ValueError, match="agent_settings"):
+        from_dict(_payload(agent_settings=["model", "x"]))
+
+
+def test_from_dict_rejects_non_numeric_budget_hint():
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="budget_hint"):
+        from_dict(_payload(expectations={"budget_hint": [1]}))
+    with pytest.raises(ValueError, match="budget_hint"):
+        from_dict(_payload(expectations={"budget_hint": True}))
+    assert from_dict(_payload(expectations={"budget_hint": 2})).budget_hint == 2
+
+
+# ---------------------------------------------------------------------------
+# Bugs 4 and 5: skill context resolution, error handling and staged names.
+# ---------------------------------------------------------------------------
+
+def _skill_dir(path: Path, body: str = "skill body") -> Path:
+    path.mkdir(parents=True)
+    (path / "SKILL.md").write_text(body, encoding="utf-8")
+    return path
+
+
+def _ctx(label, kind, path=None, text=None):
+    from maestro.context import ContextEntry
+
+    return ContextEntry(label=label, kind=kind, text=text, path=path, source="handoff")
+
+
+def test_relative_skill_path_resolves_against_the_workspace_not_the_cwd(tmp_path, monkeypatch):
+    from maestro.context import check_skill_entries, render_context
+
+    cwd = tmp_path / "cwd"
+    _skill_dir(cwd / "skills" / "pdf")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.chdir(cwd)
+    entry = _ctx("pdf", "skill", path="skills/pdf")
+    # The delegate-time check and the render step agree: the skill is missing.
+    with pytest.raises(ValueError, match="directory not found"):
+        check_skill_entries([entry], workspace)
+    rendered = render_context([entry], "implementer", workspace, tmp_path / "task", "codex")
+    assert 'Skill "pdf" is unavailable' in rendered.block
+    assert rendered.skills_root is None
+    # Once the skill exists inside the workspace, both steps accept it.
+    _skill_dir(workspace / "skills" / "pdf")
+    check_skill_entries([entry], workspace)
+    rendered = render_context([entry], "implementer", workspace, tmp_path / "task", "codex")
+    assert 'Skill "pdf" is available at' in rendered.block
+
+
+def test_check_skill_entries_requires_skill_md_and_ignores_other_kinds(tmp_path):
+    from maestro.context import check_skill_entries
+
+    (tmp_path / "empty").mkdir()
+    check_skill_entries([_ctx("note", "text", text="hello")], tmp_path)
+    with pytest.raises(ValueError, match="no SKILL.md"):
+        check_skill_entries([_ctx("empty", "skill", path="empty")], tmp_path)
+
+
+def test_skill_copy_failure_degrades_to_a_note(tmp_path, monkeypatch):
+    from maestro import context
+    from maestro.context import render_context
+
+    skill = _skill_dir(tmp_path / "skill")
+
+    def broken_copytree(src, dst, *args, **kwargs):
+        raise PermissionError("permission denied")
+
+    monkeypatch.setattr(context.shutil, "copytree", broken_copytree)
+    rendered = render_context([_ctx("s", "skill", path=str(skill))], "implementer", tmp_path, tmp_path / "task", "codex")
+    assert 'Skill "s" is unavailable' in rendered.block and "permission denied" in rendered.block
+    assert rendered.skills_root is None
+
+
+def test_labels_with_the_same_slug_stage_separate_skills(tmp_path):
+    from maestro.context import render_context
+
+    first = _skill_dir(tmp_path / "one", "first skill")
+    second = _skill_dir(tmp_path / "two", "second skill")
+    entries = [_ctx("code review", "skill", path=str(first)), _ctx("code/review", "skill", path=str(second))]
+    rendered = render_context(entries, "implementer", tmp_path, tmp_path / "task", "codex")
+    staged = sorted((rendered.skills_root / ".claude" / "skills").iterdir())
+    assert len(staged) == 2
+    bodies = sorted((path / "SKILL.md").read_text(encoding="utf-8") for path in staged)
+    assert bodies == ["first skill", "second skill"]
+
+
+def test_labels_with_the_same_slug_keep_separate_large_file_artifacts(tmp_path):
+    from maestro.context import FILE_INLINE_LIMIT, render_context
+
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("A" * (FILE_INLINE_LIMIT + 1), encoding="utf-8")
+    b.write_text("B" * (FILE_INLINE_LIMIT + 1), encoding="utf-8")
+    entries = [_ctx("big file", "file", path=str(a)), _ctx("big/file", "file", path=str(b))]
+    task_dir = tmp_path / "task"
+    render_context(entries, "implementer", tmp_path, task_dir, "codex")
+    artifacts = sorted(task_dir.glob("context-*.txt"))
+    assert len(artifacts) == 2
+    assert sorted(p.read_text(encoding="utf-8")[0] for p in artifacts) == ["A", "B"]
+
+
+def test_staged_names_avoid_every_collision():
+    from maestro.context import _staged_names
+
+    labels = ["x y", "x-y-2", "x/y", "x-y", "X-Y"]
+    names = _staged_names([_ctx(label, "text", text="t") for label in labels])
+    # The first entry keeps the plain slug; every later clash gets a free suffix,
+    # and names that differ only in case also count as a clash.
+    assert names == ["x-y", "x-y-2", "x-y-3", "x-y-4", "X-Y-5"]
+
+
+# ---------------------------------------------------------------------------
+# Bug 6: daily spend follows each attempt's own finish time.
+# ---------------------------------------------------------------------------
+
+def test_daily_spend_counts_todays_attempt_on_an_older_task():
+    from maestro.budgets import check, BudgetCaps, daily_spend
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    yesterday = (now - timedelta(days=1)).isoformat()
+    record = {
+        "started_at": yesterday,
+        "attempts": [
+            {"agent": "codex", "usage": {"cost_usd": 1.0}, "finished_at": yesterday},
+            {"agent": "codex", "usage": {"cost_usd": 2.5}, "finished_at": now.isoformat()},
+        ],
+    }
+    assert daily_spend([record], now=now) == pytest.approx(2.5)
+    assert check(BudgetCaps(daily_usd=2.0), "codex", [record], now=now) is not None
+
+
+def test_daily_spend_ignores_yesterdays_attempt_on_a_task_started_today():
+    from maestro.budgets import daily_spend
+
+    now = datetime(2026, 9, 23, 0, 30, tzinfo=timezone.utc)
+    record = {
+        "started_at": now.isoformat(),
+        "attempts": [{"agent": "codex", "usage": {"cost_usd": 4.0}, "finished_at": "2026-09-22T23:59:00Z"}],
+    }
+    assert daily_spend([record], now=now) == 0.0
+
+
+def test_daily_spend_falls_back_to_task_start_without_finish_time():
+    from maestro.budgets import daily_spend
+
+    now = datetime(2026, 9, 23, 12, 0, tzinfo=timezone.utc)
+    records = [
+        {"started_at": now.isoformat(), "attempts": [{"agent": "a", "usage": {"cost_usd": 1.0}}]},
+        {"started_at": "2026-09-01T00:00:00+00:00", "attempts": [{"agent": "a", "usage": {"cost_usd": 9.0}, "finished_at": None}]},
+        {"started_at": "garbage", "attempts": [{"agent": "a", "usage": {"cost_usd": 5.0}, "finished_at": "also garbage"}]},
+        {"started_at": now.isoformat(), "attempts": ["not a dict", {"agent": "a", "usage": {"cost_usd": 0}}]},
+    ]
+    assert daily_spend(records, now=now) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Bug 7: the registry writer must emit valid TOML and never clobber a good file.
+# ---------------------------------------------------------------------------
+
+def test_toml_scalar_escapes_every_control_character():
+    nasty = "a\rb\x1b[0m\x00\x7f\tc\nd\"e\\f"
+    text = f"v = {_toml_scalar(nasty)}\n"
+    assert tomllib.loads(text)["v"] == nasty
+
+
+def test_dump_toml_quotes_keys_that_are_not_bare():
+    text = _dump_toml({"plain": 1, "agent_settings": {"my key": "v", "dotted.key": "w"}})
+    assert tomllib.loads(text)["agent_settings"] == {"my key": "v", "dotted.key": "w"}
+
+
+def test_registry_round_trips_control_characters(tmp_path):
+    registry = AgentRegistry(tmp_path)
+    spec = AgentSpec(name="odd", kind="codex", display_name="Odd\r\x1b[31mRed\x7f")
+    registry.save(spec)
+    loaded = registry.get("odd")
+    assert loaded is not None and loaded.display_name == "Odd\r\x1b[31mRed\x7f"
+    assert [s.name for s in registry.list()] == ["odd"]
+
+
+def test_registry_save_refuses_to_replace_a_good_file_with_invalid_toml(tmp_path, monkeypatch):
+    from maestro import agents
+
+    registry = AgentRegistry(tmp_path)
+    registry.save(AgentSpec(name="good", kind="codex", display_name="Good"))
+    before = (registry.dir / "good.toml").read_text(encoding="utf-8")
+    monkeypatch.setattr(agents, "_dump_toml", lambda data: 'name = "unterminated\n')
+    with pytest.raises(ValueError, match="invalid TOML"):
+        registry.save(AgentSpec(name="good", kind="codex", display_name="Changed"))
+    assert (registry.dir / "good.toml").read_text(encoding="utf-8") == before
+    assert sorted(p.name for p in registry.dir.iterdir()) == ["good.toml"]
+
+
+def test_registry_save_writes_owner_only_files(tmp_path):
+    registry = AgentRegistry(tmp_path)
+    registry.save(AgentSpec(name="secret", kind="codex", token="t0k"))
+    path = registry.dir / "secret.toml"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # a new entry is private
+    path.chmod(0o644)  # an entry written by an older version
+    registry.save(AgentSpec(name="secret", kind="codex", token="t0k2"))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600  # tightened on the next save
+    assert registry.get("secret").token == "t0k2"
+    assert sorted(p.name for p in registry.dir.iterdir()) == ["secret.toml"]
+
+
+def test_registry_save_cleans_up_when_the_write_fails(tmp_path, monkeypatch):
+    registry = AgentRegistry(tmp_path)
+
+    def broken_replace(src, dst):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", broken_replace)
+    with pytest.raises(OSError, match="disk full"):
+        registry.save(AgentSpec(name="x", kind="codex"))
+    assert list(registry.dir.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Bug 8: integrations must upgrade stale blocks and write where Codex reads.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def fake_home(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("MAESTRO_HOME", str(tmp_path / "maestro-home"))
+    return home
+
+
+def test_openhands_reinstall_replaces_the_old_block(fake_home):
+    from maestro.integrations import INTEGRATIONS
+
+    integration = INTEGRATIONS["openhands"]()
+    path = fake_home / ".openhands" / "agent_settings.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"custom_instructions": "Mine first."}), encoding="utf-8")
+    assert integration.install_skill(fake_home, "old skill text").action == "installed"
+    result = integration.install_skill(fake_home, "new skill text")
+    assert result.ok and result.action == "already-installed"
+    text = json.loads(path.read_text(encoding="utf-8"))["custom_instructions"]
+    assert "new skill text" in text and "old skill text" not in text
+    assert text.startswith("Mine first.") and text.count("maestro-driven-development:begin") == 1
+
+
+def test_codex_skill_goes_to_agents_md(fake_home):
+    from maestro.integrations import INTEGRATIONS
+
+    integration = INTEGRATIONS["codex"]()
+    result = integration.install_skill(fake_home, "skill text")
+    assert result.ok and result.path == str(fake_home / ".codex" / "AGENTS.md")
+    assert "skill text" in (fake_home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+    assert integration.status(fake_home)["installed"] is True
+
+
+def test_codex_install_moves_a_legacy_block_out_of_instructions_md(fake_home):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_text(f"My notes.\n\n{_managed_block('old text')}\n", encoding="utf-8")
+    integration = INTEGRATIONS["codex"]()
+    assert integration.status(fake_home)["installed"] is False
+    assert integration.status(fake_home)["legacy_installed"] is True
+    integration.install_skill(fake_home, "new text")
+    assert legacy.read_text(encoding="utf-8") == "My notes.\n"
+    assert integration.status(fake_home)["legacy_installed"] is False
+
+
+def test_codex_install_deletes_a_legacy_file_that_only_held_the_block(fake_home):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_text(_managed_block("old") + "\n", encoding="utf-8")
+    INTEGRATIONS["codex"]().install_skill(fake_home, "new")
+    assert not legacy.exists()
+
+
+def test_codex_uninstall_removes_the_legacy_block_too(fake_home):
+    from maestro.integrations import INTEGRATIONS, SkillManager, _managed_block
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_text(_managed_block("old") + "\n", encoding="utf-8")
+    results = SkillManager(home=fake_home).uninstall()
+    assert [(r.kind, r.action) for r in results] == [("codex", "uninstalled")]
+    assert not legacy.exists()
+    # With nothing left anywhere, uninstall reports a skip.
+    assert INTEGRATIONS["codex"]().uninstall_skill(fake_home).action == "skipped"
+
+
+def test_codex_uninstall_removes_both_blocks(fake_home):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    integration = INTEGRATIONS["codex"]()
+    integration.install_skill(fake_home, "new")
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.write_text(_managed_block("old") + "\n", encoding="utf-8")
+    result = integration.uninstall_skill(fake_home)
+    assert result.ok and result.action == "uninstalled"
+    assert not legacy.exists() and not (fake_home / ".codex" / "AGENTS.md").exists()
+
+
+def test_codex_legacy_cleanup_error_is_reported(fake_home, monkeypatch):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_text(_managed_block("old") + "\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def guarded_unlink(self, *args, **kwargs):
+        if self == legacy:
+            raise OSError("read-only")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+    result = INTEGRATIONS["codex"]().install_skill(fake_home, "new")
+    assert result.ok is False and result.action == "error" and "read-only" in result.detail
+
+
+def test_codex_legacy_unreadable_file_is_not_reported_installed(fake_home):
+    from maestro.integrations import INTEGRATIONS
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_bytes(b"\xff\xfe not utf-8")
+    assert INTEGRATIONS["codex"]().status(fake_home)["legacy_installed"] is False
+
+
+def test_codex_legacy_read_error_is_not_reported_installed(fake_home, monkeypatch):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.parent.mkdir()
+    legacy.write_text(_managed_block("old"), encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == legacy:
+            raise PermissionError("no access")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    assert INTEGRATIONS["codex"]().status(fake_home)["legacy_installed"] is False
+
+
+def test_codex_uninstall_reports_a_legacy_cleanup_error(fake_home, monkeypatch):
+    from maestro.integrations import INTEGRATIONS, _managed_block
+
+    integration = INTEGRATIONS["codex"]()
+    integration.install_skill(fake_home, "new")
+    legacy = fake_home / ".codex" / "instructions.md"
+    legacy.write_text(_managed_block("old") + "\n", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def guarded_unlink(self, *args, **kwargs):
+        if self == legacy:
+            raise OSError("read-only")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+    result = integration.uninstall_skill(fake_home)
+    assert result.ok is False and result.action == "error" and result.path == str(legacy)
+    assert not (fake_home / ".codex" / "AGENTS.md").exists()
+
+
+def test_codex_uninstall_passes_through_a_read_error(fake_home, monkeypatch):
+    from maestro.integrations import INTEGRATIONS
+
+    agents_md = fake_home / ".codex" / "AGENTS.md"
+    agents_md.parent.mkdir()
+    agents_md.write_text("mine", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == agents_md:
+            raise PermissionError("no access")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    result = INTEGRATIONS["codex"]().uninstall_skill(fake_home)
+    assert result.ok is False and result.action == "error" and "no access" in result.detail
+
+
+# ---------------------------------------------------------------------------
+# Bug 9: without a preset fixer, fixes go to the task's actual implementer.
+# ---------------------------------------------------------------------------
+
+def test_fixer_defaults_to_the_explicit_target_not_the_preset_implementer():
+    from maestro.handoff import HandoffDoc
+    from maestro.modes import ModePreset, expand
+
+    preset = ModePreset(name="cheap", implementer="codex-mini", reviewer="reviewer")
+    doc = HandoffDoc(title="t", request="r", target_agent="claude", explicit_target=True)
+    expand(preset, doc)
+    assert doc.target_agent == "claude" and doc.fix_agent == "claude"

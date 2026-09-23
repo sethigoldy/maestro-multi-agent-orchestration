@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 
@@ -107,22 +107,40 @@ def spent_by_agent(records: list[dict[str, Any]]) -> dict[str, float]:
     return totals
 
 
+def _utc_date(raw: Any) -> date | None:
+    """UTC calendar date of an ISO timestamp, or None when it cannot be parsed.
+
+    A timestamp without a zone is taken to be UTC.
+    """
+    try:
+        moment = datetime.fromisoformat(str(raw or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).date()
+
+
 def daily_spend(records: list[dict[str, Any]], now: datetime | None = None) -> float:
-    """Total cost of attempts whose task started today (UTC)."""
+    """Total cost of the attempts that finished today (UTC).
+
+    Each attempt is dated by its own ``finished_at`` time, so money spent today
+    by a follow-up on an older task counts toward today's cap. An attempt with
+    no usable finish time falls back to the task's ``started_at`` time, which is
+    how records written before attempts carried a timestamp are dated.
+    """
     now = now or datetime.now(timezone.utc)
     today = now.date()
     total = 0.0
     for record in records:
-        started_at = str(record.get("started_at") or "")
-        try:
-            started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        if started.astimezone(timezone.utc).date() != today:
-            continue
-        total += sum(cost for _, cost in attempt_costs(record))
+        task_date = _utc_date(record.get("started_at"))
+        for attempt in record.get("attempts") or []:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_date = _utc_date(attempt.get("finished_at")) or task_date
+            cost = cost_of(attempt.get("usage"))
+            if attempt_date == today and cost > 0:
+                total += cost
     return total
 
 
