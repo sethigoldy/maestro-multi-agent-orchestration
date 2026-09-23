@@ -108,7 +108,7 @@ def agents_list() -> str:
     out = []
     for spec in d.registry.list():
         status = d.registry.status(spec.name)
-        out.append({**spec.to_dict(), "status": status})
+        out.append({**spec.to_dict(redact=True), "status": status})
     return json.dumps(out, indent=2)
 
 

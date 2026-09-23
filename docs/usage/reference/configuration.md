@@ -189,6 +189,7 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for CLI task commands; an empty value scopes to the home directory |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Daemon endpoint for CLI daemon commands (e.g. another machine's) |
 | `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that endpoint; also the stable token a daemon uses when it generates one on a non-loopback bind |
+| `MAESTRO_DAEMON_ALLOWED_ORIGINS` | — | Comma-separated browser origins (`scheme://host[:port]`) that may POST to the daemon besides its own address, such as a reverse proxy's public address. `maestro-daemon --allow-origin` replaces it when given. An invalid entry stops the daemon from starting |
 | `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before moving to the next fallback (total attempts = 1 + N) |
 | `MAESTRO_BACKOFF_S` | `1.0` | Base seconds between retries; delay is linear: base × (attempt + 1) |
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP `delegate`/`followup` tools block for a task |

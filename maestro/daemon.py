@@ -8,6 +8,7 @@ SSE). Everything is event-driven: consumers wait on the bus, nothing polls.
 
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import re
@@ -36,7 +37,7 @@ from .a2a import (
     sse_encode,
 )
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
-from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec
+from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
 from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
 from .context import RenderedContext, compose_context, entry_from_dict, render_context
 from .core import Maestro, maestro_user_dir
@@ -286,7 +287,11 @@ class MaestroDaemon:
         bind: str = "127.0.0.1",
         max_retries: int | None = None,
         backoff_s: float | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> None:
+        # Browser origins, besides the daemon's own, that may POST to it (a
+        # reverse proxy's public address). None reads MAESTRO_DAEMON_ALLOWED_ORIGINS.
+        self.allowed_origins = frozenset(_normalize_origin(o) for o in (_allowed_origins_from_env() if allowed_origins is None else allowed_origins))
         self.state_dir = Path(state_dir).expanduser() if state_dir else maestro_user_dir()
         # Pin Maestro's user-level state (claims/registry) to this daemon's state
         # directory so the daemon is the single source of truth for its state.
@@ -356,7 +361,7 @@ class MaestroDaemon:
         marker: dict[str, Any] = {"pid": os.getpid(), "port": self.port, "host": self.local_host, "started_at": utcnow_iso()}
         if self.token is not None:
             marker["token"] = self.token
-        (self.state_dir / "daemon.json").write_text(json.dumps(marker, indent=2), encoding="utf-8")
+        _write_private(self.state_dir / "daemon.json", json.dumps(marker, indent=2))
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         thread.start()
         # P2P presence: announce over UDP so other Maestro nodes find us.
@@ -1838,6 +1843,35 @@ def record_transcript_answer(record: dict[str, Any] | None, answer: str) -> None
             break
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _host_name(value: str) -> str:
+    """The host part of a Host header or an Origin's netloc, without the port."""
+    value = value.strip().lower()
+    if value.startswith("["):  # [::1]:8790
+        return value[1:value.find("]")] if "]" in value else value
+    return value.rsplit(":", 1)[0] if value.count(":") == 1 else value
+
+
+def _normalize_origin(value: str) -> str:
+    """An allowed origin as a browser sends it: ``scheme://host[:port]``, lower case.
+
+    Raises ValueError for anything else, so a typo fails at daemon start
+    instead of silently refusing the proxy's requests.
+    """
+    parts = urlsplit(value.strip())
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc or parts.path not in ("", "/") or parts.query or parts.fragment:
+        raise ValueError(f"Invalid allowed origin {value!r}: expected scheme://host[:port], for example https://maestro.example.com")
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def _allowed_origins_from_env() -> list[str]:
+    """``MAESTRO_DAEMON_ALLOWED_ORIGINS``: a comma-separated list of origins."""
+    raw = os.environ.get("MAESTRO_DAEMON_ALLOWED_ORIGINS", "")
+    return [item for item in (part.strip() for part in raw.split(",")) if item]
+
+
 def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
     dispatcher = A2ADispatcher(daemon)
 
@@ -1851,16 +1885,57 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             Accepts the ``Authorization: Bearer <token>`` header or a
             ``?token=`` query parameter — EventSource (used by the web console
             and terminal dashboards) cannot set custom headers. Static console
-            assets are public; every data/mutation endpoint is gated.
+            assets are public; every data/mutation endpoint is gated. Tokens
+            are compared in constant time.
             """
             if daemon.token is None:
                 return True
-            expected = daemon.token
+            expected = daemon.token.encode("utf-8")
             header = self.headers.get("Authorization", "")
-            if header.startswith("Bearer ") and header[len("Bearer "):].strip() == expected:
+            if header.startswith("Bearer ") and hmac.compare_digest(header[len("Bearer "):].strip().encode("utf-8"), expected):
                 return True
             query = parse_qs(urlsplit(self.path).query)
-            return bool(query.get("token")) and query["token"][0] == expected
+            return bool(query.get("token")) and hmac.compare_digest(query["token"][0].encode("utf-8"), expected)
+
+        def _host_allowed(self) -> bool:
+            """Refuse requests addressed to a name other than this machine.
+
+            A loopback daemon has no token, so the Host header is what stops a
+            DNS-rebinding web page: the page's own domain, re-pointed at
+            127.0.0.1, would otherwise read tasks and live agent output. Only
+            loopback names are accepted there. A daemon with a token is reached
+            by LAN addresses and host names that cannot be listed in advance,
+            and the token already protects it, so any Host is accepted.
+            """
+            if daemon.token is not None:
+                return True
+            host = self.headers.get("Host")
+            return host is None or _host_name(host) in _LOOPBACK_HOSTS
+
+        def _post_allowed(self) -> str | None:
+            """Why a POST must be refused, or None when it may proceed.
+
+            A web page can send a cross-site POST without asking first only
+            when its Content-Type is a plain form or text type, so requiring
+            application/json forces the browser to ask (a CORS preflight),
+            which this server never approves. A request that carries an Origin
+            header must also come from exactly this server: the origin's host
+            and port must equal the Host header. Behind a reverse proxy that
+            rewrites Host, the proxy's public origin must be listed in
+            ``daemon.allowed_origins``. A request with no Origin header comes
+            from a program, not a web page, and is not checked.
+            """
+            content_type = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return "Content-Type must be application/json"
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return None
+            if urlsplit(origin).netloc.lower() == (self.headers.get("Host") or "").strip().lower():
+                return None
+            if origin.strip().lower() in daemon.allowed_origins:
+                return None
+            return "cross-origin requests are not allowed"
 
         def _send_json(self, code: int, obj: dict[str, Any]) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -1872,6 +1947,9 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
+            if not self._host_allowed():
+                self._send_json(403, {"error": "forbidden host"})
+                return
             if path in ("/", "/index.html", "/console.js"):
                 from .dashboard import console_asset
 
@@ -1927,8 +2005,15 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             if urlsplit(self.path).path != "/":
                 self._send_json(404, {"error": "not found"})
                 return
+            if not self._host_allowed():
+                self._send_json(403, {"error": "forbidden host"})
+                return
             if not self._authorized():
                 self._send_json(401, {"error": "unauthorized"})
+                return
+            refusal = self._post_allowed()
+            if refusal is not None:
+                self._send_json(403, {"error": refusal})
                 return
             try:
                 length = int(self.headers.get("Content-Length") or 0)

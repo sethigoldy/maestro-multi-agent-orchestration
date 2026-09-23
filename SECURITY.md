@@ -45,11 +45,49 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
 
 - The daemon **binds to loopback (`127.0.0.1`) by default** and requires no
   token on loopback. Nothing listens on your LAN unless you ask for it.
+- A web page open in your browser can also reach `127.0.0.1`, so a loopback
+  daemon refuses requests that a browser page could send:
+  - A request whose `Host` header is not `127.0.0.1`, `localhost` or `::1` is
+    refused with 403. This stops a DNS-rebinding page, whose own domain has
+    been pointed at 127.0.0.1, from reading tasks or live agent output.
+  - A POST must have `Content-Type: application/json`. A browser can only send
+    that cross-site after asking the server first (a CORS preflight), and the
+    daemon never agrees, so a page cannot submit work to it.
+  - A POST that carries an `Origin` header is refused with 403 unless it
+    comes from exactly this daemon's own address: the host and port in the
+    `Origin` must be the same as the request's `Host` header. This is an
+    exact-origin rule, not a same-site rule, so another port on the same
+    machine counts as a different origin. A POST with no `Origin` header comes
+    from a program rather than a web page (the CLI, the MCP server, `curl`)
+    and is not checked.
+  - Behind a reverse proxy that changes the `Host` header to the daemon's own
+    address, the page's `Origin` (the proxy's public address) no longer
+    matches, so browser POSTs through the proxy are refused. List the proxy's
+    public origin with `maestro-daemon --allow-origin https://maestro.example.com`
+    (repeat the option for more than one) or in the
+    `MAESTRO_DAEMON_ALLOWED_ORIGINS` environment variable, as a comma-separated
+    list. The environment variable also covers a daemon started by
+    `maestro daemon start` or by the MCP server. Each entry must be written
+    the way a browser sends it, `scheme://host[:port]`; an invalid entry stops
+    the daemon from starting. A loopback daemon still checks the `Host`
+    header, so the proxy must send `Host: 127.0.0.1:<port>` (or `localhost`),
+    which is what a proxy that rewrites `Host` to its upstream address does.
 - Binding a non-loopback address (e.g. `--host 0.0.0.0` or an explicit IP)
   **always requires a bearer token**: either `MAESTRO_DAEMON_TOKEN` (stable
   across restarts) or an auto-generated one written to the local
-  `$MAESTRO_HOME/daemon.json` marker. The API is not designed for public
-  exposure; put it behind your own authentication if you must.
+  `$MAESTRO_HOME/daemon.json` marker. The token is compared in constant time.
+  The API is not designed for public exposure; put it behind your own
+  authentication if you must.
+- Files that can hold a token are readable by their owner only (mode 0600):
+  the `daemon.json` marker and each agent registry entry under
+  `$MAESTRO_HOME/agents/`. Maestro never rewrites these files in place. It
+  writes a new file with mode 0600 and moves it over the old one, so a
+  process that opened an older, world-readable copy cannot read the new
+  token through that open handle. Registry entries written by older versions
+  with a wider mode are set to 0600 whenever the registry is loaded; an entry
+  that the current user cannot change (for example one owned by another
+  user) is left as it is. `maestro agents list`, `maestro agents add` and the
+  MCP `agents_list` tool show a stored token as `<redacted>`.
 - The web console served by the daemon respects the same token: loopback needs
   none, remote access does.
 
@@ -63,6 +101,10 @@ data (and note that `maestro doctor` output includes paths but no task content).
 ## Security-relevant behavior we commit to
 
 - Loopback-only binding by default; token required for any non-loopback bind.
+- A loopback daemon refuses foreign `Host` headers, non-JSON POSTs and
+  POSTs from any browser origin other than its own address or an origin you
+  listed with `--allow-origin` or `MAESTRO_DAEMON_ALLOWED_ORIGINS`, so a web
+  page cannot drive it.
 - Read-only diagnostics: `maestro doctor` never mutates state or runs agents'
   work (its agent probes run version checks only).
 - No network calls from the core library beyond what you configure (agent CLIs,

@@ -36,7 +36,7 @@ are authorized automatically.
 ## maestro-daemon
 
 ```text
-maestro-daemon [--port N] [--bind IF] [--state-dir DIR]
+maestro-daemon [--port N] [--bind IF] [--state-dir DIR] [--allow-origin ORIGIN ...]
 ```
 
 Starts the broker daemon and blocks until SIGINT/SIGTERM. Prints one JSON line
@@ -48,6 +48,7 @@ when authentication is enabled.
 | `--port N` | `0` | Port to bind; `0` picks a free port |
 | `--bind IF` | `127.0.0.1` | Listen interface. `127.0.0.1` (loopback, no token), `0.0.0.0`/`::` (all interfaces — token auth enabled, primary LAN IP advertised), or an explicit IP (advertised and dialed as-is; token auth enabled) |
 | `--state-dir DIR` | `~/.maestro` or `$MAESTRO_HOME` | State directory for this daemon |
+| `--allow-origin ORIGIN` | `$MAESTRO_DAEMON_ALLOWED_ORIGINS` | A browser origin, written `scheme://host[:port]`, that may POST to the daemon besides the daemon's own address. Use it for the public address of a reverse proxy. Repeat the option for more than one origin. When given, it replaces the environment variable's list. An invalid origin stops the daemon from starting |
 
 ## maestro daemon
 
