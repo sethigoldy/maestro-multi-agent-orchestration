@@ -9,13 +9,17 @@ claim of every task.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -164,11 +168,20 @@ def test_registry_that_is_not_a_list_or_unreadable(home, tmp_path, monkeypatch):
 
         def failing_read(self, *a, **k):
             if self == m.index_path:
-                raise OSError("unreadable")
+                raise OSError(errno.EMFILE, "Too many open files")
             return real_read(self, *a, **k)
 
+        before = m.index_path.read_bytes()
+        set_aside = sorted(home.glob("registry.corrupt-*.json"))  # the "not a list" file above
         monkeypatch.setattr(Path, "read_text", failing_read)
-        assert [x["task_id"] for x in m._registry_records()] == ["task-a", "task-b"]
+        # A file that exists but cannot be read right now is not missing and not
+        # damaged: nothing is rebuilt, moved or overwritten.
+        with pytest.raises(OSError, match="Could not read the task registry"):
+            m._registry_records()
+        with pytest.raises(OSError, match="Could not read the task registry"):
+            m._write_registry_record(m._registry_record("task-c", 3, "c"))
+        assert m.index_path.read_bytes() == before
+        assert sorted(home.glob("registry.corrupt-*.json")) == set_aside
     finally:
         m.close()
 
@@ -179,11 +192,12 @@ def test_a_missing_registry_is_rebuilt_from_claims(home, tmp_path):
     m = Maestro(home)
     try:
         _register(m, "task-a", "a", ws)
-        m._write_claim("task-weird", "task_number", "not-a-number")  # skipped
+        m._write_claim("task-weird", "task_number", "not-a-number")  # kept, with a fresh number
         m._write_claim("task-gone", "task_number", "7")  # no workspace claim
         m.index_path.unlink()
         records = {x["task_id"]: x for x in m._registry_records()}
-        assert set(records) == {"task-a", "task-gone"}
+        assert set(records) == {"task-a", "task-gone", "task-weird"}
+        assert records["task-weird"]["number"] == 8  # after task-gone's 7
         assert records["task-a"]["project_root"] == str(ws.resolve()) or records["task-a"]["project_root"] == str(ws)
         assert records["task-gone"]["workspace"] == ""
     finally:
@@ -279,3 +293,289 @@ def test_task_list_reads_the_journal_once(home, tmp_path, monkeypatch):
         assert time.monotonic() - started < 10
     finally:
         m.close()
+
+
+# ------------------------------------------------------------ review fixes
+def test_a_reader_does_not_move_aside_a_registry_another_process_just_repaired(home, tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    try:
+        _register(m, "task-a", "a", ws)
+        good = m.index_path.read_text(encoding="utf-8")
+        m.index_path.write_text("[{broken", encoding="utf-8")
+        real_read = Path.read_text
+        reads: list[int] = []
+
+        def repaired_right_after_the_first_read(self, *a, **k):
+            text = real_read(self, *a, **k)
+            if self == m.index_path and not reads:
+                reads.append(1)
+                self.write_text(good, encoding="utf-8")  # another process repairs it now
+            return text
+
+        monkeypatch.setattr(Path, "read_text", repaired_right_after_the_first_read)
+        assert [x["task_id"] for x in m._registry_records()] == ["task-a"]
+        assert not list(home.glob("registry.corrupt-*.json")), "the repaired file was moved away"
+        assert json.loads(real_read(m.index_path, encoding="utf-8"))[0]["task_id"] == "task-a"
+    finally:
+        m.close()
+
+
+def test_the_move_aside_waits_for_the_registry_lock(home, tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    other = Maestro(home)
+    try:
+        _register(m, "task-a", "a", ws)
+        good = m.index_path.read_text(encoding="utf-8")
+        m.index_path.write_text("[{broken", encoding="utf-8")
+        result: dict[str, list[str]] = {}
+
+        def read_registry():
+            result["ids"] = [x["task_id"] for x in m._registry_records()]
+
+        with other._task_lock():
+            reader = threading.Thread(target=read_registry)
+            reader.start()
+            time.sleep(0.3)  # the reader has seen the damaged file and waits for the lock
+            assert not list(home.glob("registry.corrupt-*.json"))
+            m.index_path.write_text(good, encoding="utf-8")  # the lock holder repairs it
+        reader.join()
+        assert result["ids"] == ["task-a"]
+        assert not list(home.glob("registry.corrupt-*.json"))
+    finally:
+        m.close()
+        other.close()
+
+
+def test_a_missing_registry_is_saved_after_the_rebuild(home, tmp_path, monkeypatch):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    try:
+        _register(m, "task-a", "a", ws)
+        _register(m, "task-b", "b", ws)
+        m.index_path.unlink()
+        rebuilds: list[int] = []
+        real_rebuild = Maestro._index_from_claims
+        monkeypatch.setattr(Maestro, "_index_from_claims", lambda self: rebuilds.append(1) or real_rebuild(self))
+        assert [x["task_id"] for x in m.list_tasks()] == ["task-a", "task-b"]
+        assert [x["task_id"] for x in m.list_tasks()] == ["task-a", "task-b"]
+        assert len(rebuilds) == 1  # the second listing reads the saved registry
+        assert [x["task_id"] for x in json.loads(m.index_path.read_text(encoding="utf-8"))] == ["task-a", "task-b"]
+    finally:
+        m.close()
+
+
+def test_the_rebuild_keeps_tasks_without_a_number_and_their_creation_time(home, tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    try:
+        numbered = "task-20260101-120000-aaaaaa"
+        _register(m, numbered, "numbered", ws)
+        (home / "task-counter").write_text("5", encoding="utf-8")  # numbers 2..5 were given out and gc'd
+        unnumbered = "task-20260102-130000-bbbbbb"
+        m._write_claim(unnumbered, "task_status", "WORKING")
+        m._write_claim(unnumbered, "task_title", "no number yet")
+        m._write_claim("task-folder", "task_status", "COMPLETE")
+        folder = home / "tasks" / "task-folder"
+        folder.mkdir(parents=True)
+        os.utime(folder, (1_700_000_000, 1_700_000_000))
+        m._write_claim("task-bare", "task_status", "COMPLETE")
+        m.mem.add("an event, not a task")  # other subjects in the journal are ignored
+        m.index_path.unlink()
+
+        records = {x["task_id"]: x for x in m._registry_records()}
+        assert {k: v["number"] for k, v in records.items()} == {numbered: 1, unnumbered: 6, "task-bare": 7, "task-folder": 8}
+        assert records[numbered]["created_at"] == datetime(2026, 1, 1, 12, 0, 0).astimezone(timezone.utc).isoformat()
+        assert records[unnumbered]["title"] == "no number yet"
+        assert records["task-folder"]["created_at"] == datetime.fromtimestamp(1_700_000_000, tz=timezone.utc).isoformat()
+        assert records["task-bare"]["created_at"] is None
+        # The fresh number is saved as a claim, so a second rebuild gives the same number.
+        assert m.mem.history(m._subject(unnumbered), "task_number")[-1].object == "6"
+        assert m._new_task_number() == 9
+    finally:
+        m.close()
+
+
+def test_legacy_journal_import_uses_the_counter_and_the_registry_lock(home, tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    (project / ".maestro").mkdir(parents=True)
+    tid = "task-20250101-000000-abcdef"
+    unnumbered = "task-20250102-000000-fedcba"
+    events = [
+        {"kind": "registry", "record": {"number": 4, "task_id": tid, "title": "legacy", "workspace": str(project)}},
+        {"kind": "claim", "task_id": unnumbered, "predicate": "task_status", "value": "COMPLETE"},  # no legacy number
+    ]
+    (project / ".maestro" / "project-state.jsonl").write_text("".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+    (home / "task-counter").write_text("10", encoding="utf-8")  # 1..10 were given out, then gc'd
+    held = [0]
+    locked_writes: list[bool] = []
+    real_lock = Maestro._task_lock
+    real_write = Maestro._write_registry_record
+
+    @contextmanager
+    def counting_lock(self):
+        with real_lock(self):
+            held[0] += 1
+            try:
+                yield
+            finally:
+                held[0] -= 1
+
+    monkeypatch.setattr(Maestro, "_task_lock", counting_lock)
+    monkeypatch.setattr(Maestro, "_write_registry_record", lambda self, record: locked_writes.append(held[0] > 0) or real_write(self, record))
+    m = Maestro(project)
+    try:
+        assert [(x["task_id"], x["number"], x["legacy_task_number"]) for x in m._registry_records()] == [(tid, 11, 4), (unnumbered, 12, None)]
+        assert locked_writes == [True, True]
+        m.index_path.unlink()  # the rebuild keeps the legacy number too
+        assert [(x["number"], x.get("legacy_task_number")) for x in m._registry_records()] == [(11, 4), (12, None)]
+        m._write_claim("task-odd", "task_legacy_number", "not json")
+        m.index_path.unlink()
+        assert {x["task_id"]: x.get("legacy_task_number") for x in m._registry_records()}["task-odd"] == "not json"
+    finally:
+        m.close()
+
+
+def test_the_parse_cache_notices_an_in_place_rewrite_with_the_same_size_and_mtime(home):
+    state = _FileState(home)
+    state.remember("s", "p", "a")
+    assert [c.object for c in state.history("s", "p")] == ["a"]
+    before = state.path.stat()
+    text = state.path.read_text(encoding="utf-8").replace('"object": "a"', '"object": "b"')
+    with state.path.open("r+", encoding="utf-8") as fh:  # same inode, same size
+        fh.write(text)
+    os.utime(state.path, ns=(before.st_atime_ns, before.st_mtime_ns))  # same mtime
+    assert [c.object for c in state.history("s", "p")] == ["b"]
+
+
+def test_the_parse_cache_checks_content_when_every_stat_field_collides(home, monkeypatch):
+    # On ext4 an inode number is reused and timestamps can be coarse, so a new
+    # journal of the same size can report exactly the same stat values.
+    state = _FileState(home)
+    state.remember("s", "p", "a")
+    frozen = SimpleNamespace(st_ino=7, st_size=state.path.stat().st_size, st_mtime_ns=1, st_ctime_ns=1)
+    real_stat = os.stat
+    monkeypatch.setattr(core.os, "stat", lambda p, *a, **k: frozen if str(p) == str(state.path) else real_stat(p, *a, **k))
+    monkeypatch.setattr(core.os, "fstat", lambda fd: frozen)
+    assert [c.object for c in state.history("s", "p")] == ["a"]
+    state.path.write_text(state.path.read_text(encoding="utf-8").replace('"object": "a"', '"object": "b"'), encoding="utf-8")
+    assert [c.object for c in state.history("s", "p")] == ["b"]
+
+
+def test_a_lock_that_cannot_be_taken_warns_once(tmp_path, monkeypatch, capsys):
+    import fcntl
+
+    monkeypatch.setattr(core, "_LOCK_WARNED", set(), raising=False)
+    monkeypatch.setattr(fcntl, "flock", lambda *a: (_ for _ in ()).throw(OSError(errno.ENOLCK, "No locks available")))
+    lock = tmp_path / "state.lock"
+    with core._file_lock(lock):
+        pass
+    with core._file_lock(lock):
+        pass
+    err = capsys.readouterr().err
+    assert err.count(str(lock)) == 1
+    assert "not locked" in err and "No locks available" in err
+    monkeypatch.setitem(sys.modules, "fcntl", None)  # Windows: no fcntl module
+    other = tmp_path / "registry.lock"
+    with core._file_lock(other):
+        pass
+    assert str(other) in capsys.readouterr().err
+
+
+def test_gc_skips_a_task_that_changed_after_it_was_chosen(home, tmp_path, monkeypatch, capsys):
+    from maestro import cli
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    _register(m, "task-old", "old", ws)
+    m.close()
+    task_dir = home / "tasks" / "task-old"
+    task_dir.mkdir(parents=True)
+    ancient = time.time() - 30 * 86400
+    os.utime(task_dir, (ancient, ancient))
+    real_unregister = Maestro.unregister_task
+
+    def a_follow_up_starts_first(self, task_id, *a, **k):
+        self._write_claim(task_id, "task_status", "WORKING")  # written after gc chose the task
+        return real_unregister(self, task_id, *a, **k)
+
+    monkeypatch.setattr(Maestro, "unregister_task", a_follow_up_starts_first)
+    assert cli.main(["gc", "--days", "1"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"removed": [], "kept": 1}
+    assert task_dir.is_dir()
+    m = Maestro(home)
+    try:
+        assert [x["task_id"] for x in m._registry_records()] == ["task-old"]
+        assert m._claims("task-old")["task_status"] == "WORKING"
+    finally:
+        m.close()
+
+
+def test_unregister_skips_when_the_check_under_the_lock_fails(home, tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    try:
+        _register(m, "task-a", "a", ws)
+        seen: list[object] = []
+        assert m.unregister_task("task-a", should_remove=lambda record: seen.append(record) or False) is None
+        assert seen and seen[0]["task_id"] == "task-a"
+        assert m.unregister_task("task-gone", should_remove=lambda record: record is not None) is None
+        assert [x["task_id"] for x in m._registry_records()] == ["task-a"]
+        assert m.unregister_task("task-a", should_remove=lambda record: True) == 4
+        assert m._registry_records() == []
+    finally:
+        m.close()
+
+
+def test_task_list_reports_an_unreadable_registry(home, tmp_path, monkeypatch, capsys):
+    from maestro import cli
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    _register(m, "task-a", "a", ws)
+    m.close()
+    monkeypatch.delenv("MAESTRO_WORKSPACE", raising=False)
+    monkeypatch.delenv("MAESTRO_PROJECT", raising=False)
+    monkeypatch.chdir(ws)
+    real_read = Path.read_text
+
+    def denied(self, *a, **k):
+        if self.name == "registry.json":
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_read(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", denied)
+    assert cli.main(["task", "list"]) == 2
+    assert "Could not read the task registry" in capsys.readouterr().err
+
+
+def test_gc_skips_a_task_another_gc_removed_first(home, tmp_path, monkeypatch, capsys):
+    from maestro import cli
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    m = Maestro(home)
+    _register(m, "task-old", "old", ws)
+    m.close()
+    task_dir = home / "tasks" / "task-old"
+    task_dir.mkdir(parents=True)
+    ancient = time.time() - 30 * 86400
+    os.utime(task_dir, (ancient, ancient))
+    real_unregister = Maestro.unregister_task
+
+    def another_gc_wins(self, task_id, *a, **k):
+        real_unregister(self, task_id)  # a second `maestro gc` removed it first
+        return real_unregister(self, task_id, *a, **k)
+
+    monkeypatch.setattr(Maestro, "unregister_task", another_gc_wins)
+    assert cli.main(["gc", "--days", "1"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"removed": [], "kept": 1}

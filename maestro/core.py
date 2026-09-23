@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 def maestro_user_dir() -> Path:
@@ -39,29 +39,64 @@ class _Episode:
     episode_ids: list[str]
 
 
+class RegistryUnreadableError(OSError):
+    """registry.json exists but could not be read at this moment, for example
+    because the process has too many open files or no permission to read it.
+    The registry is not rebuilt and not overwritten in that case."""
+
+
+_HELD_LOCKS = threading.local()
+_LOCK_WARNED: set[str] = set()
+
+
 @contextmanager
 def _file_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive advisory lock on ``path`` (created if missing).
 
     The lock is taken on a separate lock file, never on the data file itself,
     so it still works after the data file is replaced by a rewrite.
+
+    A thread that already holds the lock can take it again (for example a
+    registry repair inside a registration); a second flock from the same
+    thread would otherwise wait for itself forever. Other threads and other
+    processes still wait.
+
+    When locking is not available (no ``fcntl`` on Windows, or a file system
+    such as some NFS and SMB mounts that refuses flock), this continues
+    without a lock and prints a warning once per lock file.
     """
+    held: dict[str, int] = _HELD_LOCKS.__dict__.setdefault("paths", {})
+    key = str(path)
+    if key in held:
+        held[key] += 1
+        try:
+            yield
+        finally:
+            held[key] -= 1
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+")
+    locked = False
     try:
         try:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
-        yield
+            locked = True
+        except (ImportError, OSError) as exc:
+            if key not in _LOCK_WARNED:
+                _LOCK_WARNED.add(key)
+                print(f"[maestro] warning: {path} is not locked because file locking is not available here ({exc}); do not run `maestro gc` or a second writer while the daemon is running", file=sys.stderr)
+        held[key] = 1
+        try:
+            yield
+        finally:
+            del held[key]
     finally:
         try:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except (ImportError, OSError):
-            pass
-        handle.close()
+            if locked:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _replace_atomically(path: Path, text: str) -> None:
@@ -90,13 +125,15 @@ class _FileState:
     listing tasks asks for many claims of many tasks.
     """
 
+    _TAIL_BYTES = 512  # how much of the file's end is compared to detect a change
+
     def __init__(self, state_dir: Path) -> None:
         self.path = state_dir / "state.jsonl"
         self.lock_path = state_dir / "state.lock"
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.touch(exist_ok=True)
         self._cache_lock = threading.Lock()
-        self._cache_key: tuple[int, int, int] | None = None
+        self._cache_key: tuple[int, int, int, int, bytes] | None = None
         self._cache_claims: list[_Claim] = []
         self._cache_index: dict[tuple[str, str], list[_Claim]] = {}
 
@@ -116,10 +153,20 @@ class _FileState:
 
     def _load(self) -> tuple[list[_Claim], dict[tuple[str, str], list[_Claim]]]:
         """The parsed journal and a (subject, predicate) index, re-read only
-        when the file's inode, size or modification time changed."""
+        when the file changed.
+
+        The file counts as unchanged only when its inode, size, modification
+        time, change time and last few hundred bytes are all the same. The
+        stat values alone are not enough: on Linux ext4 an inode number is
+        reused after a rewrite and timestamps can be coarse, so a rewritten
+        journal of the same size can report the same values.
+        """
         try:
-            st = self.path.stat()
-            key: tuple[int, int, int] | None = (st.st_ino, st.st_size, st.st_mtime_ns)
+            with self.path.open("rb") as fh:
+                st = os.fstat(fh.fileno())
+                fh.seek(max(0, st.st_size - self._TAIL_BYTES))
+                tail = fh.read(self._TAIL_BYTES)
+            key: tuple[int, int, int, int, bytes] | None = (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns, tail)
         except OSError:
             key = None
         with self._cache_lock:
@@ -371,48 +418,105 @@ class Maestro:
     def _subject(self, task_id: str) -> str:
         return f"maestro:task:{task_id}"
 
+    def _read_index_file(self) -> list[dict[str, Any]] | str:
+        """registry.json as a list, or "missing" when there is no file, or
+        "damaged" when its contents are not a JSON list. Any other read error
+        raises RegistryUnreadableError: the file may be fine, so it must not
+        be rebuilt or overwritten."""
+        try:
+            data = json.loads(self.index_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            raise RegistryUnreadableError(f"Could not read the task registry {self.index_path} ({exc}); nothing was changed. Try again.") from exc
+        except ValueError:  # not JSON, or not UTF-8
+            return "damaged"
+        return data if isinstance(data, list) else "damaged"
+
     def _load_index(self) -> list[dict[str, Any]]:
         """The task registry (registry.json).
 
-        A file that cannot be parsed is moved aside, never overwritten, and the
-        registry is rebuilt from the tasks' claims. Returning an empty list
-        instead would make the next registration write a registry holding only
-        the new task, deleting every other entry and restarting numbering.
+        A missing or damaged file is repaired under the registry lock. The
+        file is read again under the lock, because another process may have
+        repaired it in the meantime. A file that is still damaged is moved
+        aside, never overwritten, and kept for inspection. The registry is
+        then rebuilt from the tasks' claims and saved, so the rebuild runs
+        once and not on every listing. Returning an empty list instead would
+        make the next registration write a registry holding only the new task,
+        deleting every other entry and restarting numbering.
         """
-        if not self.index_path.is_file():
-            return self._index_from_claims()
+        items = self._read_index_file()
+        if isinstance(items, list):
+            return items
+        with self._task_lock():
+            items = self._read_index_file()
+            if isinstance(items, list):
+                return items
+            if items == "damaged":
+                aside = self.index_path.with_name(f"registry.corrupt-{self._now().strftime('%Y%m%dT%H%M%S%f')}.json")
+                try:
+                    os.replace(self.index_path, aside)
+                    print(f"[maestro] {self.index_path} could not be parsed; moved it to {aside} and rebuilt the task registry from task claims", file=sys.stderr)
+                except FileNotFoundError:
+                    pass  # removed by a process that does not take the lock (an older version)
+            records = self._index_from_claims()
+            self._save_index(records)
+            return records
+
+    def _created_at_from_disk(self, task_id: str) -> str | None:
+        """When a task was created, for a rebuilt registry record. The claim
+        journal stores no times, so this uses the date and time in the task
+        id (task-YYYYMMDD-HHMMSS-..., local time), or else the modification
+        time of the task's folder."""
         try:
-            data = json.loads(self.index_path.read_text(encoding="utf-8"))
-        except OSError:
-            return self._index_from_claims()
-        except (json.JSONDecodeError, TypeError, ValueError):
-            data = None
-        if isinstance(data, list):
-            return data
-        aside = self.index_path.with_name(f"registry.corrupt-{self._now().strftime('%Y%m%dT%H%M%S%f')}.json")
+            return datetime.strptime(task_id[len("task-"):len("task-") + 15], "%Y%m%d-%H%M%S").astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
         try:
-            os.replace(self.index_path, aside)
-            print(f"[maestro] {self.index_path} could not be read; moved it to {aside} and rebuilt the task registry from task claims", file=sys.stderr)
+            return datetime.fromtimestamp((self.user_state_dir / "tasks" / task_id).stat().st_mtime, tz=timezone.utc).isoformat()
         except OSError:
-            pass  # another process moved it first
-        return self._index_from_claims()
+            return None
 
     def _index_from_claims(self) -> list[dict[str, Any]]:
-        """Registry records rebuilt from the durable task_number claims."""
+        """Registry records rebuilt from the tasks' claims. Called under the
+        registry lock.
+
+        Every task with at least one claim is kept. A task keeps the number in
+        its task_number claim. A task without a usable one gets the next number
+        after the highest ever given out, and that number is written as a claim
+        so a later rebuild gives the same number.
+        """
         prefix = self._subject("")
+        task_ids: dict[str, None] = {}
         numbers: dict[str, int] = {}
         for claim in self.mem.get_all():
-            if claim.predicate == "task_number" and claim.subject.startswith(prefix):
+            if not claim.subject.startswith(prefix):
+                continue
+            task_id = claim.subject[len(prefix):]
+            task_ids[task_id] = None
+            if claim.predicate == "task_number":
                 try:
-                    numbers[claim.subject[len(prefix):]] = int(claim.object)
+                    numbers[task_id] = int(claim.object)
                 except ValueError:
                     continue
+        next_number = max([*numbers.values(), self._read_task_counter()]) + 1
+        for task_id in sorted(t for t in task_ids if t not in numbers):
+            numbers[task_id] = next_number
+            self._write_claim(task_id, "task_number", str(next_number))
+            next_number += 1
         records = []
         for task_id, number in numbers.items():
             claims = self._claims(task_id)
             workspace = claims.get("task_workspace") or ""
             project_root = str(self._resolve_project_root(Path(workspace))) if workspace and Path(workspace).is_dir() else workspace
-            records.append({"number": number, "task_id": task_id, "title": claims.get("task_title") or task_id, "created_at": None, "workspace": workspace, "project_root": project_root})
+            record = {"number": number, "task_id": task_id, "title": claims.get("task_title") or task_id, "created_at": self._created_at_from_disk(task_id), "workspace": workspace, "project_root": project_root}
+            legacy = self.mem.history(self._subject(task_id), "task_legacy_number")
+            if legacy:
+                try:
+                    record["legacy_task_number"] = json.loads(legacy[-1].object)
+                except ValueError:
+                    record["legacy_task_number"] = legacy[-1].object
+            records.append(record)
         return sorted(records, key=lambda x: int(x["number"]))
 
     def _save_index(self, items: list[dict[str, Any]]) -> None:
@@ -431,18 +535,27 @@ class Maestro:
         if number > self._read_task_counter():
             _replace_atomically(self.user_state_dir / "task-counter", str(number))
 
-    def unregister_task(self, task_id: str) -> int:
+    def unregister_task(self, task_id: str, should_remove: Callable[[dict[str, Any] | None], bool] | None = None) -> int | None:
         """Remove a task from the registry and drop its claims (used by gc).
 
-        Everything happens under the registry lock, so a task registered by a
-        daemon at the same moment is never lost. Returns the number of claims
-        dropped. The memvara backend keeps claims as history and cannot drop
-        them, so it is refused before anything changes.
+        Everything happens under the registry lock and the claim journal lock,
+        so a task registered by a daemon at the same moment is never lost, and
+        no claim can be written for this task between the check and the
+        removal. ``should_remove`` receives the task's current registry record
+        (None if it is no longer registered) and is evaluated under both
+        locks; when it returns False nothing changes and None is returned.
+        gc uses it to confirm that the task is still finished and still old.
+        Otherwise returns the number of claims dropped. The memvara backend
+        keeps claims as history and cannot drop them, so it is refused before
+        anything changes.
         """
         if self.config["storage_backend"] != "filesystem":
             raise ValueError("Removing tasks is not supported on the memvara storage backend yet; nothing was changed")
-        with self._task_lock():
-            self._save_index([x for x in self._load_index() if str(x.get("task_id")) != task_id])
+        with self._task_lock(), _file_lock(self.mem.lock_path):
+            items = self._load_index()
+            if should_remove is not None and not should_remove(next((x for x in items if str(x.get("task_id")) == task_id), None)):
+                return None
+            self._save_index([x for x in items if str(x.get("task_id")) != task_id])
             return self.mem.forget(self._subject(task_id))
 
     def _registry_records(self) -> list[dict[str, Any]]:
@@ -504,22 +617,28 @@ class Maestro:
                 records[tid] = {**records.get(tid, {}), **event["record"]}
             elif event.get("kind") == "claim":  # pragma: no branch
                 claims.setdefault(tid, {})[str(event.get("predicate"))] = event.get("value")
-        existing = self._registry_records()
-        next_number = max([int(x.get("number", 0)) for x in existing] + [0]) + 1
-        existing_ids = {str(x["task_id"]) for x in existing}
         field_map = {"task_status":"phase", "task_owner":"supervisor", "task_implementer":"implementer", "task_design":"design", "task_result":"result", "task_verification":"verification", "task_workspace":"workspace", "task_model":"model", "task_effort":"effort"}
         imported = 0
-        for tid in sorted(set(records) | set(claims)):
-            if tid in existing_ids: continue  # pragma: no branch
-            rec = records.get(tid, {}); c = claims.get(tid, {})
-            title = str(c.get("task_title") or rec.get("title") or tid)
-            workspace = str(c.get("task_workspace") or rec.get("workspace") or self.root)
-            new_record = {"number": next_number, "task_id": tid, "title": title, "created_at": str(rec.get("created_at") or self._now().isoformat()), "workspace": workspace, "project_root": str(self.project_root), "legacy_task_number": c.get("task_number") or rec.get("task_number") or rec.get("number")}
-            self._write_registry_record(new_record)
-            for predicate in field_map:
-                if c.get(predicate) not in (None, ""): self._write_claim(tid, predicate, str(c[predicate]))
-            self._write_claim(tid, "task_number", str(next_number)); self._write_claim(tid, "task_title", title)
-            next_number += 1; imported += 1
+        # Numbers come from _new_task_number under the registry lock, like a
+        # daemon registration, so a number removed by gc is never given out again.
+        with self._task_lock():
+            existing_ids = {str(x["task_id"]) for x in self._registry_records()}
+            for tid in sorted(set(records) | set(claims)):
+                if tid in existing_ids: continue  # pragma: no branch
+                rec = records.get(tid, {}); c = claims.get(tid, {})
+                title = str(c.get("task_title") or rec.get("title") or tid)
+                workspace = str(c.get("task_workspace") or rec.get("workspace") or self.root)
+                number = self._new_task_number()
+                legacy_number = c.get("task_number") or rec.get("task_number") or rec.get("number")
+                new_record = {"number": number, "task_id": tid, "title": title, "created_at": str(rec.get("created_at") or self._now().isoformat()), "workspace": workspace, "project_root": str(self.project_root), "legacy_task_number": legacy_number}
+                self._write_registry_record(new_record)
+                self._bump_task_counter(number)
+                for predicate in field_map:
+                    if c.get(predicate) not in (None, ""): self._write_claim(tid, predicate, str(c[predicate]))
+                self._write_claim(tid, "task_number", str(number)); self._write_claim(tid, "task_title", title)
+                if legacy_number is not None:  # kept as a claim so a registry rebuild restores it
+                    self._write_claim(tid, "task_legacy_number", json.dumps(legacy_number))
+                imported += 1
         self.migration_marker.write_text(json.dumps({"imported": imported, "source": str(self.project_journal), "migrated_at": self._now().isoformat()}, indent=2), encoding="utf-8")
 
     def _migrate_legacy_memvara(self, strict: bool = False) -> int:

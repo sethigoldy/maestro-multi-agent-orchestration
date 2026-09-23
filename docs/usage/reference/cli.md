@@ -250,10 +250,19 @@ automatically.
 
 It is safe to run while the daemon is working: gc removes each task under the
 same locks the daemon uses to register tasks and append claims, so nothing the
-daemon writes at that moment is lost. Removed task numbers are never given out
-again. gc is refused on the `memvara` storage backend, which keeps claims as
-history and cannot drop them yet; nothing is deleted in that case and the
-command exits 2.
+daemon writes at that moment is lost. Before it removes a task, gc checks again
+under those locks that the task is still finished and still older than `N`
+days. If the task changed in the meantime (for example a follow-up started
+and set its status back to working), gc keeps it and counts it in `kept`. Removed task
+numbers are never given out again. gc is refused on the `memvara` storage
+backend, which keeps claims as history and cannot drop them yet; nothing is
+deleted in that case and the command exits 2.
+
+This safety depends on file locking. On Windows, where Python has no `fcntl`
+module, and on file systems that refuse `flock` (some NFS and SMB mounts),
+Maestro cannot take the locks. It then prints a warning once that names the
+lock file and carries on without the lock. In that case, stop the daemon
+before you run `maestro gc`.
 
 ## doctor
 
