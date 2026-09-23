@@ -136,7 +136,10 @@ def test_connect_events_forwards_branch_renames():
         import pytest
 
         pytest.skip("node not available; JS event wiring not tested")
+    # A browser-free stand-in: Node before 22 has no sessionStorage, and the
+    # console reads its token from there (none is stored here).
     script = f"""
+globalThis.sessionStorage = {{ getItem: () => null, setItem: () => {{}} }};
 const listeners = {{}};
 globalThis.EventSource = class {{
   constructor(url) {{ this.url = url; }}
