@@ -52,7 +52,7 @@ class FakeDaemon:
         self.calls.append(("cancel", task_id, reason))
         return {"task_id": task_id, "state": "canceled"}
 
-    def followup(self, task_id, instruction, context_mode="reuse"):
+    def followup(self, task_id, instruction, context_mode="reuse", branch=None):
         if task_id == "task-shallow":
             raise ValueError("Max delegation depth exceeded")
         self.calls.append(("followup", task_id, instruction, context_mode))
@@ -295,3 +295,35 @@ def test_send_keeps_resolvable_builtin_target():
     assert "error" not in resp, resp
     (kind, doc, ws) = d.daemon.calls[0]
     assert doc.target_agent == "codex"
+
+
+# ------------------------------------------------ malformed params and unexpected errors
+def test_params_that_are_not_an_object_are_rejected():
+    dispatcher = _dispatch()
+    for method in ("message/send", "tasks/get", "tasks/cancel", "tasks/followup"):
+        for params in (["task-1"], "task-1", 5):
+            resp = dispatcher.handle(_req(method, params, rid=9))
+            assert resp["id"] == 9 and resp["error"]["code"] == ERR_INVALID_PARAMS, (method, params)
+            assert "params must be an object" in resp["error"]["message"]
+    # Missing or null params still mean "no parameters".
+    assert dispatcher.handle({"jsonrpc": "2.0", "id": 1, "method": "tasks/get", "params": None})["error"]["code"] == ERR_INVALID_PARAMS
+    assert "params.id" in dispatcher.handle({"jsonrpc": "2.0", "id": 1, "method": "tasks/get"})["error"]["message"]
+
+
+def test_message_parts_that_are_not_a_list_are_ignored():
+    dispatcher = _dispatch()
+    msg = {"role": "user", "parts": 5, "metadata": {"maestro": {"workspace": "/ws"}}}
+    resp = dispatcher.handle(_req("message/send", {"message": msg}))
+    assert resp["error"]["code"] == ERR_INVALID_PARAMS and "neither" in resp["error"]["message"]
+
+
+def test_unexpected_exception_becomes_an_internal_error(capsys):
+    from maestro.a2a import ERR_INTERNAL
+
+    class Broken(FakeDaemon):
+        def status_a2a(self, task_id):
+            raise RuntimeError("journal exploded")
+
+    resp = A2ADispatcher(Broken()).handle(_req("tasks/get", {"id": "task-1"}, rid=3))
+    assert resp == {"jsonrpc": "2.0", "id": 3, "error": {"code": ERR_INTERNAL, "message": "Internal error: RuntimeError"}}
+    assert "journal exploded" in capsys.readouterr().err  # the operator still gets the traceback

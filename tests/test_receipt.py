@@ -467,6 +467,9 @@ def test_receipt_parse_edges_and_claim_only_number(plain_state):
 
     m, _ = plain_state
     tid = "task-20260101-000000-pppppp"
+    # The registry exists and holds no record for these tasks. (A missing
+    # registry would be rebuilt from the claims, which registers the task.)
+    m._save_index([])
 
     # Invalid JSON in the runtime claim degrades to an empty snapshot.
     m._write_claim(tid, "task_runtime", "{definitely not json")

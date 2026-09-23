@@ -43,7 +43,7 @@ export function loadReceipt(taskId) {
 
 export function connectEvents(handlers) {
   const source = new EventSource(withToken("/events"));
-  for (const type of ["state", "output", "usage"]) {
+  for (const type of ["state", "output", "usage", "branch"]) {
     source.addEventListener(type, (message) => {
       let envelope;
       try {

@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import tomllib
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -96,7 +97,9 @@ class AgentSpec:
     output_format: str = "text"
     workspace_policy: str = "cwd"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, redact: bool = False) -> dict[str, Any]:
+        """The spec as a plain dict. ``redact=True`` replaces the bearer token
+        with "<redacted>"; use it for anything shown to a person or a model."""
         data: dict[str, Any] = {
             "name": self.name,
             "kind": self.kind,
@@ -112,7 +115,7 @@ class AgentSpec:
         if self.timeout_s is not None:
             data["timeout_s"] = self.timeout_s
         if self.token is not None:
-            data["token"] = self.token
+            data["token"] = "<redacted>" if redact else self.token
         if self.kind == GENERIC_KIND:
             data.update(
                 {
@@ -239,12 +242,50 @@ def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
     )
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` readable by the owner only (mode 0600).
+
+    Used for files that can hold a bearer token. The text goes into a new
+    temporary file in the same directory, created with mode 0600, which then
+    replaces ``path``. The file is never rewritten in place: Unix checks
+    permissions only when a file is opened, so another user who opened an old
+    world-readable copy could otherwise read the new token through that handle.
+    The temporary file is removed if anything fails.
+    """
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class AgentRegistry:
     """File-backed registry of agents under ``<state_dir>/agents/``."""
 
     def __init__(self, state_dir: str | Path) -> None:
         self.dir = Path(state_dir) / "agents"
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._tighten_entry_modes()
+
+    def _tighten_entry_modes(self) -> None:
+        """Make entries written by older versions readable by the owner only.
+
+        Older versions wrote entries with the default mode, often 0644, and an
+        entry can hold a bearer token. A symbolic link is left alone so
+        that its target is never changed. A file this user cannot chmod (for
+        example one owned by another user) is skipped rather than failing.
+        """
+        for path in self.dir.glob("*.toml"):
+            try:
+                mode = path.lstat().st_mode
+                if stat.S_ISREG(mode) and mode & 0o077:
+                    os.chmod(path, 0o600)
+            except OSError:
+                continue
 
     def _path(self, name: str) -> Path:
         if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -288,17 +329,10 @@ class AgentRegistry:
             tomllib.loads(text)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"Refusing to save agent {spec.name!r}: the registry writer produced invalid TOML ({exc})") from exc
-        temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-        try:
-            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            os.replace(temp, path)
-        except BaseException:
-            # Any failure, including a UnicodeEncodeError from a lone surrogate,
-            # must not leave a temporary file behind: it can hold a token.
-            temp.unlink(missing_ok=True)
-            raise
+        # The entry can hold a bearer token, so only the owner may read it.
+        # _write_private replaces the file and removes its temporary file on
+        # any failure, including a UnicodeEncodeError from a lone surrogate.
+        _write_private(path, text)
         return spec
 
     def remove(self, name: str) -> bool:

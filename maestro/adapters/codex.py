@@ -46,7 +46,8 @@ def probe_codex_autonomy_flags(binary: str | None = None) -> list[str]:
         return classify_codex_help("")  # no CLI visible: assume the current surface
     try:
         probe = subprocess.run(
-            [path, "exec", "--help"], capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL
+            [path, "exec", "--help"], capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=15, stdin=subprocess.DEVNULL,
         )
         help_text = (probe.stdout or "") + (probe.stderr or "")
     except (OSError, subprocess.SubprocessError):

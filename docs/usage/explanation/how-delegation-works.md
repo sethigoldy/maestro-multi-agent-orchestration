@@ -49,7 +49,7 @@ never by callers:
 submitted ──▶ working ──▶ completed
    │            │  ▲         
    │            ▼  │         
-   │     input-required (question answered → back to working)
+   │     input-required (question answered → submitted → working)
    │            │
    ├──▶ canceled (user cancel, running or queued)
    └──▶ failed   (every agent in the target→fallback chain failed)
@@ -60,7 +60,8 @@ submitted ──▶ working ──▶ completed
 - **working** — an agent is running on the task branch. Retries and fallback
   hops stay inside this state; each attempt is recorded separately.
 - **input-required** — the agent asked a question (or a sensitive task awaits
-  approval). The task waits here indefinitely until answered.
+  approval). The task waits here indefinitely until answered. An answer starts
+  a new turn: the task goes back to `submitted` and then to `working`.
 - **completed** — an agent finished successfully *and* verification ran. Note
   that "completed" already includes the deterministic check; it is not merely
   "the agent said done." A task whose check fails still reaches `completed` —
@@ -154,6 +155,19 @@ branch, and nothing is ever committed by Maestro itself. Commit policy
 (`branch`/`pr` vs `no-commit`) only controls whether that isolation exists;
 with `no-commit`, the agent works directly in your tree, for sandboxes and
 non-git directories where a branch would be ceremony without value.
+
+## Agent processes
+
+Each agent runs in its own process group. When a run ends, for any reason
+(success, failure, timeout or cancel), Maestro stops every process still left
+in that group. A task is a batch run, so nothing it starts in the background,
+such as a dev server or a watcher, outlives it. If the agent exits while a
+background child still holds its output open, Maestro waits two seconds for
+remaining output and then treats the run as finished.
+
+A cancel reaches a running agent within about half a second, even while the
+agent prints nothing. Agent output that is not valid UTF-8 is read with the
+bad bytes replaced, so it never stops a run.
 
 ## Verification: evidence, not vibes
 
