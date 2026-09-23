@@ -195,9 +195,9 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP `delegate`/`followup` tools block for a task |
 | `MAESTRO_BUDGET_PER_AGENT_USD` | off | Cumulative USD cap per agent name (see Budget caps) |
 | `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap across all agents, reset at UTC midnight |
-| `MAESTRO_DISCOVERY` | `1` | Set `0` to disable P2P discovery entirely |
+| `MAESTRO_DISCOVERY` | on beyond loopback, off on loopback | Set `0` to disable P2P discovery entirely. A daemon that listens on loopback only runs discovery only when this is set to `1` (or `true`, `yes`, `on`) |
 | `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
-| `MAESTRO_DISCOVERY_IF` | default interface | Interface used for announcements (e.g. `127.0.0.1` for loopback only) |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface used for announcements (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored) |
 | `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
 | `MAESTRO_NODE_NAME` | `maestro-node` | Name this daemon announces under discovery |
 | `MAESTRO_STORAGE` | — | Storage backend fallback when no config file sets it |

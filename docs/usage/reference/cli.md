@@ -26,8 +26,9 @@ Commands that talk to the daemon (`delegate`, `task tail`, `dashboard`) resolve
 the endpoint in this order:
 
 1. `MAESTRO_DAEMON_URL` (optionally with `MAESTRO_DAEMON_TOKEN`).
-2. The `daemon.json` marker written by whichever broker started last. The
-   marker's process is liveness-checked; a stale marker yields the error
+2. The `daemon.json` marker written by the daemon that owns the state
+   directory (only one daemon can own it at a time). The marker's process is
+   liveness-checked and confirmed to be that daemon; a stale marker yields the error
    `no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL`.
 
 Non-loopback daemons record their auth token in the marker, so local CLI calls
@@ -42,6 +43,12 @@ maestro-daemon [--port N] [--bind IF] [--state-dir DIR] [--allow-origin ORIGIN .
 Starts the broker daemon and blocks until SIGINT/SIGTERM. Prints one JSON line
 on startup: `pid`, `port`, `bind`, `advertised_host`, `state_dir`, and `token`
 when authentication is enabled.
+
+Only one daemon can own a state directory. If a live daemon already owns it,
+`maestro-daemon` prints an error to stderr that names the running daemon's pid
+and URL, and exits with status `1`. It does not touch that daemon's marker or
+its tasks. Stop the running daemon with `maestro daemon stop`, or pass a
+different `--state-dir`.
 
 | Option | Default | Meaning |
 |---|---|---|
@@ -65,8 +72,8 @@ The lifecycle manager for the background daemon. It drives the same broker as
 | Subcommand | Behavior |
 |---|---|
 | `start` | Starts the daemon in a detached session (survives shell exit) and returns immediately. Output goes to `<state-dir>/daemon.log`. **Idempotent**: if a live, answering daemon already exists for this state directory it is reused — never duplicated (an advisory lock serializes concurrent starts). If a process exists but does not answer HTTP, `start` refuses rather than stacking a second daemon |
-| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. **Idempotent**: stopping when nothing is running is not an error |
-| `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
+| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. A process is signalled only when it is confirmed to be the daemon that wrote the marker (it holds `daemon.owner.lock`, or, for a marker from an older version, its endpoint answers with a Maestro agent card). If the daemon crashed and its pid now belongs to an unrelated process, `stop` removes the stale marker, does not signal that process, and says so. **Idempotent**: stopping when nothing is running is not an error |
+| `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), *a live process that is not the daemon* (stale: the pid was reused), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
 | `restart` | `stop` + `start` with error handling |
 
 The `daemon.json` marker (written by the daemon itself) is the single source of

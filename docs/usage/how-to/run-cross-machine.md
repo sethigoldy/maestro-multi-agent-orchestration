@@ -85,7 +85,13 @@ workspace slot it queues the task; a missing/wrong token fails fast with
 
 Daemons on the same LAN find each other automatically: each daemon periodically
 announces itself over UDP multicast (port 9786) and peers are recorded in
-`~/.maestro/peers.json`.
+`~/.maestro/peers.json`. Only a daemon that listens beyond loopback (for
+example `--bind 0.0.0.0`, as in Step 1) announces itself by default; a daemon
+on `127.0.0.1` announces only when `MAESTRO_DISCOVERY=1` is set.
+
+Announcements are untrusted: one whose advertised host is not an IP address is
+dropped, names lose their control characters, and `peers.json` keeps at most
+256 peers (a discovered peer unheard for an hour is removed).
 
 ```bash
 maestro peers list          # live + stale peers, with URLs
