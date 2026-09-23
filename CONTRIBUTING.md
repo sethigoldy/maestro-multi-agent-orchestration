@@ -13,15 +13,14 @@ to rebuild the web console bundle.
 git clone https://github.com/sethigoldy/maestro-multi-agent-orchestration maestro
 cd maestro
 python3.11 -m venv .venv
-.venv/bin/python -m pip install -e . pytest coverage build
+.venv/bin/python -m pip install -e . pytest pytest-xdist pytest-cov coverage build
 ```
 
 Verify the environment before and after your change:
 
 ```sh
-.venv/bin/python -m pytest -q                          # full suite (hermetic, no network)
-.venv/bin/python -m coverage run --branch -m pytest -q && \
-  .venv/bin/python -m coverage report --fail-under=100 # the coverage gate
+.venv/bin/python -m pytest -n auto -q                  # full suite, one worker per CPU (hermetic, no network)
+.venv/bin/python -m pytest -n auto -q --cov --cov-fail-under=100  # the same, with the 100% coverage gate
 .venv/bin/python -m build                             # wheel + sdist
 scripts/smoke-fake-agent.sh                           # end-to-end fake-agent smoke test
 scripts/validate-package.sh                           # clean-install verification (wheel + sdist)

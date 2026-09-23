@@ -267,14 +267,14 @@ python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install .            # or: python -m pip install -e . for development
-maestro --version                  # → 0.12.0
+maestro --version                  # → 0.13.0
 ```
 
 > **Note on the name:** `maestro` is already taken on PyPI by an unrelated
 > project (a VLM fine-tuning library). This package is **not published to
 > PyPI**; install it from this repository (as above), from a release artifact
 > attached to a [GitHub Release](https://github.com/sethigoldy/maestro-multi-agent-orchestration/releases)
-> (`pip install maestro-0.12.0-py3-none-any.whl`), or from a locally built wheel
+> (`pip install maestro-0.13.0-py3-none-any.whl`), or from a locally built wheel
 > (`python -m build`). The CLI command stays `maestro`.
 
 ### 2. Check your environment
@@ -970,9 +970,8 @@ Tasks are durable per state directory — make sure you're using the same
 
 ```bash
 python -m pip install -e .
-python -m pip install pytest coverage
-python -m coverage run --branch -m pytest -q
-python -m coverage report --fail-under=100     # CI enforces 100% line+branch
+python -m pip install pytest pytest-xdist pytest-cov coverage
+python -m pytest -n auto -q --cov --cov-fail-under=100   # parallel; CI enforces 100% line+branch
 scripts/smoke-fake-agent.sh                    # end-to-end fake-agent smoke test (no CLIs, no network)
 scripts/validate-package.sh                    # clean-install check: wheel + sdist in fresh venvs
 ```
