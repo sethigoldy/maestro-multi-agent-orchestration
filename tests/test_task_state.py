@@ -218,13 +218,14 @@ def test_followup_after_cancel_runs_normally(daemon, tmp_path, binpath):
 
 
 def test_cancel_during_a_gate_turn_is_not_undone(daemon, tmp_path, binpath):
+    running = tmp_path / "verifier-running"
     _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
-    _agent(daemon, binpath, "ver", 'cat > /dev/null\nsleep 3\necho "VERDICT: PASS"\nexit 0')
+    _agent(daemon, binpath, "ver", f'cat > /dev/null\ntouch {running}\nsleep 3\necho "VERDICT: PASS"\nexit 0')
     _agent(daemon, binpath, "rev", 'cat > /dev/null\necho "VERDICT: PASS"\nexit 0')
     ws = _git_repo(tmp_path)
     a = daemon.delegate(_doc(verify_agent="ver", review_agent="rev", verification="command", request="false"), ws)
     tid = a["task_id"]
-    _wait_for(lambda: daemon._tasks[tid].get("gate_seq") is not None)
+    _wait_for(running.exists)  # the verifier agent is running
     daemon.cancel(tid, reason="stop")
     time.sleep(1.5)  # the verifier notices the cancel within a poll interval
     record = daemon._tasks[tid]
@@ -233,13 +234,14 @@ def test_cancel_during_a_gate_turn_is_not_undone(daemon, tmp_path, binpath):
 
 
 def test_cancel_during_the_first_review_is_not_undone(daemon, tmp_path, binpath):
+    running = tmp_path / "reviewer-running"
     _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
-    _agent(daemon, binpath, "rev", 'cat > /dev/null\nsleep 3\necho "VERDICT: PASS"\nexit 0')
+    _agent(daemon, binpath, "rev", f'cat > /dev/null\ntouch {running}\nsleep 3\necho "VERDICT: PASS"\nexit 0')
     _agent(daemon, binpath, "fix", "cat > /dev/null\nexit 0")
     ws = _git_repo(tmp_path)
     a = daemon.delegate(_doc(review_agent="rev", fix_agent="fix", verification="command", request="false"), ws)
     tid = a["task_id"]
-    _wait_for(lambda: daemon._tasks[tid].get("gate_seq") is not None)
+    _wait_for(running.exists)  # the reviewer agent is running
     daemon.cancel(tid, reason="stop")
     # Wait until the reviewer's attempt is recorded, so whatever the turn does
     # after the review has happened before we look.
@@ -248,6 +250,23 @@ def test_cancel_during_the_first_review_is_not_undone(daemon, tmp_path, binpath)
     record = daemon._tasks[tid]
     assert record["state"] == "canceled"
     assert "fix" not in [att["agent"] for att in record["attempts"]]
+
+
+def test_cancel_during_a_fix_turn_is_not_undone(daemon, tmp_path, binpath):
+    running = tmp_path / "fixer-running"
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
+    _agent(daemon, binpath, "rev", 'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- nope"\nexit 0')
+    _agent(daemon, binpath, "fix", f"cat > /dev/null\ntouch {running}\nsleep 3\nexit 0")
+    ws = _git_repo(tmp_path)
+    tid = daemon.delegate(_doc(review_agent="rev", fix_agent="fix", max_bounces=2), ws)["task_id"]
+    _wait_for(running.exists)  # the fixer agent is running
+    daemon.cancel(tid, reason="stop")
+    _wait_for(lambda: any(att["agent"] == "fix" for att in daemon._tasks[tid]["attempts"]))
+    time.sleep(0.5)
+    record = daemon._tasks[tid]
+    assert record["state"] == "canceled"
+    # The canceled fix bounce is the last step: no second review, no second fix.
+    assert [att["role"] for att in record["attempts"]] == ["implement", "reviewer", "fix"]
 
 
 def test_a_canceled_task_ignores_late_reports_from_its_old_turn(daemon, tmp_path):
@@ -407,3 +426,373 @@ def test_task_event_stream_follows_the_current_turn(tmp_path, monkeypatch, binpa
         assert "second-turn" in lines and "first-turn" not in lines
     finally:
         d.stop()
+
+
+# ------------------------------------------------------------ cancel during promotion
+@pytest.mark.parametrize("kind", ["delegation", "follow-up"])
+@pytest.mark.parametrize("moment", ["before-promotion", "before-the-turn-runs"])
+def test_a_task_canceled_while_it_is_promoted_stays_canceled(daemon, tmp_path, binpath, kind, moment):
+    # A cancel can arrive after _release took the task off the queue but
+    # before it started, or after it started a thread but before that thread
+    # ran. Either way the task must stay canceled, run no agent, and hand the
+    # workspace to the next queued task.
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nsleep 0.3\nexit 0")
+    ws = _git_repo(tmp_path)
+    if kind == "follow-up":
+        victim = daemon.delegate(_doc(title="victim"), ws)["task_id"]
+        assert daemon.wait(victim, timeout=30)["status"]["state"] == "completed"
+        runner = daemon.delegate(_doc(title="runner"), ws)["task_id"]
+        assert daemon.followup(victim, "more work")["queued"] is True
+    else:
+        runner = daemon.delegate(_doc(title="runner"), ws)["task_id"]
+        victim = daemon.delegate(_doc(title="victim"), ws)["task_id"]
+    after = daemon.delegate(_doc(title="after"), ws)["task_id"]
+    attempts_before = len(daemon._tasks[victim]["attempts"])
+
+    if moment == "before-promotion":
+        real_start = daemon._start_queued
+
+        def cancel_then_start(task_id):
+            if task_id == victim:
+                daemon.cancel(victim, reason="changed my mind")
+            real_start(task_id)
+
+        daemon._start_queued = cancel_then_start
+    else:
+        real_run = daemon._run_task
+
+        def cancel_then_run(task_id, *args, **kwargs):
+            if task_id == victim:
+                daemon.cancel(victim, reason="changed my mind")
+            real_run(task_id, *args, **kwargs)
+
+        daemon._run_task = cancel_then_run
+
+    assert daemon.wait(runner, timeout=30)["status"]["state"] == "completed"
+    assert daemon.wait(after, timeout=30)["status"]["state"] == "completed"
+    time.sleep(0.5)  # give a wrongly started turn time to show itself
+    record = daemon._tasks[victim]
+    assert record["state"] == "canceled"
+    assert len(record["attempts"]) == attempts_before  # no agent ran for the canceled turn
+    assert record.get("queued") is False and "continuation" not in record
+    assert daemon._queue == [] and daemon._active == {}
+
+
+# ------------------------------------------------------------ stale turns
+def _blocking_verify(daemon):
+    """Make each call to _verify wait until the test lets it go.
+
+    Returns (entered, release): entered[n] is set when call n starts and
+    release[n] lets call n finish.
+    """
+    entered = [threading.Event() for _ in range(4)]
+    release = [threading.Event() for _ in range(4)]
+    calls = []
+    real_verify = daemon._verify
+
+    def verify(*args, **kwargs):
+        n = len(calls)
+        calls.append(n)
+        entered[n].set()
+        assert release[n].wait(30)
+        return real_verify(*args, **kwargs)
+
+    daemon._verify = verify
+    return entered, release
+
+
+def _count_finished_turns(daemon):
+    finished = []
+    real_run = daemon._run_task
+
+    def run(*args, **kwargs):
+        try:
+            real_run(*args, **kwargs)
+        finally:
+            finished.append(args[0])
+
+    daemon._run_task = run
+    return finished
+
+
+def test_a_canceled_turn_cannot_finish_the_follow_up_or_free_its_workspace(daemon, tmp_path, binpath):
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
+    ws = _git_repo(tmp_path)
+    entered, release = _blocking_verify(daemon)
+    finished = _count_finished_turns(daemon)
+    tid = daemon.delegate(_doc(verification="command", verification_command="true"), ws)["task_id"]
+    assert entered[0].wait(30)  # the first turn is verifying
+    daemon.cancel(tid, reason="stop")
+    daemon.followup(tid, "more work")
+    assert entered[1].wait(30)  # the follow-up turn is verifying too
+    release[0].set()  # the canceled turn now finishes its verification
+    _wait_for(lambda: len(finished) == 1)
+    assert daemon._tasks[tid]["state"] == "working"  # still the follow-up's turn
+    assert daemon._active[str(ws)] == tid  # and it still holds the workspace
+    release[1].set()
+    assert daemon.wait(tid, timeout=30)["status"]["state"] == "completed"
+    assert daemon._active == {}
+
+
+def test_a_canceled_turn_does_not_start_a_gate_agent_after_a_follow_up(daemon, tmp_path, binpath):
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
+    _agent(daemon, binpath, "rev", 'cat > /dev/null\necho "VERDICT: PASS"\nexit 0')
+    ws = _git_repo(tmp_path)
+    entered, release = _blocking_verify(daemon)
+    finished = _count_finished_turns(daemon)
+    tid = daemon.delegate(_doc(review_agent="rev", verification="command", verification_command="true"), ws)["task_id"]
+    assert entered[0].wait(30)
+    daemon.cancel(tid, reason="stop")
+    daemon.followup(tid, "more work")
+    assert entered[1].wait(30)
+    release[0].set()
+    _wait_for(lambda: len(finished) == 1)
+    roles = [att.get("role") for att in daemon._tasks[tid]["attempts"]]
+    assert "reviewer" not in roles  # the canceled turn started no reviewer
+    release[1].set()
+    assert daemon.wait(tid, timeout=30)["status"]["state"] == "completed"
+    roles = [att.get("role") for att in daemon._tasks[tid]["attempts"]]
+    assert roles.count("reviewer") == 1  # only the follow-up's own review ran
+
+
+def test_a_canceled_turn_does_not_retry_its_agent_after_a_follow_up(tmp_path, monkeypatch, binpath):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=1, backoff_s=0)
+    try:
+        log = tmp_path / "runs.log"
+        _agent(d, binpath, "impl", f"cat > /dev/null\necho run >> {log}\nexit 1")
+        ws = _git_repo(tmp_path)
+        finished = _count_finished_turns(d)
+        entered, release = threading.Event(), threading.Event()
+        real_record = d._record_attempt
+        calls = []
+
+        def record_attempt(*args, **kwargs):
+            real_record(*args, **kwargs)
+            calls.append(1)
+            if len(calls) == 1:  # the first turn's first failed attempt
+                entered.set()
+                assert release.wait(30)
+
+        d._record_attempt = record_attempt
+        tid = d.delegate(_doc(), ws)["task_id"]
+        assert entered.wait(30)
+        d.cancel(tid, reason="stop")
+        d.followup(tid, "try again")
+        _wait_for(lambda: d._tasks[tid]["state"] == "failed")  # the follow-up used both of its attempts
+        release.set()
+        _wait_for(lambda: len(finished) == 2)
+        # One run for the canceled turn, two for the follow-up; the canceled
+        # turn must not retry once the follow-up replaced its cancel flag.
+        assert log.read_text(encoding="utf-8").count("run") == 3
+        assert len(d._tasks[tid]["attempts"]) == 3
+        assert d._tasks[tid]["state"] == "failed"
+    finally:
+        d.stop()
+
+
+def test_a_stale_turn_starts_no_agent(daemon, tmp_path, binpath):
+    # Each agent-starting step checks that its turn is still the task's
+    # current, uncanceled turn right before it starts the agent.
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nexit 0")
+    ws = _git_repo(tmp_path)
+    doc = _doc(review_agent="impl")
+    tid, record = daemon._make_record(doc, str(ws))
+    daemon._register_and_claims(tid, doc, str(ws))
+    stale = threading.Event()  # not the task's current flag: a replaced turn
+    daemon._run_turn(tid, doc, ws, stale)
+    turn = daemon._gate_turn(tid, doc, ws, agent_name="impl", role="reviewer", verification_ok=True, report_path=ws / "none.txt", turn_flag=stale)
+    assert turn == {"ok": True, "issues": [], "parked": False}
+    assert daemon._fix_turn(tid, doc, ws, "impl", ["- x"], False, turn=1, turn_flag=stale) == ("canceled", None)
+    assert record["attempts"] == []
+    # A turn that was replaced cannot end the task or free its workspace.
+    with daemon._lock:
+        daemon._active[str(ws)] = tid
+    daemon._finish_turn(tid, stale, "failed", error="late")
+    assert record["state"] == "submitted" and daemon._active[str(ws)] == tid
+    # Nor can it start a queued task's first turn.
+    assert daemon._launch(tid, doc, ws, stale, True) == "canceled"
+    assert record["state"] == "submitted" and record["attempts"] == []
+
+
+# ------------------------------------------------------------ concurrent continuations
+def _race(calls):
+    """Run the given callables at once; return their results or exceptions."""
+    results: list = [None] * len(calls)
+
+    def run(i, fn):
+        try:
+            results[i] = fn()
+        except Exception as exc:  # collected for the assertions
+            results[i] = exc
+
+    threads = [threading.Thread(target=run, args=(i, fn)) for i, fn in enumerate(calls)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    return results
+
+
+def test_two_concurrent_follow_ups_start_one_turn(daemon, tmp_path, binpath):
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nsleep 0.3\nexit 0")
+    ws = _git_repo(tmp_path)
+    tid = daemon.delegate(_doc(), ws)["task_id"]
+    assert daemon.wait(tid, timeout=30)["status"]["state"] == "completed"
+    # Hold both calls after their early state check, so both see "completed".
+    barrier = threading.Barrier(2, timeout=10)
+    real_doc = daemon._doc_from_record
+
+    def doc_from_record(record):
+        barrier.wait()
+        return real_doc(record)
+
+    daemon._doc_from_record = doc_from_record
+    results = _race([lambda: daemon.followup(tid, "first"), lambda: daemon.followup(tid, "second")])
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 1 and isinstance(errors[0], ValueError) and "still active" in str(errors[0])
+    assert daemon.wait(tid, timeout=30)["status"]["state"] == "completed"
+    time.sleep(0.5)
+    assert len(daemon._tasks[tid]["attempts"]) == 2  # the original turn and one follow-up
+
+
+def test_two_concurrent_answers_start_one_turn(daemon, tmp_path, binpath):
+    _agent(daemon, binpath, "impl", "cat > /dev/null\nsleep 0.3\nexit 0")
+    ws = _git_repo(tmp_path)
+    tid = daemon.delegate(_doc(sensitive=True), ws)["task_id"]
+    assert daemon._tasks[tid]["state"] == "input-required"
+    barrier = threading.Barrier(2, timeout=10)
+    real_defaults = daemon._apply_defaults
+
+    def apply_defaults(doc):
+        barrier.wait()
+        return real_defaults(doc)
+
+    daemon._apply_defaults = apply_defaults
+    results = _race([lambda: daemon.answer_question(tid, "approved"), lambda: daemon.answer_question(tid, "approved too")])
+    errors = [r for r in results if isinstance(r, Exception)]
+    assert len(errors) == 1 and isinstance(errors[0], ValueError) and "no longer awaiting" in str(errors[0])
+    assert daemon.wait(tid, timeout=30, stop_states=("completed", "failed"))["status"]["state"] == "completed"
+    time.sleep(0.5)
+    assert len(daemon._tasks[tid]["attempts"]) == 1
+
+
+# ------------------------------------------------------------ stale park details
+def test_a_stale_routing_question_does_not_capture_a_later_answer(daemon, tmp_path, binpath):
+    _agent(daemon, binpath, "codex", "cat > /dev/null\necho work >> notes.txt\nexit 0")
+    _agent(daemon, binpath, "rev", 'cat > /dev/null\necho "VERDICT: FAIL"\necho "ISSUES:"\necho "- nope"\nexit 0')
+    ws = _git_repo(tmp_path)
+    # No target and no [defaults]: the task parks on the routing question.
+    doc = HandoffDoc(title="t", request="r", verification="none", commit_policy="no-commit", review_agent="rev", max_bounces=0)
+    tid = daemon.delegate(doc, ws)["task_id"]
+    assert daemon._tasks[tid]["awaiting"] == "routing"
+    daemon.cancel(tid, reason="later")
+    assert "awaiting" not in daemon._tasks[tid] and "question" not in daemon._tasks[tid]
+    daemon.followup(tid, "do the work")
+    assert daemon.wait(tid, timeout=30)["status"]["state"] == "input-required"
+    assert daemon._tasks[tid]["awaiting"] == "gate"  # the gate park names its own reason
+    out = daemon.answer_question(tid, "fix it please")  # an ordinary answer, not a routing answer
+    assert out["state"] == "working"
+
+
+def test_cancel_clears_the_routing_question_across_a_restart(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    ws = _git_repo(tmp_path)
+    first = _new_daemon(home)
+    tid = first.delegate(HandoffDoc(title="t", request="r", verification="none", commit_policy="no-commit"), ws)["task_id"]
+    first.cancel(tid)
+    first.stop()
+    second = _new_daemon(home)
+    try:
+        rebuilt = second._durable_record(tid)
+        assert rebuilt["state"] == "canceled" and "awaiting" not in rebuilt and "question" not in rebuilt
+    finally:
+        second.stop()
+
+
+# ------------------------------------------------------------ cancel versus completion
+def test_a_cancel_and_a_completion_at_the_same_moment_do_not_both_happen(daemon, tmp_path):
+    ws = _git_repo(tmp_path)
+    tid, record = daemon._make_record(_doc(), str(ws))
+    daemon._register_and_claims(tid, _doc(), str(ws))
+    daemon._set_state(tid, "working")
+    finisher: list[threading.Thread] = []
+
+    class CompletesOnSet(threading.Event):
+        # The turn finishes on another thread exactly while cancel() runs.
+        def set(self):
+            done = threading.Event()
+
+            def finish():
+                daemon._set_state(tid, "completed")
+                done.set()
+
+            thread = threading.Thread(target=finish)
+            finisher.append(thread)
+            thread.start()
+            done.wait(1.0)
+            super().set()
+
+    daemon._cancel_flags[tid] = CompletesOnSet()
+    daemon.cancel(tid, reason="stop")
+    finisher[0].join(10)
+    states = [e.data.get("state") for e in daemon.bus.history(task_id=tid, types=("state",))]
+    assert record["state"] == "canceled"
+    assert "completed" not in states  # never reported as both completed and canceled
+    # The other order: a task that already completed cannot be canceled.
+    tid2, _ = daemon._make_record(_doc(), str(ws))
+    daemon._set_state(tid2, "completed")
+    with pytest.raises(ValueError, match="already finished"):
+        daemon.cancel(tid2)
+
+
+# ------------------------------------------------------------ remote agents
+def test_a_silent_remote_agent_is_canceled_promptly(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from maestro.adapters.a2a_remote import A2ARemoteAdapter
+
+    canceled = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            # The remote agent prints nothing until it is canceled.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            canceled.wait(20)
+            frame = b'event: state\ndata: {"task_id": "r-1", "type": "state", "data": {"state": "canceled", "error": "canceled by orchestrator"}}\n\n'
+            self.wfile.write(frame)
+            self.wfile.flush()
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+            if body.get("method") == "tasks/cancel":
+                canceled.set()
+            out = json.dumps({"jsonrpc": "2.0", "id": body.get("id"), "result": {"task": {"kind": "task", "id": "r-1", "status": {"state": "submitted"}}}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        adapter = A2ARemoteAdapter(AgentSpec(name="remote", kind="a2a_remote", command=f"http://127.0.0.1:{server.server_address[1]}"))
+        flag = threading.Event()
+        threading.Timer(0.3, flag.set).start()
+        started = time.monotonic()
+        result = adapter.run("p", tmp_path, "task-1", timeout=6, should_cancel=flag.is_set)
+        assert result.ok is False and "canceled" in (result.error or "")
+        assert time.monotonic() - started < 4
+    finally:
+        canceled.set()
+        server.shutdown()
+        server.server_close()

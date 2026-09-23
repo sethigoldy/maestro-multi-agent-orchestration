@@ -105,7 +105,9 @@ to disable reuse or resize its budget.
 
 Errors: unknown task (`KeyError` text), empty instruction, task still active
 (`"…cancel it or answer its question before following up"`), depth exhausted —
-each returned as `{"error": …}`.
+each returned as `{"error": …}`. When two follow-ups for the same task arrive
+at the same moment, only one starts a turn; the other gets the "still active"
+error.
 
 ## task_wait
 
@@ -171,9 +173,14 @@ answer_task_question(workspace: str, task_id: str, answer: str) -> str
 ```
 
 Answers a question asked mid-task (state `input-required`). The agent resumes
-on its branch with the Q&A appended to its context. Returns
-`{"task_id": …, "state": "working"}`. Errors: unknown task, task not in
-`input-required`, empty answer — returned as `{"error": …}`.
+on its branch with the Q&A appended to its context. The answer starts a new
+turn, so the task moves to `submitted` straight away and then to `working`.
+Returns `{"task_id": …, "state": "working"}`, or
+`{"task_id": …, "state": "submitted", "queued": true}` when another task holds
+the workspace, or `{"task_id": …, "state": "input-required"}` when the task
+still has no agent chosen and now asks the routing question. Errors: unknown task, task not in `input-required`, empty
+answer, and an answer that lost a race (another answer given at the same
+moment, or a cancel, reached the task first) — returned as `{"error": …}`.
 
 ## Notes
 

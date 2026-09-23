@@ -59,6 +59,9 @@ appended to its context. Rules:
 
 - The task must be in `input-required`; answering anything else is an error.
 - The answer cannot be empty.
+- If two answers arrive at the same moment, only the first one starts the
+  task again; the other gets an error saying the task is no longer awaiting
+  that answer. The same error comes back when the task was canceled first.
 - Every Q&A pair is recorded in the task's transcript, so later follow-ups see
   it too. This includes answers to a task parked by a work-mode gate or waiting
   for approval: the park question and your answer both reach the agent.
@@ -84,12 +87,16 @@ Behavior and rules:
 - The call blocks until the follow-up turn finishes or needs input — no
   polling.
 - You cannot follow up while the task is still active; cancel it or answer its
-  question first.
+  question first. If two follow-ups arrive at the same moment, only one starts
+  a turn and the other gets this "still active" error.
 - A follow-up takes the task's workspace, like a new delegation. If another
   task is working in the same workspace, the follow-up waits in the queue
   (the call reports `"queued": true`) and starts when that task finishes, so
   two agents never edit the same working tree at once.
-- A task that was canceled can be followed up normally.
+- A task that was canceled can be followed up normally. If the canceled turn
+  is still finishing in the background (for example, still running its
+  verification), it can no longer change the task's state, free the
+  workspace, or start another agent; only the follow-up's turn can.
 - With `verification = "command"`, every follow-up runs the task's original
   verification command. The follow-up's instruction is never run as a command.
 - Each follow-up decrements `max_depth_remaining` by one (default 3), so
@@ -109,7 +116,14 @@ cancel_task(workspace="/path/to/repo",
 ```
 
 - Works on running tasks and on queued-waiting tasks (it removes them from the
-  queue).
+  queue). A queued task that is canceled at the moment it is being started
+  stays canceled, runs no agent, and the workspace goes to the next queued
+  task.
+- The check that the task is still running and the cancel happen in one step.
+  A task that finishes at the same moment is either completed (and the cancel
+  reports that it already finished) or canceled, never both.
+- Canceling a task that waits for an answer also clears the question it was
+  waiting on, so a later follow-up does not inherit it.
 - Partial work stays on the task branch — nothing is rolled back.
 - The task is marked `canceled` with your reason; already-finished tasks cannot
   be canceled (they are terminal).

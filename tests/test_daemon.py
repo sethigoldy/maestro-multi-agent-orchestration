@@ -1085,11 +1085,14 @@ def test_fifo_promotion_keeps_third_queued(daemon, tmp_path, binpath):
     assert second["queued"] and third["queued"]
     daemon.cancel(first["task_id"], reason="make room")
     # The second task is promoted; the third stays queued (workspace still busy).
+    # It leaves the queue as soon as it takes the slot, and its turn's thread
+    # then moves it on from "submitted"; wait for that.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        if not daemon._tasks[second["task_id"]]["queued"]:
+        if daemon._tasks[second["task_id"]]["state"] != "submitted":
             break
         time.sleep(0.1)
+    assert daemon._tasks[second["task_id"]]["queued"] is False
     assert daemon._tasks[second["task_id"]]["state"] in ("working", "completed")
     assert daemon._tasks[third["task_id"]]["queued"] is True
     daemon.cancel(second["task_id"])
@@ -2465,7 +2468,7 @@ def test_crash_does_not_override_parked_state(daemon, tmp_path, binpath, monkeyp
     _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
     ws = _git_repo(tmp_path)
 
-    def park_then_boom(task_id, doc, workspace, agent_name, result):
+    def park_then_boom(task_id, doc, workspace, agent_name, result, turn_flag=None):
         daemon._set_state(task_id, "input-required", question="parked for test")
         raise RuntimeError("boom after park")
 

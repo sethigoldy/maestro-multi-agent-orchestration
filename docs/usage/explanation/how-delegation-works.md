@@ -49,7 +49,7 @@ never by callers:
 submitted ──▶ working ──▶ completed
    │            │  ▲         
    │            ▼  │         
-   │     input-required (question answered → back to working)
+   │     input-required (question answered → submitted → working)
    │            │
    ├──▶ canceled (user cancel, running or queued)
    └──▶ failed   (every agent in the target→fallback chain failed)
@@ -60,7 +60,8 @@ submitted ──▶ working ──▶ completed
 - **working** — an agent is running on the task branch. Retries and fallback
   hops stay inside this state; each attempt is recorded separately.
 - **input-required** — the agent asked a question (or a sensitive task awaits
-  approval). The task waits here indefinitely until answered.
+  approval). The task waits here indefinitely until answered. An answer starts
+  a new turn: the task goes back to `submitted` and then to `working`.
 - **completed** — an agent finished successfully *and* verification ran. Note
   that "completed" already includes the deterministic check; it is not merely
   "the agent said done." A task whose check fails still reaches `completed` —
