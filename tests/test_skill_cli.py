@@ -73,7 +73,7 @@ def test_skill_install_all(tmp_path, monkeypatch, capsys):
     runner = Runner(monkeypatch, home)
     rc, out, _ = runner.run("skill", "install", "--all")
     assert rc == 0
-    assert (home / ".codex" / "instructions.md").is_file()
+    assert (home / ".codex" / "AGENTS.md").is_file()
     assert (home / ".cursor" / "rules" / f"{SKILL_NAME}.mdc").is_file()
     assert (home / ".claude" / "skills" / SKILL_NAME / "SKILL.md").is_file()
     data = json.loads((home / ".openhands" / "agent_settings.json").read_text(encoding="utf-8"))
@@ -96,7 +96,7 @@ def test_skill_install_detected_only(tmp_path, monkeypatch, capsys):
     assert rc == 0
     assert "✓ Codex" in out and "installed" in out
     assert "not-detected" in out  # the other seven are reported, not failed
-    assert (home / ".codex" / "instructions.md").is_file()
+    assert (home / ".codex" / "AGENTS.md").is_file()
     assert not (home / ".claude" / "skills").exists()
 
 
@@ -113,11 +113,11 @@ def test_skill_install_and_uninstall_roundtrip(tmp_path, monkeypatch, capsys):
     runner = Runner(monkeypatch, home, bindir)
 
     rc, out, _ = runner.run("skill", "install")
-    assert rc == 0 and (home / ".codex" / "instructions.md").is_file()
+    assert rc == 0 and (home / ".codex" / "AGENTS.md").is_file()
 
     rc, out, _ = runner.run("skill", "uninstall")
     assert rc == 0 and "Codex" in out and "uninstalled" in out
-    assert not (home / ".codex" / "instructions.md").exists()
+    assert not (home / ".codex" / "AGENTS.md").exists()
 
     # Idempotent: uninstalling again is a no-op success.
     rc, out, _ = runner.run("skill", "uninstall")

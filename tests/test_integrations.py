@@ -503,7 +503,7 @@ def test_manager_install_detected_only(tmp_path, monkeypatch):
     for kind in ("copilot", "cursor", "hermes", "pi", "cline", "openhands"):
         assert by_kind[kind].action == "not-detected" and by_kind[kind].ok is True
     # Only detected agents received files.
-    assert (home / ".codex" / "instructions.md").is_file()
+    assert (home / ".codex" / "AGENTS.md").is_file()
     assert (home / ".claude" / "skills" / SKILL_NAME / "SKILL.md").is_file()
     assert not (home / ".copilot" / "instructions.md").exists()
 
@@ -567,7 +567,7 @@ def test_manager_uninstall_everywhere(tmp_path, monkeypatch):
     results = manager.uninstall()
     assert {r.kind for r in results} == {"codex", "claude_code"}
     assert all(r.action == "uninstalled" for r in results)
-    assert not (home / ".codex" / "instructions.md").exists()
+    assert not (home / ".codex" / "AGENTS.md").exists()
 
     # Nothing installed anymore.
     assert manager.uninstall() == []

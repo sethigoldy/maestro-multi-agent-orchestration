@@ -60,10 +60,12 @@ class HermesAdapter(BaseAdapter):
         log_dir = settings.get("maestro_log_dir")
         if log_dir:
             command += ["--usage-file", str(Path(log_dir) / f"usage-{task_id}.json")]
-        model = (self.spec.model if self.spec is not None else None) or settings.get("model")
+        # Settings already carry registry defaults merged with per-task
+        # overrides (daemon._turn_settings), so a per-task value wins.
+        model = settings.get("model") or (self.spec.model if self.spec is not None else None)
         if model:
             command += ["-m", str(model)]
-        effort = (self.spec.effort if self.spec is not None else None) or settings.get("effort")
+        effort = settings.get("effort") or (self.spec.effort if self.spec is not None else None)
         if effort:
             command += ["--reasoning", str(effort)]
         command.append("--yolo")

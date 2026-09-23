@@ -385,7 +385,7 @@ def test_claim_fallback_and_status_artifacts(tmp_path, monkeypatch):
     # Path without .maestro cannot produce workspace.
     assert Maestro._workspace_from_artifact_path('/tmp/nope/result.json') is None
     # Registry duplicate and missing status: list should skip invalid entries.
-    idx=m._load_index(); idx.append({'number':99,'task_id':'task-missing','title':'missing','workspace':str(w1),'project_root':str(w1)}); m._save_index(idx); orig_status=m.status; m.status=lambda ref: (_ for _ in ()).throw(KeyError(ref)) if ref=='task-missing' else orig_status(ref); assert all(x['task_id']!='task-missing' for x in m.list_tasks())
+    idx=m._load_index(); idx.append({'number':99,'task_id':'task-missing','title':'missing','workspace':str(w1),'project_root':str(w1)}); m._save_index(idx); orig_status=m.status; m.status=lambda ref, *rest: (_ for _ in ()).throw(KeyError(ref)) if ref=='task-missing' else orig_status(ref, *rest); assert all(x['task_id']!='task-missing' for x in m.list_tasks())
     m.close()
 
 def test_final_branch_edges(tmp_path, monkeypatch):

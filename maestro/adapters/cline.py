@@ -31,10 +31,16 @@ class ClineAdapter(BaseAdapter):
 
     def build_command(self, prompt: str, workspace: Path, task_id: str, settings: dict[str, Any]) -> list[str]:
         command = ["cline", "--json"]
-        model = (self.spec.model if self.spec is not None else None) or settings.get("model")
+        # Settings already carry registry defaults merged with per-task
+        # overrides (daemon._turn_settings), so a per-task value wins.
+        model = settings.get("model") or (self.spec.model if self.spec is not None else None)
         if model:
             command += ["--model", str(model)]
-        effort = (self.spec.effort if self.spec is not None else None) or settings.get("effort")
+        # A task effort cline does not understand (such as "max") falls back to
+        # the registry effort, so --thinking is not silently dropped.
+        effort = settings.get("effort")
+        if effort not in _CLINE_THINKING:
+            effort = self.spec.effort if self.spec is not None else None
         if effort in _CLINE_THINKING:
             command += ["--thinking", str(effort)]
         return command

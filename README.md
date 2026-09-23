@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orch
 4. **installs the global `maestro-driven-development` skill** into every
    detected agent, using each agent's own global instruction/skill mechanism
    (e.g. `~/.claude/skills/…` for Claude Code, a managed block in
-   `~/.codex/instructions.md` for Codex, a global rule for Cursor).
+   `~/.codex/AGENTS.md` for Codex, a global rule for Cursor).
 5. **starts the daemon in the background** (`maestro daemon start`) and
    verifies it is healthy before printing a summary of what it did.
 
@@ -80,6 +80,21 @@ The daemon runs detached in its own session, so it survives the shell that
 started it; a new terminal can talk to it immediately. Its state lives in
 `~/.maestro/daemon.json` (plus `daemon.log` for output), and a stale marker from
 a dead process is reported as stopped — never as running.
+
+Only one daemon owns a state directory at a time. The owning daemon holds a
+lock file (`daemon.owner.lock`) for as long as it runs. A second
+`maestro-daemon` on the same state directory refuses to start and says which
+daemon owns it. The MCP server's built-in daemon does not refuse, because that
+would break the MCP tools whenever a background daemon is running: it runs its
+own tasks without an HTTP endpoint, prints a note on stderr, and leaves the
+owning daemon's marker and tasks alone. A daemon marks leftover "working" tasks
+as failed at startup only when no other daemon process is using the state
+directory, so it never fails tasks that another live daemon is still running.
+
+`maestro daemon stop` signals a process only after confirming that it is the
+daemon that wrote the marker. If the daemon crashed and its pid now belongs to
+an unrelated process, `stop` removes the stale marker, does not signal that
+process, and says so.
 
 `maestro-daemon` remains the low-level **foreground** executable for
 development, debugging, service managers, and CI: it starts the same daemon in
@@ -483,6 +498,23 @@ its LAN IP when bound to all interfaces; every other daemon that hears it
 records the peer in `~/.maestro/peers.json`. Peers heard recently are **live**;
 a peer silent for ~15 seconds is marked **stale**.
 
+A daemon that listens on loopback only (the default, `127.0.0.1`) cannot be
+reached from another machine, so it does not announce itself or listen for
+peers unless you set `MAESTRO_DISCOVERY=1`. A daemon started with
+`--bind 0.0.0.0` or a LAN address runs discovery unless you set
+`MAESTRO_DISCOVERY=0`.
+
+Announcements are treated as untrusted input. The daemon reads only packets
+sent to the multicast group, never unicast packets aimed at the port. When
+`MAESTRO_DISCOVERY_IF` is `127.0.0.1`, it ignores announcements from other
+hosts. An announcement is dropped when its advertised host is not an IP
+address or its port is not a valid port, and names lose their control
+characters, so `maestro peers list` never prints terminal escape codes.
+`peers.json` holds at most 256 peers: a discovered peer that has not been heard
+for an hour is removed, and when the table is full the oldest discovered peers
+are dropped first. Manually added peers are never dropped. The file is
+rewritten only when a peer is new or has changed, not on every announcement.
+
 Peers are an *informational* roster — they tell you what's on the network. To
 actually delegate to a discovered daemon, register it as an agent with its
 token (see "Remote agents" above).
@@ -505,9 +537,9 @@ peers refresh automatically. To tune or disable discovery:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `MAESTRO_DISCOVERY` | `1` | Set `0` to turn discovery off entirely |
+| `MAESTRO_DISCOVERY` | on beyond loopback, off on loopback | Set `0` to turn discovery off entirely. Set `1` to turn it on for a daemon that listens on loopback only |
 | `MAESTRO_DISCOVERY_PORT` | `9786` | UDP port for the presence channel |
-| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only) |
+| `MAESTRO_DISCOVERY_IF` | default interface | Interface to shout on (e.g. `127.0.0.1` for loopback only; then announcements from other hosts are ignored) |
 | `MAESTRO_DISCOVERY_TTL` | `1` | Hop distance: `0` = this machine only, `1` = LAN |
 | `MAESTRO_NODE_NAME` | `maestro-node` | The name this daemon announces under |
 
@@ -554,8 +586,8 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | Command | What it does |
 |---|---|
 | `maestro doctor [--json]` | Diagnose the environment: state dir, daemon reachability, git, agent CLIs (with versions), workspace, budget caps. Read-only; exits non-zero only on a blocking problem |
-| `maestro daemon start \| stop \| status [--json] \| restart` | Background daemon lifecycle manager. `start` detaches the daemon and returns immediately (idempotent — never starts a duplicate); `stop` is SIGTERM → grace period → SIGKILL, idempotent; `status` exits 0 when running, 1 when stopped, and distinguishes a stale marker from a live process |
-| `maestro-daemon [--port N] [--bind IF] [--state-dir DIR]` | The same broker daemon in the **foreground** (development/CI/service managers). `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only |
+| `maestro daemon start \| stop \| status [--json] \| restart` | Background daemon lifecycle manager. `start` detaches the daemon and returns immediately (idempotent — never starts a duplicate); `stop` is SIGTERM → grace period → SIGKILL, idempotent, and never signals a process it cannot confirm is the daemon (a reused pid only gets its stale marker removed); `status` exits 0 when running, 1 when stopped, and distinguishes a stale marker from a live process |
+| `maestro-daemon [--port N] [--bind IF] [--state-dir DIR] [--allow-origin ORIGIN]` | The same broker daemon in the **foreground** (development/CI/service managers). `--bind 0.0.0.0` (or an explicit IP) exposes it to the network and enables token auth; default is loopback-only. `--allow-origin` lets a reverse proxy's public address POST to it |
 | `maestro skill list \| status \| install [--agent NAME \| --all] \| uninstall [--agent NAME]` | Manage the global `maestro-driven-development` skill across supported agents (per-agent global mechanisms, idempotent installs) |
 | `maestro delegate --title … --request … --target A --fallback B --workspace DIR` | Delegate a handoff (blocks, live output). `--file handoff.toml` instead of flags; `--mode NAME` applies a work-mode preset (see "Work modes"); `--context TEXT`, `--context-file PATH`, `--skill DIR` add context entries (repeatable, see "Context injection"); `--no-wait` returns immediately |
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
@@ -611,7 +643,7 @@ backend = "filesystem"    # filesystem (default) | memvara
 
 **Routing defaults:** when a handoff names no target agent, `[defaults].agent`
 becomes the target and `[defaults].model`/`effort` fill in what the handoff left
-unset. If neither the handoff nor `[defaults]` names an agent, Maestro does not
+unset, unless the target agent's registry entry sets its own value. If neither the handoff nor `[defaults]` names an agent, Maestro does not
 guess: the task parks in state `input-required` with a question listing every
 available agent, and resumes via MCP `answer_task_question` (a bare agent name,
 `agent=… model=…` pairs, or JSON). Set `[defaults]` to stop being asked.
@@ -665,7 +697,7 @@ phases = ["implementer"]         # optional — default: all phases
 | `MAESTRO_DELEGATE_TIMEOUT` | `3600` | Max seconds the MCP server waits for a delegated task |
 | `MAESTRO_BUDGET_PER_AGENT_USD` | off | Cumulative USD cap per agent (see Budget caps) |
 | `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap, all agents, UTC day |
-| `MAESTRO_DISCOVERY` / `_PORT` / `_IF` / `_TTL` | on/9786/default/1 | P2P discovery tuning (see P2P discovery) |
+| `MAESTRO_DISCOVERY` / `_PORT` / `_IF` / `_TTL` | on (off for a loopback-only daemon)/9786/default/1 | P2P discovery tuning (see P2P discovery) |
 | `MAESTRO_NODE_NAME` | `maestro-node` | Announced name for discovery |
 | `MAESTRO_PYTHON` | — | Interpreter used for verification's pytest probe (must be a file) |
 | `MAESTRO_STORAGE` | — | Storage backend when no config file sets it (file values win) |
@@ -680,7 +712,8 @@ project or worktree:
 
 ```text
 ~/.maestro/                      (or $MAESTRO_HOME)
-├── registry.json                # registered agents
+├── agents/<name>.toml           # registered agents
+├── registry.json                # task registry: task numbers, titles, workspaces
 ├── state.jsonl                  # durable claim journal (task history)
 ├── daemon.json                  # which daemon is running (host, port, pid; token when auth is on)
 ├── peers.json                   # discovered/registered peers
@@ -823,7 +856,7 @@ by hand.
 
 The MCP surface is task-oriented: `delegate`, `followup`, `task_wait`,
 `task_status`, `list_tasks`, `agents_list`, `cancel_task`,
-`answer_task_question` — exact signatures and return shapes in the
+`answer_task_question`, `rename_task_branch` — exact signatures and return shapes in the
 [MCP tools reference](docs/usage/reference/mcp-tools.md).
 
 ---
@@ -845,7 +878,9 @@ reset; already-running tasks are unaffected.
 
 **`peers list` is empty on a LAN**
 The network likely blocks multicast — use `maestro peers add --name … --url …`.
-Verify your daemon is announcing at all: set `MAESTRO_DISCOVERY_TTL=0` and
+Check that your daemon is announcing at all: a daemon bound to `127.0.0.1`
+does not announce unless `MAESTRO_DISCOVERY=1` is set. Then set
+`MAESTRO_DISCOVERY=1`, `MAESTRO_DISCOVERY_TTL=0` and
 `MAESTRO_DISCOVERY_IF=127.0.0.1` to confirm loopback discovery works before
 debugging the network.
 

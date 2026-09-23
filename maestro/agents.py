@@ -9,8 +9,11 @@ code (launch command + input/output mode + workspace policy).
 
 from __future__ import annotations
 
+import os
 import re
+import secrets
 import shutil
+import stat
 import subprocess
 import tomllib
 from dataclasses import dataclass, field
@@ -94,7 +97,9 @@ class AgentSpec:
     output_format: str = "text"
     workspace_policy: str = "cwd"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, redact: bool = False) -> dict[str, Any]:
+        """The spec as a plain dict. ``redact=True`` replaces the bearer token
+        with "<redacted>"; use it for anything shown to a person or a model."""
         data: dict[str, Any] = {
             "name": self.name,
             "kind": self.kind,
@@ -110,7 +115,7 @@ class AgentSpec:
         if self.timeout_s is not None:
             data["timeout_s"] = self.timeout_s
         if self.token is not None:
-            data["token"] = self.token
+            data["token"] = "<redacted>" if redact else self.token
         if self.kind == GENERIC_KIND:
             data.update(
                 {
@@ -151,15 +156,32 @@ def validate_agent_spec(spec: AgentSpec) -> AgentSpec:
     return spec
 
 
+#: Characters a TOML basic string may not hold as-is: backslash, double quote,
+#: and every control character except tab (U+0000 to U+001F and U+007F).
+_TOML_NEEDS_ESCAPE = re.compile('[\\\\"\x00-\x08\x0a-\x1f\x7f]')
+_TOML_SHORT_ESCAPES = {"\\": "\\\\", '"': '\\"', "\n": "\\n"}
+_TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
 def _toml_scalar(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
-        escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        # Backslash, quote and newline use their short escapes; every other
+        # forbidden character is written as \uXXXX, which TOML always accepts.
+        escaped = _TOML_NEEDS_ESCAPE.sub(
+            lambda match: _TOML_SHORT_ESCAPES.get(match.group(0), f"\\u{ord(match.group(0)):04X}"), value
+        )
         return f'"{escaped}"'
     raise TypeError(f"Unsupported TOML scalar type: {type(value).__name__}")
+
+
+def _toml_key(key: Any) -> str:
+    """Write a key bare when TOML allows it, and as a quoted string otherwise."""
+    text = str(key)
+    return text if _TOML_BARE_KEY_RE.match(text) else _toml_scalar(text)
 
 
 def _dump_toml(data: dict[str, Any]) -> str:
@@ -171,29 +193,29 @@ def _dump_toml(data: dict[str, Any]) -> str:
             nested[key] = value
         elif isinstance(value, list):
             if all(isinstance(item, str) for item in value):
-                lines.append(f"{key} = [{', '.join(_toml_scalar(item) for item in value)}]")
+                lines.append(f"{_toml_key(key)} = [{', '.join(_toml_scalar(item) for item in value)}]")
             elif all(isinstance(item, dict) for item in value):
                 # Array of tables: [[key]] blocks (e.g. the handoff's [[context]]).
                 for item in value:
                     lines.append("")
-                    lines.append(f"[[{key}]]")
+                    lines.append(f"[[{_toml_key(key)}]]")
                     for sub_key, sub_value in item.items():
                         if isinstance(sub_value, list):
-                            lines.append(f"{sub_key} = [{', '.join(_toml_scalar(x) for x in sub_value)}]")
+                            lines.append(f"{_toml_key(sub_key)} = [{', '.join(_toml_scalar(x) for x in sub_value)}]")
                         else:
-                            lines.append(f"{sub_key} = {_toml_scalar(sub_value)}")
+                            lines.append(f"{_toml_key(sub_key)} = {_toml_scalar(sub_value)}")
             else:
                 raise TypeError(f"List {key!r} must contain only strings or tables")
         else:
-            lines.append(f"{key} = {_toml_scalar(value)}")
+            lines.append(f"{_toml_key(key)} = {_toml_scalar(value)}")
     for key, table in nested.items():
         lines.append("")
-        lines.append(f"[{key}]")
+        lines.append(f"[{_toml_key(key)}]")
         for sub_key, value in table.items():
             if isinstance(value, list):
-                lines.append(f"{sub_key} = [{', '.join(_toml_scalar(item) for item in value)}]")
+                lines.append(f"{_toml_key(sub_key)} = [{', '.join(_toml_scalar(item) for item in value)}]")
             else:
-                lines.append(f"{sub_key} = {_toml_scalar(value)}")
+                lines.append(f"{_toml_key(sub_key)} = {_toml_scalar(value)}")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -220,12 +242,50 @@ def _spec_from_data(data: dict[str, Any]) -> AgentSpec:
     )
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` readable by the owner only (mode 0600).
+
+    Used for files that can hold a bearer token. The text goes into a new
+    temporary file in the same directory, created with mode 0600, which then
+    replaces ``path``. The file is never rewritten in place: Unix checks
+    permissions only when a file is opened, so another user who opened an old
+    world-readable copy could otherwise read the new token through that handle.
+    The temporary file is removed if anything fails.
+    """
+    tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 class AgentRegistry:
     """File-backed registry of agents under ``<state_dir>/agents/``."""
 
     def __init__(self, state_dir: str | Path) -> None:
         self.dir = Path(state_dir) / "agents"
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._tighten_entry_modes()
+
+    def _tighten_entry_modes(self) -> None:
+        """Make entries written by older versions readable by the owner only.
+
+        Older versions wrote entries with the default mode, often 0644, and an
+        entry can hold a bearer token. A symbolic link is left alone so
+        that its target is never changed. A file this user cannot chmod (for
+        example one owned by another user) is skipped rather than failing.
+        """
+        for path in self.dir.glob("*.toml"):
+            try:
+                mode = path.lstat().st_mode
+                if stat.S_ISREG(mode) and mode & 0o077:
+                    os.chmod(path, 0o600)
+            except OSError:
+                continue
 
     def _path(self, name: str) -> Path:
         if not isinstance(name, str) or not _NAME_RE.match(name):
@@ -254,8 +314,25 @@ class AgentRegistry:
             return None
 
     def save(self, spec: AgentSpec) -> AgentSpec:
+        """Write the spec's TOML file without ever leaving a broken file behind.
+
+        The text is parsed before anything is written; if it is not valid TOML
+        the save is refused and the current file is left as it was. The text
+        is then written to a temporary file next to the target and renamed over
+        it, so a failed write cannot truncate the existing entry. The entry can
+        hold a bearer token, so the file is readable by its owner only (0600).
+        """
         spec = validate_agent_spec(spec)
-        self._path(spec.name).write_text(_dump_toml(spec.to_dict()), encoding="utf-8")
+        path = self._path(spec.name)
+        text = _dump_toml(spec.to_dict())
+        try:
+            tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ValueError(f"Refusing to save agent {spec.name!r}: the registry writer produced invalid TOML ({exc})") from exc
+        # The entry can hold a bearer token, so only the owner may read it.
+        # _write_private replaces the file and removes its temporary file on
+        # any failure, including a UnicodeEncodeError from a lone surrogate.
+        _write_private(path, text)
         return spec
 
     def remove(self, name: str) -> bool:

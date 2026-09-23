@@ -9,7 +9,8 @@ paths are hardcoded anywhere else.
 Mechanisms (all under the user's home directory, never system paths):
 
 - Claude Code: global Agent Skill at ``~/.claude/skills/maestro-driven-development/SKILL.md``
-- Codex: managed block in ``~/.codex/instructions.md`` (global instructions)
+- Codex: managed block in ``~/.codex/AGENTS.md`` (global instructions; a block left
+  in the legacy ``~/.codex/instructions.md`` by older releases is removed)
 - GitHub Copilot CLI: managed block in ``~/.copilot/instructions.md``
 - Cursor: global user rule at ``~/.cursor/rules/maestro-driven-development.mdc``
 - Hermes: managed block in ``~/.hermes/instructions.md``
@@ -124,6 +125,21 @@ class AgentIntegration:
         raise NotImplementedError
 
 
+def _read_instructions(path: Path) -> tuple[str | None, str | None]:
+    """Read an instructions file as UTF-8 text; return (text, None) or (None, error).
+
+    A file that cannot be read, or whose bytes are not valid UTF-8, gives an
+    error text instead of raising. Callers must then leave the file alone,
+    because writing it back would destroy text that the user wrote.
+    """
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except UnicodeDecodeError as exc:
+        return None, f"cannot read {path}: the file is not valid UTF-8 text ({exc}); Maestro left it unchanged"
+    except OSError as exc:
+        return None, f"cannot read {path}: {exc}"
+
+
 class _BlockIntegration(AgentIntegration):
     """Agents whose global instructions live in one markdown file."""
 
@@ -132,10 +148,9 @@ class _BlockIntegration(AgentIntegration):
 
     def install_skill(self, home: Path, content: str) -> IntegrationResult:
         path = self.instructions_path(home)
-        try:
-            existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-        except OSError as exc:
-            return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot read {path}: {exc}", str(path))
+        existing, error = _read_instructions(path) if path.is_file() else ("", None)
+        if existing is None:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error or f"cannot read {path}", str(path))
         new_text, present = _replace_block(existing, _managed_block(content))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,10 +164,9 @@ class _BlockIntegration(AgentIntegration):
         path = self.instructions_path(home)
         if not path.is_file():
             return IntegrationResult(self.kind, self.display_name, True, "skipped", "nothing installed", str(path))
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot read {path}: {exc}", str(path))
+        text, error = _read_instructions(path)
+        if text is None:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error or f"cannot read {path}", str(path))
         new_text, removed = _remove_block(text)
         if not removed:
             return IntegrationResult(self.kind, self.display_name, True, "skipped", "not installed", str(path))
@@ -166,14 +180,19 @@ class _BlockIntegration(AgentIntegration):
         return IntegrationResult(self.kind, self.display_name, True, "uninstalled", f"{self.mechanism} removed", str(path))
 
     def status(self, home: Path) -> dict[str, Any]:
+        """Report whether the managed block is present.
+
+        When the file exists but cannot be read (including a file that is not
+        UTF-8), ``installed`` is False and an ``error`` key says why, because
+        Maestro cannot tell whether its block is there.
+        """
         path = self.instructions_path(home)
         installed = False
+        error = None
         if path.is_file():
-            try:
-                installed = _BEGIN in path.read_text(encoding="utf-8")
-            except OSError:
-                installed = False
-        return {
+            text, error = _read_instructions(path)
+            installed = text is not None and _BEGIN in text
+        info = {
             "kind": self.kind,
             "display_name": self.display_name,
             "mechanism": self.mechanism,
@@ -181,15 +200,78 @@ class _BlockIntegration(AgentIntegration):
             "detected": self.detect(),
             "installed": installed,
         }
+        if error is not None:
+            info["error"] = error
+        return info
 
 
 class CodexIntegration(_BlockIntegration):
+    """Codex reads its global instructions from ``~/.codex/AGENTS.md``.
+
+    Earlier Maestro releases wrote the block to ``~/.codex/instructions.md``,
+    which current Codex CLIs do not read. Installing or uninstalling therefore
+    also removes a managed block left in that legacy file, and deletes the
+    legacy file when the block was all it held.
+    """
+
     kind = "codex"
     display_name = "Codex"
-    mechanism = "global instructions block (~/.codex/instructions.md)"
+    mechanism = "global instructions block (~/.codex/AGENTS.md)"
 
     def instructions_path(self, home: Path) -> Path:
+        return home / ".codex" / "AGENTS.md"
+
+    def legacy_path(self, home: Path) -> Path:
         return home / ".codex" / "instructions.md"
+
+    def _legacy_block_present(self, home: Path) -> bool:
+        path = self.legacy_path(home)
+        try:
+            return path.is_file() and _BEGIN in path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return False  # a file we cannot read cannot hold a block we can remove
+
+    def _remove_legacy_block(self, home: Path) -> str | None:
+        """Remove the managed block from the legacy file; return an error text or None."""
+        if not self._legacy_block_present(home):
+            return None
+        path = self.legacy_path(home)
+        try:
+            new_text, _removed = _remove_block(path.read_text(encoding="utf-8"))
+            if new_text.strip():
+                path.write_text(new_text, encoding="utf-8")
+            else:
+                path.unlink()  # the legacy file only ever held our block
+        except OSError as exc:
+            return f"cannot clean the legacy block from {path}: {exc}"
+        return None
+
+    def install_skill(self, home: Path, content: str) -> IntegrationResult:
+        result = super().install_skill(home, content)
+        if result.ok:
+            error = self._remove_legacy_block(home)
+            if error:
+                return IntegrationResult(self.kind, self.display_name, False, "error", error, result.path)
+        return result
+
+    def uninstall_skill(self, home: Path) -> IntegrationResult:
+        had_legacy = self._legacy_block_present(home)
+        result = super().uninstall_skill(home)
+        if not result.ok:
+            return result
+        error = self._remove_legacy_block(home)
+        if error:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error, str(self.legacy_path(home)))
+        if had_legacy and result.action == "skipped":
+            return IntegrationResult(self.kind, self.display_name, True, "uninstalled", "legacy instructions block removed", str(self.legacy_path(home)))
+        return result
+
+    def status(self, home: Path) -> dict[str, Any]:
+        info = super().status(home)
+        # A block in the legacy file is not read by Codex, so it does not count
+        # as installed; it is reported separately so uninstall can clean it.
+        info["legacy_installed"] = self._legacy_block_present(home)
+        return info
 
 
 class CopilotIntegration(_BlockIntegration):
@@ -388,9 +470,9 @@ class OpenHandsIntegration(AgentIntegration):
         block = _managed_block(content)
         current = data.get("custom_instructions")
         current = current if isinstance(current, str) else ""
-        present = _BEGIN in current
-        if not present:
-            current = f"{current.rstrip(chr(10))}\n\n{block}\n" if current.strip() else f"{block}\n"
+        # Replace an existing managed block so that an upgrade installs the new
+        # skill text; append a new block after any text the user wrote.
+        current, present = _replace_block(current, block)
         data["custom_instructions"] = current
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -510,7 +592,10 @@ class SkillManager:
             return [target.uninstall_skill(self.home)]
         results: list[IntegrationResult] = []
         for integration in self.integrations():
-            if integration.status(self.home)["installed"]:
+            state = integration.status(self.home)
+            # A file that cannot be read may still hold the block, so it is
+            # included; its uninstall reports the problem and leaves it alone.
+            if state["installed"] or state.get("legacy_installed") or state.get("error"):
                 results.append(integration.uninstall_skill(self.home))
         return results
 

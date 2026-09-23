@@ -123,7 +123,10 @@ def test_agents_cli_lifecycle(monkeypatch, tmp_path, capsys):
                "--command", "http://10.0.0.5:8790", "--token", "sekrit") == 0
     remote = json.loads(capsys.readouterr().out)
     assert remote["kind"] == "a2a_remote" and remote["command"] == "http://10.0.0.5:8790"
-    assert remote["token"] == "sekrit"
+    assert remote["token"] == "<redacted>"  # printed output never carries the token
+    stored = (home / "agents" / "remote-b.toml")
+    assert 'token = "sekrit"' in stored.read_text(encoding="utf-8")  # the registry keeps the real one
+    assert stored.stat().st_mode & 0o777 == 0o600
     assert run("agents", "remove", "remote-b") == 0
     capsys.readouterr()
 

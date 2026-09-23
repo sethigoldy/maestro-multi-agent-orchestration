@@ -66,7 +66,7 @@ Maestro already does:
 | `implementer` (required) | implementing | the handoff's explicit target, or its default |
 | `verifier` | verifying | deterministic check only (today's behavior) |
 | `reviewer` | reviewing | no LLM review turn; you/supervisor review as before |
-| `fixer` | fixing | bounces go back to the implementer |
+| `fixer` | fixing | bounces go back to the task's implementer (the handoff's explicit target when it names one, otherwise the preset's `implementer`) |
 
 Check that Maestro parsed them:
 
