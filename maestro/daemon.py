@@ -333,15 +333,20 @@ class MaestroDaemon:
         self._runner: dict[str, Any] = {"pid": os.getpid(), "started": daemonctl.process_start_token(os.getpid())}
         # Every daemon process that uses this state directory holds a shared
         # lock on it. Only a process that can briefly take that lock
-        # exclusively is alone here. Task records written by older versions
-        # name no runner, so such a task may be failed only by a daemon that
-        # is alone: otherwise it may belong to another live daemon.
+        # exclusively is alone here; see _reconcile_interrupted_tasks for how
+        # that decides which leftover tasks are failed.
         self._users_lock_fd = daemonctl.open_lock(self.state_dir / daemonctl.USERS_LOCK_NAME)
         try:
             alone = daemonctl.try_exclusive(self._users_lock_fd)
             # A daemon from an older version holds no lock, so its answering marker is checked too.
-            alone = alone and daemonctl.live_owner(self.state_dir) is None
-            self._reconcile_interrupted_tasks(alone=alone)
+            owner = daemonctl.live_owner(self.state_dir)
+            if start_http and owner is not None:
+                # This daemon is about to be refused (start_http raises the same
+                # error), so it must not fail any task on its way out.
+                raise daemonctl.DaemonAlreadyRunning(
+                    f"another Maestro daemon (pid {owner.pid}, {owner.url}) already owns the state directory {self.state_dir}"
+                )
+            self._reconcile_interrupted_tasks(alone=alone and owner is None)
             daemonctl.hold_shared(self._users_lock_fd)
         except BaseException:
             # Closing the descriptor drops the lock, whichever mode it was in,
@@ -489,13 +494,17 @@ class MaestroDaemon:
         input-required tasks are left alone — they are legitimately waiting for
         an answer, not interrupted.
 
-        Whether a task is interrupted is decided by its own runner: the pid and
+        When this daemon is ``alone`` (the default), no other daemon process
+        uses the state directory, so nothing else can be running a leftover
+        task, and every one is failed, whatever its runner record says. (A
+        container that restarts runs the new daemon under the old pid again, so
+        a live pid in the record proves nothing then.) When other daemon
+        processes share the directory, the task's runner decides: the pid and
         start time of the daemon process that ran it, recorded in its runtime
-        record. A task whose runner is still alive belongs to that process and
-        is left alone, even when this daemon is otherwise alone. A task from an
-        older version records no runner; it is failed only when ``alone`` is
-        True (the default), that is, when no other daemon process uses the
-        state directory.
+        record. The task is failed only when that process is certainly gone. It
+        is left alone when the process still runs, when its start time cannot
+        be read now (the process may still run), and when no runner was
+        recorded (a record from an older version).
         """
         try:
             records = self.maestro._registry_records()
@@ -523,13 +532,13 @@ class MaestroDaemon:
                 reason = "daemon restarted before the task started; re-delegate to run it."
             else:
                 continue  # completed/failed/canceled or parked input-required: leave as-is
-            runner = runtime.get("runner")
-            pid = runner.get("pid") if isinstance(runner, dict) else None
-            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
-                if daemonctl.runner_alive(runner):
-                    continue  # its daemon process still runs it
-            elif not alone:
-                continue  # no usable runner recorded: it may belong to another live daemon
+            if not alone:
+                runner = runtime.get("runner")
+                pid = runner.get("pid") if isinstance(runner, dict) else None
+                if not (isinstance(pid, int) and not isinstance(pid, bool) and pid > 0):
+                    continue  # no usable runner recorded: it may belong to another live daemon
+                if daemonctl.runner_state(runner) != "gone":
+                    continue  # its daemon process still runs it, or may
             try:
                 record = self._durable_record(task_id)
                 if record is None:
@@ -2125,20 +2134,46 @@ class MaestroDaemon:
                 claims = self.maestro._claims(task_id)
                 if not claims and not (self.state_dir / "tasks" / task_id).is_dir():
                     raise KeyError(f"Unknown task reference {task_id!r}")
-                # A task without a live record belongs to a dead process and can
-                # never emit events, so an unresolved state must not block waiters
-                # for the full timeout: _durable_state resolves it (unknown → failed).
+                # A task without a live record is not run by this daemon, so no
+                # event for it may ever come here: _durable_state resolves an
+                # unresolved state (unknown → failed), and the durable record is
+                # polled below in case another process is still running it.
                 state = _durable_state(claims, _runtime_from_claims(claims))
                 if state in stop_states:
                     return self.status_a2a(task_id)  # durable terminal from an earlier run
             threshold = sub.start_seq
-            sub.wait(
-                predicate=lambda e: e.task_id == task_id and e.type == "state" and e.data.get("state") in stop_states and e.seq > threshold,
-                timeout=timeout,
-            )
+            predicate = lambda e: e.task_id == task_id and e.type == "state" and e.data.get("state") in stop_states and e.seq > threshold  # noqa: E731
+            if record is not None:
+                sub.wait(predicate=predicate, timeout=timeout)
+            else:
+                self._wait_durable(task_id, sub, predicate, timeout, stop_states)
         finally:
             sub.close()
         return self.status_a2a(task_id)
+
+    def _wait_durable(self, task_id: str, sub: Any, predicate: Callable[[TaskEvent], bool], timeout: float | None, stop_states: tuple[str, ...]) -> None:
+        """Wait for a task this daemon does not run, until it stops or ``timeout`` passes.
+
+        Another process may be running it and writes its state to the durable
+        record, so the record is read again every DURABLE_POLL_S seconds. An
+        event from this daemon (when it takes the task over, for example by an
+        answer) ends the wait at once.
+        """
+        import time
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            slice_s = DURABLE_POLL_S if deadline is None else min(DURABLE_POLL_S, max(0.0, deadline - time.monotonic()))
+            if sub.wait(predicate=predicate, timeout=slice_s) is not None:
+                return
+            record = self._tasks.get(task_id)
+            if record is not None:
+                state = record["state"]
+            else:
+                claims = self.maestro._claims(task_id)
+                state = _durable_state(claims, _runtime_from_claims(claims))
+            if state in stop_states or (deadline is not None and time.monotonic() >= deadline):
+                return
 
     # ------------------------------------------------------------------ views
     def resolve(self, ref: str) -> str:
@@ -2344,6 +2379,9 @@ def _allowed_origins_from_env() -> list[str]:
     raw = os.environ.get("MAESTRO_DAEMON_ALLOWED_ORIGINS", "")
     return [item for item in (part.strip() for part in raw.split(",")) if item]
 
+
+# How often a wait for a task this daemon does not run reads the task's durable record.
+DURABLE_POLL_S = 0.5
 
 MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024  # a JSON-RPC request larger than 8 MiB is refused unparsed
 # After refusing a body, the handler reads and discards up to this much of it
@@ -2638,69 +2676,111 @@ _instance: "MaestroDaemon | DaemonClient | None" = None
 _instance_kwargs: dict[str, Any] = {}
 _instance_lock = threading.Lock()
 SHUTDOWN_LOCK_WAIT_S = 5.0  # shutdown_daemon may run in a signal handler; it never waits longer
+# How long a call waits for a daemon that owns the state directory but does
+# not answer, before it reports an error. Nothing runs locally meanwhile.
+OWNER_RETRY_S = 20.0
+# Set by the MCP server's main(): when no daemon owns the state directory,
+# start a detached background daemon (as 'maestro daemon start' does) and
+# forward to it, instead of running the daemon inside this process.
+BACKGROUND_OWNER = False
 
 
 def get_daemon(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
     """Process-wide daemon for the MCP tools (and anything else in this process).
 
-    Only one daemon runs tasks for a state directory. When another daemon
-    already owns it and answers HTTP (for example the background daemon that
-    ``maestro daemon start`` launched), this returns a
-    :class:`~maestro.daemon_client.DaemonClient` that sends every call to that
-    owner, so its tasks, cancels and workspace queue stay in one process.
-    Otherwise this process starts its own daemon, which serves HTTP and owns
-    the directory.
+    Only one daemon runs tasks for a state directory, and this process never
+    runs tasks beside it. When a daemon already owns the directory and answers
+    HTTP (for example one that ``maestro daemon start`` launched), this returns
+    a :class:`~maestro.daemon_client.DaemonClient` that sends every call to
+    that owner. When no daemon owns it, a daemon is started: with
+    ``BACKGROUND_OWNER`` (the MCP server) a detached background daemon, which
+    outlives this process, and otherwise one inside this process. When a
+    background daemon cannot be started, the daemon runs inside this process
+    as a fallback, and a note on stderr says so.
 
-    Each call checks that the owner still answers. Once it has gone away, this
-    process starts its own daemon and takes ownership. If the owner is still
-    alive but does not answer HTTP, ownership cannot be taken, and the daemon
-    started here runs its tasks without an HTTP endpoint for the rest of this
-    process's life; a note on stderr says so.
+    Each call checks that the owner still answers. When the owner still holds
+    the directory but does not answer, the call waits and checks again, with
+    growing pauses, for up to OWNER_RETRY_S seconds, and then raises
+    :class:`~maestro.daemon_client.DaemonUnavailable`. Only when the owner is
+    gone (no process holds the directory) is a new daemon started.
     """
     global _instance, _instance_kwargs
     with _instance_lock:
-        if isinstance(_instance, DaemonClient) and not _instance.alive():
-            print(
-                f"maestro: the Maestro daemon at {_instance.url} stopped answering; this process now runs its own daemon.",
-                file=sys.stderr,
-                flush=True,
-            )
+        if _instance is not None and not isinstance(_instance, DaemonClient):
+            return _instance  # this process runs the daemon that owns the directory
+        if _instance is not None:
+            if _instance.alive():
+                return _instance
+            print(f"maestro: the Maestro daemon at {_instance.url} stopped answering; looking for its replacement.", file=sys.stderr, flush=True)
             _instance = None
-        if _instance is None:
+        else:
             _instance_kwargs = dict(kwargs)
-            _instance = _open_daemon(**kwargs)
+        _instance = _connect(**_instance_kwargs)
         return _instance
 
 
-def _owner_client(state_dir: Path) -> "DaemonClient | None":
-    """A client for the daemon that owns ``state_dir`` and answers HTTP, or None."""
-    info = daemonctl.live_owner(state_dir)
-    if info is None or not info.running or not info.url:
-        return None
-    return DaemonClient(state_dir, info.url, info.token, info.pid, fallback=lambda: None)
-
-
-def _open_daemon(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
-    raw = kwargs.get("state_dir")
-    state_dir = Path(raw).expanduser() if raw else maestro_user_dir()
-    client = _owner_client(state_dir)
-    if client is None:
-        try:
-            return MaestroDaemon(**kwargs)
-        except daemonctl.DaemonAlreadyRunning as exc:
-            # Another daemon took the directory after the check above, or the
-            # owner is alive but does not answer HTTP.
-            client = _owner_client(state_dir)
-            if client is None:
-                print(
-                    f"maestro: {exc}, but it does not answer HTTP. This process runs its own tasks without an HTTP "
-                    "endpoint and leaves that daemon's marker and tasks alone.",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                return MaestroDaemon(**{**kwargs, "start_http": False})
+def _client_for(state_dir: Path, info: daemonctl.DaemonInfo) -> "DaemonClient":
+    client = DaemonClient(state_dir, str(info.url), info.token, info.pid, fallback=lambda: None)
     client._fallback = lambda: _replace_client(client)
     return client
+
+
+def _connect(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
+    """The daemon to use for ``kwargs['state_dir']``: the answering owner, or a newly started one.
+
+    Raises DaemonUnavailable when, for OWNER_RETRY_S seconds, the directory
+    is held by a daemon that does not answer, or no daemon could be started
+    or reached.
+    """
+    import time
+
+    from .daemon_client import DaemonUnavailable
+
+    raw = kwargs.get("state_dir")
+    state_dir = Path(raw).expanduser() if raw else maestro_user_dir()
+    deadline = time.monotonic() + OWNER_RETRY_S
+    pause = 0.1
+    while True:
+        info = daemonctl.live_owner(state_dir)
+        if info is not None and info.running and info.url:
+            return _client_for(state_dir, info)
+        if info is None:
+            started = _start_owner(state_dir, kwargs)
+            if started is not None:
+                return started
+        if time.monotonic() >= deadline:
+            if info is not None:
+                raise DaemonUnavailable(
+                    f"the Maestro daemon (pid {info.pid}) owns the state directory {state_dir} but does not answer at "
+                    f"{info.url}. This MCP server does not run tasks beside it. Try again, or restart it with "
+                    "'maestro daemon restart'."
+                )
+            raise DaemonUnavailable(f"could not start or reach a Maestro daemon for the state directory {state_dir}; see {state_dir / 'daemon.log'}")
+        time.sleep(pause)
+        pause = min(pause * 2, 2.0)
+
+
+def _start_owner(state_dir: Path, kwargs: dict[str, Any]) -> "MaestroDaemon | DaemonClient | None":
+    """Start the daemon that will own ``state_dir``; None when another daemon took it first.
+
+    ``kwargs`` are the MaestroDaemon arguments for a daemon inside this process.
+    """
+    if BACKGROUND_OWNER:
+        try:
+            info = daemonctl.start(state_dir)
+        except (RuntimeError, TimeoutError, OSError) as exc:
+            print(
+                f"maestro: could not start a background daemon ({exc}). This MCP server runs the daemon in its own "
+                "process instead; its tasks stop when this MCP server exits.",
+                file=sys.stderr,
+                flush=True,
+            )
+        else:
+            return _client_for(state_dir, info)
+    try:
+        return MaestroDaemon(**kwargs)
+    except daemonctl.DaemonAlreadyRunning:
+        return None  # another daemon took the directory first; the caller connects to it
 
 
 def _replace_client(client: "DaemonClient") -> "MaestroDaemon | DaemonClient":
@@ -2708,7 +2788,8 @@ def _replace_client(client: "DaemonClient") -> "MaestroDaemon | DaemonClient":
     global _instance
     with _instance_lock:
         if _instance is client or _instance is None:
-            _instance = _open_daemon(**_instance_kwargs)
+            _instance = None
+            _instance = _connect(**_instance_kwargs)
         return _instance
 
 

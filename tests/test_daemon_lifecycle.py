@@ -449,26 +449,84 @@ def test_reconciliation_fails_a_task_whose_runner_died_while_another_daemon_uses
         guest.stop()
 
 
-def test_reconciliation_keeps_a_task_whose_runner_is_still_alive(home, tmp_path):
-    """Even a daemon that is alone in the directory leaves a live runner's task alone."""
+def test_a_daemon_alone_fails_leftover_tasks_whatever_their_runner_record_says(home, tmp_path):
+    """Alone in the directory, nothing else can be running the task: a live pid in the record is a reused one.
+
+    A container that restarts runs the new daemon as PID 1 again, so the old
+    record's pid is alive (and, without a start time, looks like the runner).
+    """
     from maestro import daemonctl
 
     ws = tmp_path / "ws"
     ws.mkdir()
     runner = _sleeper()
-    tid = "task-20260101-000000-live04"
     try:
         seed = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
-        _seed_task_with_runner(seed, tid, ws, {"pid": runner.pid, "started": daemonctl.process_start_token(runner.pid)})
+        _seed_task_with_runner(seed, "task-20260101-000000-live04", ws, {"pid": runner.pid, "started": daemonctl.process_start_token(runner.pid)})
+        _seed_task_with_runner(seed, "task-20260101-000000-live05", ws, {"pid": os.getpid(), "started": None})
         seed.stop()
+        d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+        try:
+            assert d.status_a2a("task-20260101-000000-live04")["status"]["state"] == "failed"
+            assert d.status_a2a("task-20260101-000000-live05")["status"]["state"] == "failed"
+        finally:
+            d.stop()
+    finally:
+        runner.kill()
+        runner.wait()
+
+
+def test_reconciliation_keeps_a_live_runners_task_while_another_daemon_uses_the_directory(home, tmp_path):
+    from maestro import daemonctl
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    runner = _sleeper()
+    guest = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000000-live06"
+    try:
+        _seed_task_with_runner(guest, tid, ws, {"pid": runner.pid, "started": daemonctl.process_start_token(runner.pid)})
         d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
         try:
             assert d.status_a2a(tid)["status"]["state"] == "working"
         finally:
             d.stop()
     finally:
+        guest.stop()
         runner.kill()
         runner.wait()
+
+
+def test_reconciliation_keeps_a_task_whose_runner_cannot_be_checked(home, tmp_path, monkeypatch):
+    """A recorded start time that cannot be read now (ps missing or timing out) means "possibly alive"."""
+    from maestro import daemonctl
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    runner = _sleeper()
+    guest = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000000-unkn01"
+    try:
+        _seed_task_with_runner(guest, tid, ws, {"pid": runner.pid, "started": daemonctl.process_start_token(runner.pid)})
+        monkeypatch.setattr(daemonctl, "process_start_token", lambda pid: None)
+        d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+        try:
+            assert d.status_a2a(tid)["status"]["state"] == "working"
+        finally:
+            d.stop()
+    finally:
+        guest.stop()
+        runner.kill()
+        runner.wait()
+
+
+def test_a_daemon_that_will_be_refused_does_not_reconcile(owner, home, monkeypatch):
+    """A second daemon refuses to start; it must not fail anything on its way out."""
+    calls: list = []
+    monkeypatch.setattr(MaestroDaemon, "_reconcile_interrupted_tasks", lambda self, **kw: calls.append(kw))
+    with pytest.raises(RuntimeError, match="already owns"):
+        MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
+    assert calls == []
 
 
 def test_reconciliation_fails_a_task_whose_runner_pid_was_reused(home, tmp_path):
@@ -655,20 +713,28 @@ def test_mcp_server_stops_its_daemon_on_exit(home, tmp_path, how):
 
 
 def test_mcp_server_main_stops_the_daemon_when_the_client_disconnects(home, monkeypatch):
+    """main() asks for a background daemon; when none can start, the daemon in this process is stopped on exit."""
     import atexit
     import signal
 
     import maestro.daemon as dm
-    from maestro import mcp_server
+    from maestro import daemonctl, mcp_server
 
     registered: list = []
     handlers: dict = {}
     monkeypatch.setattr(atexit, "register", lambda fn: registered.append(fn))
     monkeypatch.setattr(signal, "signal", lambda signum, handler: handlers.__setitem__(signum, handler))
     monkeypatch.setattr(dm, "_instance", None)
+    monkeypatch.setattr(dm, "BACKGROUND_OWNER", False)  # main() switches it on; restored after the test
+
+    def cannot_start(state_dir=None, **kwargs):
+        raise RuntimeError("no background daemon in this test")
+
+    monkeypatch.setattr(daemonctl, "start", cannot_start)
     started: list = []
     monkeypatch.setattr(mcp_server.mcp, "run", lambda: started.append(dm.get_daemon()))
     mcp_server.main()
+    assert dm.BACKGROUND_OWNER is True
     assert started and started[0]._stopped is True and dm._instance is None
     assert not (home / "daemon.json").exists()
     assert registered == [dm.shutdown_daemon] and signal.SIGTERM in handlers
@@ -1073,5 +1139,78 @@ def test_cli_endpoint_returns_the_confirmed_daemon(home, monkeypatch):
     d = MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
     try:
         assert cli._daemon_endpoint() == (f"http://127.0.0.1:{d.port}", None)
+    finally:
+        d.stop()
+
+
+# ------------------------------------------------ waiting on a task another process runs
+def test_wait_follows_the_durable_state_of_a_task_this_daemon_does_not_run(home):
+    """Reviewer's fallback_wait.py: another process finishes the task; the wait must see it, not sit out its timeout."""
+    from maestro.core import Maestro
+
+    task_id = "task-20260923-120000-abcdef"
+    local = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    other = Maestro(home)  # stands in for the daemon process that runs the task
+    try:
+        other._write_claim(task_id, "task_workspace", str(home))
+        other._write_claim(task_id, "task_runtime", json.dumps({"state": "working"}))
+
+        def finish():
+            time.sleep(1.0)
+            other._write_claim(task_id, "task_runtime", json.dumps({"state": "completed"}))
+
+        threading.Thread(target=finish, daemon=True).start()
+        began = time.monotonic()
+        result = local.wait(task_id, timeout=8)
+        assert result["status"]["state"] == "completed" and time.monotonic() - began < 5
+        # A task still running elsewhere is waited for until the timeout, then reported as it stands.
+        other._write_claim(task_id, "task_runtime", json.dumps({"state": "working"}))
+        assert local.wait(task_id, timeout=0.6)["status"]["state"] == "working"
+    finally:
+        local.stop()
+        other.close()
+
+
+def test_wait_on_a_durable_task_wakes_on_this_daemons_own_events(home, tmp_path, monkeypatch):
+    """A durable task this daemon picks up later (for example by an answer) still ends the wait at once."""
+    import maestro.daemon as dm
+
+    monkeypatch.setattr(dm, "DURABLE_POLL_S", 30.0)  # only the event can end the wait in time
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000000-evnt01"
+    try:
+        _seed_running_task(d, tid, ws)  # durable only: no live record in this daemon
+        result: dict = {}
+        waiter = threading.Thread(target=lambda: result.update(d.wait(tid, timeout=20)), daemon=True)
+        waiter.start()
+        time.sleep(0.3)
+        record = d._durable_record(tid)  # this daemon takes the task over ...
+        assert record is not None
+        d._set_state(tid, "completed")  # ... and finishes it, publishing the event
+        waiter.join(timeout=5)
+        assert not waiter.is_alive() and result["status"]["state"] == "completed"
+    finally:
+        d.stop()
+
+
+def test_wait_without_a_timeout_reads_a_record_this_daemon_took_over(home, tmp_path):
+    """A durable task loaded into this daemon's memory is judged by that record, even without an event."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    tid = "task-20260101-000000-evnt02"
+    try:
+        _seed_running_task(d, tid, ws)
+        result: dict = {}
+        waiter = threading.Thread(target=lambda: result.update(d.wait(tid)), daemon=True)
+        waiter.start()
+        time.sleep(0.3)
+        record = d._durable_record(tid)
+        assert record is not None
+        record["state"] = "completed"  # changed in memory only: no event, no claim
+        waiter.join(timeout=5)
+        assert not waiter.is_alive() and result["status"]["state"] == "completed"
     finally:
         d.stop()

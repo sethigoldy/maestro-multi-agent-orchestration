@@ -858,17 +858,20 @@ def test_process_start_token_without_ps(monkeypatch):
     assert daemonctl.process_start_token(os.getpid()) is None
 
 
-def test_runner_alive_variants():
+def test_runner_state_variants(monkeypatch):
     sleeper = _unrelated_sleeper()
     try:
         token = daemonctl.process_start_token(sleeper.pid)
-        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": token}) is True
-        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": None}) is True  # no start time recorded
-        assert daemonctl.runner_alive({"pid": sleeper.pid, "started": "Thu Jan  1 00:00:00 1970"}) is False  # pid reused
+        assert daemonctl.runner_state({"pid": sleeper.pid, "started": token}) == "alive"
+        assert daemonctl.runner_state({"pid": sleeper.pid, "started": None}) == "alive"  # no start time recorded
+        assert daemonctl.runner_state({"pid": sleeper.pid, "started": "Thu Jan  1 00:00:00 1970"}) == "gone"  # pid reused
+        # A start time was recorded but cannot be read now: the runner may still be alive.
+        monkeypatch.setattr(daemonctl, "process_start_token", lambda pid: None)
+        assert daemonctl.runner_state({"pid": sleeper.pid, "started": token}) == "unknown"
     finally:
         sleeper.kill()
         sleeper.wait()
-    assert daemonctl.runner_alive({"pid": _dead_pid(), "started": None}) is False
+    assert daemonctl.runner_state({"pid": _dead_pid(), "started": None}) == "gone"
 
 
 def test_stop_does_not_sigkill_a_process_it_can_no_longer_confirm(tmp_path, monkeypatch):
@@ -885,6 +888,8 @@ def test_stop_does_not_sigkill_a_process_it_can_no_longer_confirm(tmp_path, monk
         time.sleep(0.3)
         assert process.poll() is None, "stop() sent SIGKILL to a process it could not confirm"
         assert info.running is False and "not force-killed" in info.detail
+        # The process still holds the owner lock, so the marker is kept.
+        assert (tmp_path / "daemon.json").exists()
     finally:
         process.kill()
         process.wait()
@@ -923,3 +928,188 @@ def test_stop_sigkills_a_confirmed_daemon_that_ignores_sigterm(tmp_path):
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+
+# ------------------------------------------------ review follow-ups (PR #33)
+def test_runner_is_unknown_when_ps_cannot_run(monkeypatch):
+    """Reviewer's ps_unavailable.py: a start time that cannot be read now does not make the runner gone."""
+    sleeper = _unrelated_sleeper()
+    try:
+        runner = {"pid": sleeper.pid, "started": daemonctl.process_start_token(sleeper.pid)}
+        monkeypatch.setenv("PATH", "/usr/local/bin")  # no ps on this PATH
+        monkeypatch.setattr(daemonctl, "_PROC", Path("/nonexistent-proc"))
+        assert daemonctl.process_start_token(sleeper.pid) is None
+        assert daemonctl.runner_state(runner) == "unknown"
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_start_token_does_not_depend_on_the_time_zone(monkeypatch):
+    """Reviewer's tz_runner.py: the same process gets the same token whatever TZ the caller has."""
+    sleeper = _unrelated_sleeper()
+    try:
+        monkeypatch.setenv("TZ", "Asia/Kolkata")
+        first = daemonctl.process_start_token(sleeper.pid)
+        monkeypatch.setenv("TZ", "America/New_York")
+        second = daemonctl.process_start_token(sleeper.pid)
+        monkeypatch.delenv("TZ")
+        third = daemonctl.process_start_token(sleeper.pid)
+        assert first and first == second == third
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def _fake_proc(root: Path, pid: int, stat_line: str, boot_id: str | None = "8c1f-boot\n", cmdline: bytes | None = None) -> Path:
+    """A /proc tree holding one process, the way Linux lays it out."""
+    (root / "self").mkdir(parents=True, exist_ok=True)
+    (root / "self" / "stat").write_text("1 (self) S 0\n", encoding="utf-8")
+    (root / str(pid)).mkdir(parents=True, exist_ok=True)
+    (root / str(pid) / "stat").write_text(stat_line, encoding="utf-8")
+    if cmdline is not None:
+        (root / str(pid) / "cmdline").write_bytes(cmdline)
+    if boot_id is not None:
+        (root / "sys" / "kernel" / "random").mkdir(parents=True, exist_ok=True)
+        (root / "sys" / "kernel" / "random" / "boot_id").write_text(boot_id, encoding="utf-8")
+    return root
+
+
+def test_start_token_on_linux_reads_proc(tmp_path, monkeypatch):
+    """On Linux the token is the boot id plus field 22 of /proc/<pid>/stat (start time in clock ticks)."""
+    fields_after_comm = " ".join(["S"] + [str(n) for n in range(4, 22)] + ["987654"] + ["0"] * 30)
+    root = _fake_proc(tmp_path / "proc", 4242, f"4242 (a (weird) name) {fields_after_comm}\n")
+    monkeypatch.setattr(daemonctl, "_PROC", root)
+    assert daemonctl.process_start_token(4242) == "8c1f-boot:987654"
+    assert daemonctl.process_start_token(4243) is None  # no such process
+    (root / "4242" / "stat").write_text("4242 (short) S 1 2\n", encoding="utf-8")
+    assert daemonctl.process_start_token(4242) is None  # a stat line too short to read
+    (root / "sys" / "kernel" / "random" / "boot_id").unlink()
+    (root / "4242" / "stat").write_text(f"4242 (x) {fields_after_comm}\n", encoding="utf-8")
+    assert daemonctl.process_start_token(4242) == "987654"  # no boot id: the start time alone
+
+
+def test_process_command_reads_proc_or_ps(tmp_path, monkeypatch):
+    sleeper = _unrelated_sleeper()
+    try:
+        assert "time.sleep(60)" in daemonctl.process_command(sleeper.pid)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+    assert daemonctl.process_command(_dead_pid()) is None
+    root = _fake_proc(tmp_path / "proc", 4242, "4242 (x) S 1\n", cmdline=b"/usr/bin/python3\x00-m\x00maestro.daemon_main\x00")
+    monkeypatch.setattr(daemonctl, "_PROC", root)
+    assert daemonctl.process_command(4242) == "/usr/bin/python3 -m maestro.daemon_main"
+    assert daemonctl.process_command(4243) is None
+
+
+def test_process_command_without_ps(monkeypatch):
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("ps")
+
+    monkeypatch.setattr(daemonctl.subprocess, "run", missing)
+    assert daemonctl.process_command(os.getpid()) is None
+
+
+_OLD_DAEMON = r"""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from maestro.a2a import agent_card
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        # The card of a 0.12.0 daemon: no "maestro" identity block.
+        body = b"<html>console</html>" if self.path == "/" else json.dumps(
+            agent_card(name="maestro-node", url="http://127.0.0.1:%d" % self.server.server_address[1], skills=[])).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+state = sys.argv[1]
+with open(os.path.join(state, "daemon.json"), "w") as f:
+    f.write(json.dumps({"pid": os.getpid(), "port": srv.server_address[1], "host": "127.0.0.1", "started_at": "2026-09-23T00:00:00+00:00"}))
+print("ready", flush=True)
+srv.serve_forever()
+"""
+
+
+def _start_old_daemon(state_dir: Path, *argv: str) -> subprocess.Popen:
+    """A process that behaves like a 0.12.0 daemon; ``argv`` becomes part of its command line."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    process = subprocess.Popen([sys.executable, "-c", _OLD_DAEMON, str(state_dir), *argv], stdout=subprocess.PIPE, text=True, env=env)
+    assert process.stdout.readline().strip() == "ready"
+    return process
+
+
+@pytest.mark.parametrize("entry", ["maestro.daemon_main", "maestro-daemon", "maestro.mcp_server", "maestro-mcp"])
+def test_a_daemon_from_the_last_release_is_still_confirmed_and_stopped(tmp_path, entry):
+    """Reviewer's old_marker.py: after an upgrade, a running 0.12.0 daemon must still be found and stopped."""
+    old = _start_old_daemon(tmp_path, entry)
+    try:
+        info = daemonctl.status(tmp_path)
+        assert info.running is True and info.pid == old.pid
+        stopped = daemonctl.stop(tmp_path, grace_s=5)
+        assert stopped.detail == "daemon stopped"
+        assert old.wait(timeout=5) is not None
+    finally:
+        if old.poll() is None:
+            old.kill()
+            old.wait()
+
+
+def test_a_card_without_identity_from_a_process_that_is_not_maestro_is_stale(tmp_path):
+    """The same card served by a process whose command line is not a Maestro daemon is not trusted."""
+    other = _start_old_daemon(tmp_path, "some-other-program")
+    try:
+        info = daemonctl.status(tmp_path)
+        assert info.running is False and info.stale_marker is True
+        daemonctl.stop(tmp_path, grace_s=1)
+        time.sleep(0.2)
+        assert other.poll() is None, "stop() signalled a process that is not a Maestro daemon"
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_stop_sigkills_when_the_start_time_cannot_be_read_but_the_lock_is_held(tmp_path, monkeypatch):
+    """An unreadable start time is not a different process: the owner lock decides, and it is still held."""
+    process = subprocess.Popen(
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "ignore-term"], start_new_session=True
+    )
+    try:
+        _wait_for_lock_holder(tmp_path, process.pid)
+        _write_marker(tmp_path, pid=process.pid, owner_lock=True)
+        tokens = iter(["started at 10:00:00", None])  # ps worked before SIGTERM, fails after the grace period
+        monkeypatch.setattr(daemonctl, "process_start_token", lambda pid: next(tokens))
+        info = daemonctl.stop(state_dir=tmp_path, grace_s=0.5)
+        assert info.detail == "daemon stopped"
+        assert process.wait(timeout=5) != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def test_stop_never_removes_a_marker_while_the_owner_lock_is_held(tmp_path, monkeypatch):
+    """A stale-looking marker is kept while a daemon holds the owner lock for the directory."""
+    fd = _hold_owner_lock(tmp_path)  # this process owns the directory
+    sleeper = _unrelated_sleeper()
+    try:
+        _write_marker(tmp_path, pid=sleeper.pid, owner_lock=True)  # names another pid
+        info = daemonctl.stop(tmp_path, grace_s=1)
+        assert info.stale_marker is True and sleeper.poll() is None
+        assert (tmp_path / "daemon.json").exists()
+        _write_marker(tmp_path, pid=_dead_pid(), owner_lock=True)
+        daemonctl.stop(tmp_path, grace_s=1)
+        assert (tmp_path / "daemon.json").exists()
+    finally:
+        os.close(fd)
+        sleeper.kill()
+        sleeper.wait()

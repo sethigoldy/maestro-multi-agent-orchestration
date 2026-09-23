@@ -111,8 +111,9 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
   the daemon reads only packets sent to the multicast group, ignores other
   hosts when `MAESTRO_DISCOVERY_IF` is loopback, drops an announcement whose
   advertised host is not an IP address, drops an announcement from another
-  host that advertises a loopback or link-local address (such as `127.0.0.1`
-  or the cloud metadata address `169.254.169.254`), strips control characters
+  host that advertises a loopback address (such as `127.0.0.1`) or a
+  link-local address other than the one it was sent from (such as the cloud
+  metadata address `169.254.169.254`), strips control characters
   from names, and keeps at most 256 peers in `peers.json`. A daemon that
   listens on loopback only never announces `127.0.0.1` on a network
   interface. Discovered peers are only a

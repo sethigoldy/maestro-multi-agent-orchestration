@@ -22,15 +22,19 @@ Design notes:
 - Announcements are untrusted input. ``http_host`` must be an IP address,
   ``http_port`` must be a valid port, and names lose their control characters
   (so ``maestro peers list`` cannot be made to emit terminal escape codes).
-  An announcement from another host may not name a loopback or link-local
-  address (127.0.0.1, ::1, 169.254.169.254 and the like): a LAN host could
-  otherwise point this machine at its own loopback services or at a cloud
-  metadata endpoint. Only an announcement sent from a loopback address may
-  name a loopback host.
+  An announcement from another host may not name a loopback address
+  (127.0.0.1, ::1): a LAN host could otherwise point this machine at its own
+  loopback services. It may name a link-local address (169.254.x.y, fe80::)
+  only when that is the address it was sent from, so a node on a link-local
+  network (a Thunderbolt bridge, for example) can announce itself, but no
+  host can point peers at another link-local address such as the cloud
+  metadata endpoint 169.254.169.254. Only an announcement sent from a
+  loopback address may name a loopback host.
 - A node announces itself only on an interface that can reach the host it
   advertises. A daemon reachable only on loopback announces when the
   discovery interface is loopback too; on any other interface it listens for
-  peers but never announces 127.0.0.1 to the network.
+  peers but never announces 127.0.0.1 to the network. A daemon bound to a
+  link-local address announces it like any other address.
 - ``peers.json`` holds at most ``MAX_PEERS`` entries: discovered peers unseen
   for ``PRUNE_AFTER_S`` are pruned and the oldest are dropped first; manually
   added peers are never dropped. The file is rewritten only when a peer is new
@@ -103,17 +107,13 @@ def _is_loopback(address: str) -> bool:
         return False
 
 
-def _is_local_only(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True for an address that only makes sense on the machine or link it came from."""
-    return ip.is_loopback or ip.is_link_local
-
-
 def _url_host(host: str, sender: str) -> str | None:
     """``host`` formatted for a URL, or None when it is not a usable IP address.
 
-    ``sender`` is the address the announcement came from. A loopback or
-    link-local host is usable only when the sender itself is on loopback, that
-    is, when the announcement came from this machine.
+    ``sender`` is the address the announcement came from. A loopback host is
+    usable only when the sender itself is on loopback, that is, when the
+    announcement came from this machine. A link-local host is usable when the
+    sender is on loopback or is that very address.
     """
     try:
         ip = ipaddress.ip_address(host)
@@ -123,7 +123,7 @@ def _url_host(host: str, sender: str) -> str | None:
         ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
     if ip.is_multicast or ip.is_unspecified:
         return None
-    if _is_local_only(ip) and not _is_loopback(sender):
+    if (ip.is_loopback or ip.is_link_local) and not _is_loopback(sender) and str(ip) != sender:
         return None
     return f"[{ip}]" if ip.version == 6 else str(ip)
 
@@ -131,17 +131,13 @@ def _url_host(host: str, sender: str) -> str | None:
 def _announces_host(http_host: str, multicast_if: str) -> bool:
     """Whether a node advertising ``http_host`` should announce on ``multicast_if``.
 
-    Peers on the network drop a loopback or link-local host sent by another
-    machine, and it would be wrong for them anyway, so such a host is
-    announced only on a loopback interface, where only this machine hears it.
+    Peers on the network drop a loopback host sent by another machine, and it
+    would be wrong for them anyway, so a loopback host is announced only on a
+    loopback interface, where only this machine hears it.
     """
     if _is_loopback(multicast_if):
         return True
-    try:
-        ip = ipaddress.ip_address(http_host)
-    except ValueError:
-        return True  # not an address at all: receivers drop it on their own
-    return not _is_local_only(ip)
+    return not _is_loopback(http_host)
 
 
 def discovery_interface_from_env() -> str:

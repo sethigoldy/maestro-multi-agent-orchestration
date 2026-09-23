@@ -86,33 +86,52 @@ lock file (`daemon.owner.lock`) for as long as it runs. A second
 `maestro-daemon` on the same state directory refuses to start and says which
 daemon owns it.
 
-**How the MCP server and the daemon relate.** The MCP server does not need a
-daemon of its own. When it starts and a daemon already owns the state
-directory (for example one started with `maestro daemon start`), the MCP
-server runs no tasks itself: every tool call goes to that daemon over its HTTP
-API, with the daemon's token when it has one. The tasks run in that daemon, so
-`maestro daemon stop`, the dashboard and `tasks/cancel` see and control them,
-and one workspace never has two active tasks. Agents then run with that
-daemon's environment (its `PATH` and `MAESTRO_*` variables), not the MCP
-server's. When no daemon owns the directory, the MCP server starts one inside
-its own process, and that daemon serves HTTP and owns the directory like any
-other. It is stopped when the MCP server exits, including on SIGTERM. If the
-daemon the MCP server was using exits, the next tool call starts a daemon
-inside the MCP server, which takes ownership. If that daemon is still alive
-but no longer answers HTTP, ownership cannot be taken; the MCP server's daemon
-then runs its tasks without an HTTP endpoint and says so on stderr.
+**How the MCP server and the daemon relate.** The MCP server never runs
+tasks itself while a daemon owns the state directory. Every tool call goes to
+that daemon over its HTTP API, with the daemon's token when it has one. The
+tasks run in that daemon, so `maestro daemon stop`, the dashboard and
+`tasks/cancel` see and control them, and one workspace never has two active
+tasks. When no daemon owns the directory, the MCP server starts the same
+background daemon that `maestro daemon start` starts, and forwards to it. That
+daemon is a separate process: closing the session that started it does not
+stop it or the tasks other sessions sent to it.
+
+The background daemon runs with the environment of the process that started
+it: the MCP server's environment when an MCP server started it, or your
+shell's when you ran `maestro daemon start`. That environment includes the
+`PATH` used to find agent binaries and the `MAESTRO_*` settings. To give it a
+new environment, run `maestro daemon restart` from a shell that has the
+environment you want, or run `maestro daemon stop` and let the next MCP tool
+call start a new daemon with the MCP server's environment. Only when a
+background daemon cannot be started does the MCP server run the daemon inside
+its own process; it says so on stderr, and those tasks stop when that MCP
+server exits.
+
+If the daemon the MCP server uses stops answering but is still alive, a tool
+call waits and asks again with growing pauses for up to 20 seconds, and then
+returns an error that says to retry or run `maestro daemon restart`. It never
+starts a second daemon beside it. Once that daemon has exited, the next tool
+call starts a new one.
 
 Each task's record names the daemon process that runs it, by pid and start
-time. When a daemon starts, it marks a leftover "working" or queued task as
-failed if that process is gone, and leaves the task alone while that process
-still runs, even if the process belongs to another daemon.
+time. A daemon that starts alone in the state directory marks every leftover
+"working" or queued task as failed, because nothing else can still be running
+it. When other daemon processes share the directory, it marks such a task as
+failed only when the process in the record is certainly gone, and leaves it
+alone when that process still runs or cannot be checked. A daemon that is
+about to be refused as a second daemon marks nothing.
 
 `maestro daemon stop` signals a process only after confirming that it is the
-daemon that wrote the marker. If the daemon crashed and its pid now belongs to
-an unrelated process, `stop` removes the stale marker, does not signal that
+daemon that wrote the marker. A marker from 0.12.0 or earlier has no owner
+lock; it is confirmed when its port answers with a Maestro agent card and its
+pid runs a Maestro daemon or MCP server command, so a daemon started before an
+upgrade is still stopped. If the daemon crashed and its pid now belongs to an
+unrelated process, `stop` removes the stale marker, does not signal that
 process, and says so. Before it escalates from SIGTERM to SIGKILL it checks
-again that the pid still has the start time it had, so a pid reused during the
-grace period is never killed.
+again that the pid still has the start time it had (when the start time
+cannot be read, it checks that the process still holds the owner lock), so a
+pid reused during the grace period is never killed. It never removes the
+marker while a daemon holds the owner lock.
 
 `maestro-daemon` remains the low-level **foreground** executable for
 development, debugging, service managers, and CI: it starts the same daemon in
@@ -532,10 +551,12 @@ hosts. An announcement is dropped when its advertised host is not an IP
 address or its port is not a valid port, and names lose their control
 characters, so `maestro peers list` never prints terminal escape codes. An
 announcement from another host is also dropped when it advertises a loopback
-or link-local address (such as `127.0.0.1`, `::1` or `169.254.169.254`),
-because that would point this machine at its own loopback services or at a
-cloud metadata endpoint. Only an announcement sent from this machine may
-advertise a loopback address.
+address (such as `127.0.0.1` or `::1`), because that would point this machine
+at its own loopback services, or a link-local address (such as
+`169.254.169.254`, a cloud metadata endpoint) other than the address it was
+sent from. A node on a link-local-only network, such as a Thunderbolt bridge,
+can therefore still announce its own `169.254.x.y` address. Only an
+announcement sent from this machine may advertise a loopback address.
 `peers.json` holds at most 256 peers: a discovered peer that has not been heard
 for an hour is removed, and when the table is full the oldest discovered peers
 are dropped first. Manually added peers are never dropped. The file is

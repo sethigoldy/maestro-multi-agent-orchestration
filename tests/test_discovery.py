@@ -712,14 +712,6 @@ def test_handle_accepts_a_loopback_host_from_a_loopback_sender(tmp_path):
     }
 
 
-def test_handle_rejects_a_link_local_sender_address_used_as_the_host(tmp_path):
-    """An announcement without http_host falls back to the sender address, which is checked the same way."""
-    table = PeerTable(tmp_path / "peers.json")
-    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
-    server._handle(json.dumps({"kind": "maestro-presence", "name": "x", "http_port": 8790}).encode(), ("169.254.10.10", 9786))
-    assert table.load() == {}
-
-
 def _one_announce_tick(server: PresenceServer) -> _FakePresenceSocket:
     sock = _FakePresenceSocket(recv_results=[socket.timeout()])  # one quiet tick, then the socket "closes"
     server._sock = server._send_sock = sock
@@ -767,3 +759,27 @@ def test_a_host_name_that_is_not_an_address_is_still_announced(tmp_path):
     """Only addresses are judged here; receivers drop a host that is not an IP address on their own."""
     server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="maestro.local")
     assert server.announces is True
+
+
+# ------------------------------------------------ review follow-ups (PR #33)
+def test_link_local_host_is_accepted_from_that_same_address(tmp_path):
+    """On a link-local-only network (a Thunderbolt bridge) a peer announces its own 169.254.x.y address."""
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    announce = lambda host: json.dumps({"kind": "maestro-presence", "name": "tb", "http_port": 8790, "http_host": host}).encode()  # noqa: E731
+    server._handle(announce("169.254.10.20"), ("169.254.10.20", 9786))
+    server._handle(announce("169.254.169.254"), ("169.254.10.21", 9786))  # another address: still rejected
+    assert {key: peer["url"] for key, peer in table.load().items()} == {"169.254.10.20:8790": "http://169.254.10.20:8790"}
+
+
+def test_link_local_sender_without_http_host_is_accepted(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "tb", "http_port": 8790}).encode(), ("169.254.10.10", 9786))
+    assert table.load()["169.254.10.10:8790"]["url"] == "http://169.254.10.10:8790"
+
+
+def test_a_daemon_bound_to_a_link_local_address_announces_itself(tmp_path):
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="169.254.10.20")
+    assert server.announces is True
+    assert len(_one_announce_tick(server).sent) == 1

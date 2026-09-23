@@ -96,8 +96,9 @@ on `127.0.0.1` announces only when `MAESTRO_DISCOVERY=1` is set and
 machine hear it; it never announces `127.0.0.1` to the network.
 
 Announcements are untrusted: one whose advertised host is not an IP address is
-dropped, one from another host that advertises a loopback or link-local
-address (such as `127.0.0.1` or `169.254.169.254`) is dropped, names lose their
+dropped, one from another host that advertises a loopback address (such as
+`127.0.0.1`) or a link-local address other than its own (such as
+`169.254.169.254`) is dropped, names lose their
 control characters, and `peers.json` keeps at most 256 peers (a discovered
 peer unheard for an hour is removed).
 

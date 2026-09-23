@@ -261,12 +261,40 @@ def test_mcp_server_takes_ownership_when_the_owner_stops(owner, home):
     assert json.loads((home / "daemon.json").read_text())["port"] == replacement.port
 
 
-def test_mcp_server_runs_its_own_daemon_while_the_owner_does_not_answer(home, monkeypatch, capsys):
+def _no_local_daemon(**kwargs):
+    raise AssertionError("a daemon was started in this process while another daemon owns the directory")
+
+
+def test_mcp_server_never_runs_tasks_beside_an_owner_that_does_not_answer(home, monkeypatch):
+    """While a live daemon holds the directory, the MCP server retries and then reports an error; it runs nothing itself."""
     hung = daemonctl.DaemonInfo(running=False, pid=424242, url="http://127.0.0.1:1", state_dir=home)
     monkeypatch.setattr(daemonctl, "live_owner", lambda state_dir: hung)
-    d = dm.get_daemon()
-    assert isinstance(d, MaestroDaemon) and d._httpd is None
-    assert "does not answer" in capsys.readouterr().err
+    monkeypatch.setattr(dm, "MaestroDaemon", _no_local_daemon)
+    monkeypatch.setattr(dm, "OWNER_RETRY_S", 0.3)
+    began = time.monotonic()
+    with pytest.raises(DaemonUnavailable, match="does not answer") as caught:
+        dm.get_daemon()
+    assert "424242" in str(caught.value) and "maestro daemon restart" in str(caught.value)
+    assert 0.3 <= time.monotonic() - began < 5
+    assert dm._instance is None
+
+
+def test_mcp_server_waits_for_an_owner_that_misses_a_few_probes(home, monkeypatch):
+    hung = daemonctl.DaemonInfo(running=False, pid=4242, url="http://127.0.0.1:9", state_dir=home)
+    back = daemonctl.DaemonInfo(running=True, pid=4242, url="http://127.0.0.1:9", state_dir=home)
+    answers = iter([hung, hung, back])
+    monkeypatch.setattr(daemonctl, "live_owner", lambda state_dir: next(answers))
+    monkeypatch.setattr(dm, "MaestroDaemon", _no_local_daemon)
+    client = dm.get_daemon()
+    assert isinstance(client, DaemonClient) and client.url == "http://127.0.0.1:9"
+
+
+def test_tools_report_an_owner_that_stays_silent(home, monkeypatch):
+    hung = daemonctl.DaemonInfo(running=False, pid=4242, url="http://127.0.0.1:9", state_dir=home)
+    monkeypatch.setattr(daemonctl, "live_owner", lambda state_dir: hung)
+    monkeypatch.setattr(dm, "MaestroDaemon", _no_local_daemon)
+    monkeypatch.setattr(dm, "OWNER_RETRY_S", 0.1)
+    assert "does not answer" in json.loads(mcp_server.agents_list())["error"]
 
 
 def test_mcp_server_uses_a_daemon_that_took_ownership_first(home, monkeypatch):
@@ -281,6 +309,90 @@ def test_mcp_server_uses_a_daemon_that_took_ownership_first(home, monkeypatch):
     monkeypatch.setattr(dm, "MaestroDaemon", refuse)
     client = dm.get_daemon(state_dir=str(home))
     assert isinstance(client, DaemonClient) and client.url == "http://127.0.0.1:9" and client.state_dir == home
+
+
+def test_mcp_server_gives_up_when_the_directory_is_never_free_to_take(home, monkeypatch):
+    """Every start loses the race, yet no daemon ever answers: bounded, then an error."""
+    monkeypatch.setattr(daemonctl, "live_owner", lambda state_dir: None)
+
+    def refuse(**kwargs):
+        raise daemonctl.DaemonAlreadyRunning("another Maestro daemon already owns the state directory")
+
+    monkeypatch.setattr(dm, "MaestroDaemon", refuse)
+    monkeypatch.setattr(dm, "OWNER_RETRY_S", 0.2)
+    with pytest.raises(DaemonUnavailable, match="could not start or reach"):
+        dm.get_daemon()
+
+
+def test_delegate_and_followup_report_a_wait_that_cannot_continue(home, monkeypatch, tmp_path):
+    """A blocking tool whose daemon vanished and cannot be replaced returns an error instead of raising."""
+
+    class Vanishing:
+        def delegate(self, doc, workspace):
+            return {"task_id": "task-20260101-000000-abcdef", "queued": False}
+
+        def resolve(self, ref):
+            return ref
+
+        def followup(self, *args, **kwargs):
+            return {"task_id": "task-20260101-000000-abcdef"}
+
+        def wait(self, task_id, timeout=None):
+            raise DaemonUnavailable("the Maestro daemon (pid 1) owns the state directory but does not answer")
+
+    monkeypatch.setattr(mcp_server, "get_daemon", lambda: Vanishing())
+    handoff = tmp_path / "h.json"
+    handoff.write_text(json.dumps(_doc("quick").to_dict()), encoding="utf-8")
+    assert "does not answer" in json.loads(mcp_server.delegate(str(tmp_path), str(handoff)))["error"]
+    assert "does not answer" in json.loads(mcp_server.followup(str(tmp_path), "task-20260101-000000-abcdef", "go on"))["error"]
+
+
+# ------------------------------------------------------------ background owner (item 6)
+@pytest.fixture
+def background(home, agents, monkeypatch):
+    """The MCP server's production mode: start a detached background daemon when nobody owns the directory."""
+    monkeypatch.setattr(dm, "BACKGROUND_OWNER", True)
+    yield home
+    # Stop the background daemon this test started, never this test process
+    # (when the daemon runs inside it, the home fixture stops that one).
+    if daemonctl.status(home).pid not in (None, os.getpid()):
+        daemonctl.stop(home, grace_s=5)
+
+
+def test_mcp_server_starts_a_background_daemon_when_no_daemon_owns_the_directory(background, agents, tmp_path, monkeypatch):
+    """Closing the session must not kill tasks: the owner is a separate process, not the MCP server."""
+    home = background
+    client = dm.get_daemon()
+    assert isinstance(client, DaemonClient)
+    marker = json.loads((home / "daemon.json").read_text())
+    assert marker["pid"] != os.getpid() and client.pid == marker["pid"]
+    # The fake agent is only on this process's PATH, so the background daemon
+    # can run it only because it inherited the MCP server's environment.
+    from maestro.agents import AgentRegistry
+
+    AgentRegistry(home).save(AgentSpec(name=agents, kind="generic", command=f"{agents} --go"))
+    ws = _git_repo(tmp_path)
+    started = client.delegate(_doc(agents), ws)
+    deadline = time.monotonic() + 20
+    while client.status_a2a(started["task_id"])["status"]["state"] != "working" and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert client.status_a2a(started["task_id"])["status"]["state"] == "working"
+    # The session closes: its MCP server shuts down. The task keeps running in the background daemon.
+    dm.shutdown_daemon()
+    assert daemonctl.status(home).running is True
+    time.sleep(0.5)
+    assert dm.get_daemon().status_a2a(started["task_id"])["status"]["state"] == "working"
+
+
+def test_mcp_server_embeds_the_daemon_when_no_background_daemon_can_start(background, monkeypatch, capsys):
+    def cannot_start(state_dir=None, **kwargs):
+        raise RuntimeError("daemon exited while starting")
+
+    monkeypatch.setattr(daemonctl, "start", cannot_start)
+    d = dm.get_daemon()
+    assert isinstance(d, MaestroDaemon) and d._httpd is not None
+    err = capsys.readouterr().err
+    assert "could not start a background daemon" in err and "stop when this MCP server exits" in err
 
 
 def test_wait_moves_to_the_replacement_daemon_when_the_owner_stops_answering(home):

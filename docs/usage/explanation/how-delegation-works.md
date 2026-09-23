@@ -134,11 +134,13 @@ Why this shape:
   journaled), and `daemon.json` tells clients which broker is actually alive.
   Clients confirm that the marker's process is the daemon that wrote it (it
   holds the owner lock) and that it answers, instead of talking to a stale
-  marker. Each task's runtime snapshot also names the daemon process that runs
-  it (pid and start time), so a new daemon fails a leftover "working" task only
-  when that process is gone. The MCP server follows the same rule: when a
-  daemon already owns the state, it forwards its tool calls to that daemon
-  instead of running tasks itself.
+  marker. A daemon that starts alone fails every leftover "working" task,
+  since nothing else can still be running it; when other daemon processes
+  share the state, each task's runtime snapshot names the daemon process that
+  runs it (pid and start time), and the task is failed only when that process
+  is certainly gone. The MCP server never runs tasks beside a daemon that owns
+  the state: it forwards its tool calls to that daemon, and when none exists it
+  starts a background daemon and forwards to that.
 - **Append-only makes audits free.** `task audit`, budget accounting, and
   failure forensics all read the journal rather than reconstructing it.
 

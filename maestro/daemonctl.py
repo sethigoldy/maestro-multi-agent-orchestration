@@ -18,10 +18,13 @@ Design notes:
   "the lock is held and the file names the marker's pid" proves that the pid is
   still the daemon, even after a crash left the marker behind and the pid was
   reused. A marker written by an older version (no ``owner_lock`` field) is
-  confirmed only when its HTTP endpoint answers with a Maestro agent card that
-  names the marker's pid and this state directory. ``stop`` never signals a
-  process whose identity it cannot confirm, and it confirms the process again
-  (by its start time) before it escalates to SIGKILL.
+  confirmed through its HTTP endpoint's agent card. A card that names a pid and
+  state directory (this version adds them) must name the marker's pid and this
+  state directory. A card without them comes from a released version (0.12.0
+  and earlier); then the marker's pid must be a process whose command line is a
+  Maestro daemon or MCP server. ``stop`` never signals a process whose identity
+  it cannot confirm, it confirms the process again before it escalates to
+  SIGKILL, and it never removes the marker while a daemon holds the owner lock.
 - Start is guarded by an exclusive advisory lock on ``<state_dir>/daemon.lock``
   so two concurrent starts for the same state directory cannot fork duplicates.
 - The child runs in its own session (``start_new_session=True``) so it survives
@@ -195,13 +198,22 @@ def owner_lock_holder(state_dir: Path) -> int | None:
 _PORT_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError, ValueError)
 
 
+# Words in the command line of a process that runs a Maestro daemon: the
+# daemon itself, or an MCP server with the daemon inside it (released versions).
+_MAESTRO_COMMANDS = ("maestro-daemon", "maestro.daemon_main", "maestro-mcp", "maestro.mcp_server")
+
+
 def _answers_as_maestro(url: str, token: str | None, pid: int, state_dir: Path, timeout: float = 3.0) -> bool:
     """True when ``url`` serves the agent card of the Maestro daemon ``pid`` for ``state_dir``.
 
     Used for markers from older versions, which carry no owner lock. Any
-    Maestro daemon answers with an agent card, so the card must also name the
-    marker's pid and this state directory; otherwise the port belongs to
-    another daemon and the marker's pid may be an unrelated process.
+    Maestro daemon answers with an agent card, so more is needed to tie the
+    card to the marker's pid. A card with a ``maestro`` block (this version)
+    must name the marker's pid and this state directory; otherwise the port
+    belongs to another daemon. A card without one comes from a released
+    version, which does not report its pid; then the pid must be a process
+    whose command line runs a Maestro daemon, so that after an upgrade the old
+    daemon is still found and stopped instead of left running beside a new one.
     """
     request = urllib.request.Request(url + "/.well-known/agent.json")
     if token:
@@ -214,6 +226,9 @@ def _answers_as_maestro(url: str, token: str | None, pid: int, state_dir: Path, 
     if not (isinstance(card, dict) and "capabilities" in card and "url" in card):
         return False
     identity = card.get("maestro")
+    if identity is None:
+        command = process_command(pid) or ""
+        return any(word in command for word in _MAESTRO_COMMANDS)
     if not isinstance(identity, dict) or not isinstance(identity.get("state_dir"), str):
         return False
     return identity.get("pid") == pid and os.path.realpath(identity["state_dir"]) == os.path.realpath(state_dir)
@@ -232,37 +247,88 @@ def _identity_confirmed(base: Path, marker: dict[str, Any], pid: int, url: str |
     return url is not None and _answers_as_maestro(url, marker.get("token"), pid, base)
 
 
-def process_start_token(pid: int) -> str | None:
-    """When process ``pid`` started, as ``ps`` reports it; None when that cannot be read.
+_PROC = Path("/proc")  # Linux process information; absent on macOS
 
-    A pid alone can be reused by a new process after the old one exits. The
-    pair (pid, start time) names one process for its whole life, so it is
-    recorded with a task's runner and re-checked before ``stop`` sends SIGKILL.
+
+def _proc_available() -> bool:
+    return (_PROC / "self" / "stat").exists()
+
+
+def _ps(field: str, pid: int) -> str | None:
+    """One ``ps`` field for ``pid``, or None when ps cannot report it.
+
+    The environment pins the time zone and the locale, so the output is the
+    same whatever TZ or LANG the caller runs with.
     """
     try:
         result = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, env={**os.environ, "LC_ALL": "C"},
+            ["ps", "-o", f"{field}=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, env={**os.environ, "TZ": "UTC0", "LC_ALL": "C"},
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    token = result.stdout.strip()
-    return token if result.returncode == 0 and token else None
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
 
 
-def runner_alive(runner: dict[str, Any]) -> bool:
-    """True while the process recorded in a task's ``runner`` field still runs.
+def process_start_token(pid: int) -> str | None:
+    """A value that names process ``pid`` for its whole life; None when it cannot be read.
+
+    A pid alone can be reused by a new process after the old one exits. The
+    pair (pid, start time) names one process, so it is recorded with a task's
+    runner and re-checked before ``stop`` sends SIGKILL. On Linux the start
+    time is field 22 of ``/proc/<pid>/stat`` (clock ticks since boot), prefixed
+    with the boot id so a reboot never repeats a value. Elsewhere it is the
+    start time ``ps`` reports, read in UTC.
+    """
+    if not _proc_available():
+        return _ps("lstart", pid)
+    try:
+        stat_line = (_PROC / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+        # The command name (field 2) is in parentheses and may contain spaces
+        # or parentheses itself, so the fields are counted after the last ")".
+        fields = stat_line.rsplit(")", 1)[1].split()
+        start_ticks = fields[19]  # field 22; fields[0] is field 3
+    except (OSError, IndexError):
+        return None
+    try:
+        boot_id = (_PROC / "sys" / "kernel" / "random" / "boot_id").read_text(encoding="utf-8").strip()
+    except OSError:
+        return start_ticks
+    return f"{boot_id}:{start_ticks}"
+
+
+def process_command(pid: int) -> str | None:
+    """The command line of process ``pid``, or None when it cannot be read."""
+    if not _proc_available():
+        return _ps("command", pid)
+    try:
+        raw = (_PROC / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def runner_state(runner: dict[str, Any]) -> str:
+    """Whether the process recorded in a task's ``runner`` field still runs.
 
     ``runner`` holds ``pid`` and ``started`` (see :func:`process_start_token`).
-    A live pid whose start time differs is a different process that reused the
-    pid, so the runner is gone. When no start time was recorded, a live pid is
-    trusted.
+    Returns "gone" when the pid is dead, or alive with a different start time
+    (another process reused the pid). Returns "alive" when the start time
+    matches, or when none was recorded and the pid is alive. Returns
+    "unknown" when a start time was recorded but cannot be read now (ps
+    missing, failing or timing out): the runner may still be alive.
     """
     pid = int(runner["pid"])
     if not _pid_alive(pid):
-        return False
+        return "gone"
     started = runner.get("started")
-    return started is None or process_start_token(pid) == started
+    if started is None:
+        return "alive"
+    now = process_start_token(pid)
+    if now is None:
+        return "unknown"
+    return "alive" if now == started else "gone"
 
 
 def probe(url: str, timeout: float = 3.0) -> bool:
@@ -470,7 +536,9 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
     argument), then SIGKILL if required. Stale markers are cleaned up either way.
     A process is only signalled when it is confirmed to be the daemon that wrote
     the marker; a live process with a reused pid is left alone and the stale
-    marker is removed.
+    marker is removed. The marker is never removed while a daemon holds the
+    owner lock: that daemon is running and the marker is (or is about to be)
+    its own.
     """
     base = state_dir or _state_dir()
     if grace_s is None:
@@ -483,30 +551,27 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
         return DaemonInfo(running=False, state_dir=base, detail="no daemon running")
     marker = _read_marker(base)
     if marker is None:
-        (base / "daemon.json").unlink(missing_ok=True)
-        return DaemonInfo(running=False, state_dir=base, stale_marker=True, detail="removed malformed daemon marker")
+        return DaemonInfo(running=False, state_dir=base, stale_marker=True, detail=_remove_stale_marker(base, "the daemon marker was malformed"))
     try:
         pid = int(marker["pid"])
         port = int(marker.get("port") or 0)
     except (KeyError, TypeError, ValueError):
-        (base / "daemon.json").unlink(missing_ok=True)
-        return DaemonInfo(running=False, state_dir=base, stale_marker=True, detail="removed malformed daemon marker")
+        return DaemonInfo(running=False, state_dir=base, stale_marker=True, detail=_remove_stale_marker(base, "the daemon marker was malformed"))
     host = str(marker.get("host") or "127.0.0.1")
     url = f"http://{host}:{port}" if port else None
     if not _pid_alive(pid):
-        (base / "daemon.json").unlink(missing_ok=True)
         return DaemonInfo(
             running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base,
-            stale_marker=True, detail="daemon was not running; removed stale marker",
+            stale_marker=True, detail=_remove_stale_marker(base, "daemon was not running; the marker was stale"),
         )
     if not _identity_confirmed(base, marker, pid, url):
-        (base / "daemon.json").unlink(missing_ok=True)
         return DaemonInfo(
             running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base,
             stale_marker=True,
-            detail=(
-                f"removed a stale daemon marker: pid {pid} is alive but is not the Maestro daemon "
-                "for this state directory (the pid was probably reused after a crash), so it was not signalled"
+            detail=_remove_stale_marker(
+                base,
+                f"stale daemon marker: pid {pid} is alive but is not the Maestro daemon "
+                "for this state directory (the pid was probably reused after a crash), so it was not signalled",
             ),
         )
     # Recorded now, while the pid is confirmed to be the daemon, so the
@@ -524,17 +589,21 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
     if _pid_alive(pid):
         # The grace period is long enough for the daemon to exit and for its
         # pid to be reused, so confirm again that it is still the same process.
-        if started is not None:
-            same_process = process_start_token(pid) == started
+        # A start time that cannot be read now (ps failing or timing out) is
+        # not evidence of another process, so then the owner lock (or, for an
+        # older marker, the agent card) decides, as it did before SIGTERM.
+        now = process_start_token(pid) if started is not None else None
+        if now is not None:
+            same_process = now == started
         else:
             same_process = _identity_confirmed(base, marker, pid, url)
         if not same_process:
-            (base / "daemon.json").unlink(missing_ok=True)
             return DaemonInfo(
                 running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base,
-                detail=(
+                detail=_remove_stale_marker(
+                    base,
                     f"pid {pid} was still alive after the grace period but could no longer be confirmed "
-                    "as the daemon, so it was not force-killed"
+                    "as the daemon, so it was not force-killed",
                 ),
             )
         try:
@@ -545,9 +614,21 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline and _pid_alive(pid):
                 time.sleep(0.1)
-    # The daemon removes its own marker on a clean stop; remove any leftover.
-    (base / "daemon.json").unlink(missing_ok=True)
+    # The daemon removes its own marker on a clean stop; remove any leftover
+    # (unless a new daemon already took the directory over).
+    _remove_stale_marker(base, "")
     return DaemonInfo(running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base, detail="daemon stopped")
+
+
+def _remove_stale_marker(base: Path, detail: str) -> str:
+    """Remove ``daemon.json`` unless a daemon holds the owner lock.
+
+    Returns ``detail`` followed by what happened to the marker.
+    """
+    if owner_lock_holder(base) is not None:
+        return f"{detail}; the marker was kept because a daemon holds {OWNER_LOCK_NAME}"
+    (base / "daemon.json").unlink(missing_ok=True)
+    return f"{detail}; the marker was removed"
 
 
 def restart(state_dir: Path | None = None, *, grace_s: float | None = None, ready_timeout_s: float = READY_TIMEOUT_S) -> DaemonInfo:

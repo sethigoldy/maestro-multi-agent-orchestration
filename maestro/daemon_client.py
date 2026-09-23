@@ -11,9 +11,11 @@ can cancel them and one workspace never has two active tasks.
 The client offers the methods the MCP tools call on a daemon, with the same
 arguments, results and errors: an unknown task raises KeyError and a refused
 request raises ValueError. When the owner stops answering, a call raises
-:class:`DaemonUnavailable` (a ValueError, so the tools report it as an error),
-and the next ``get_daemon()`` starts a daemon in the MCP server's own process.
-A blocking :meth:`DaemonClient.wait` does that switch itself and keeps waiting.
+:class:`DaemonUnavailable` (a ValueError, so the tools report it as an error).
+The next ``get_daemon()`` waits a bounded time for the owner while it still
+holds the directory, and starts a new daemon only once the owner is gone. A
+blocking :meth:`DaemonClient.wait` makes that switch itself and keeps waiting
+in the daemon that replaces the owner.
 """
 
 from __future__ import annotations
