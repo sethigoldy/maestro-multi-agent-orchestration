@@ -49,7 +49,7 @@ from .handoff import HandoffDoc
 from .knowledge import TaskKnowledge, continuation_budget_chars, estimate_tokens, project_knowledge, render_continuation_block
 from .models import Phase
 from .modes import DEFAULT_MAX_BOUNCES, expand as expand_mode, resolve_mode
-from .worker import _verification_command
+from .worker import _has_python_test_suite, _verification_command
 
 _TASK_ID_RE = re.compile(r"^task-\d{8}-\d{6}-[0-9a-f]{6}$")
 
@@ -1049,12 +1049,7 @@ class MaestroDaemon:
                 # The branch was renamed by hand since the last turn and this
                 # turn adopted the new name: tell every view.
                 self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
-        base_head = self._base_head(workspace)
-        if base_head:
-            record = self._tasks.get(task_id)
-            if record is not None:
-                record["base_head"] = base_head  # per-turn evidence baseline for verification
-            self.maestro._write_claim(task_id, "task_base_head", base_head)
+        self._record_turn_baseline(task_id, workspace, doc)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
         last_error: str | None = None
         for agent_name in chain:
@@ -1485,6 +1480,49 @@ class MaestroDaemon:
         head = probe.stdout.strip()
         return head or None
 
+    def _record_turn_baseline(self, task_id: str, workspace: Path, doc: HandoffDoc) -> None:
+        """Record what verification compares this turn against, before the agent runs.
+
+        Two values are kept, each in the task record and in a claim so that a
+        restarted daemon still has them:
+
+        - ``base_head``: the HEAD commit, so new commits count as work.
+        - ``python_test_suite``: whether the project had a Python test suite.
+          Verification accepts pytest's "no tests collected" exit code only
+          when it did not. When it did, the project is verified with pytest
+          even if pytest is missing or the tests are gone, so an agent that
+          deletes or hides every test does not pass. Only auto-detected
+          verification uses this value, so the project is scanned only in
+          that mode.
+        """
+        base_head = self._base_head(workspace)
+        if base_head:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record["base_head"] = base_head  # per-turn evidence baseline for verification
+            self.maestro._write_claim(task_id, "task_base_head", base_head)
+        if doc.verification == "auto":
+            suite = _has_python_test_suite(workspace)
+            record = self._tasks.get(task_id)
+            if record is not None:
+                record["python_test_suite"] = suite
+            self.maestro._write_claim(task_id, "task_python_test_suite", "true" if suite else "false")
+
+    def _recorded_python_test_suite(self, task_id: str) -> bool | None:
+        """Whether the project had a Python test suite when the turn started.
+
+        The task record is read first, then the claim. None means nothing was
+        recorded, for example for a task started by an older Maestro.
+        """
+        record = self._tasks.get(task_id) or {}
+        recorded = record.get("python_test_suite")
+        if recorded is not None:
+            return bool(recorded)
+        claim = self.maestro._claims(task_id).get("task_python_test_suite")
+        if claim is None:
+            return None
+        return claim == "true"
+
     def _workspace_has_changes(self, workspace: Path, task_id: str) -> tuple[bool, str]:
         """Evidence that the turn produced work: working-tree changes or new commits."""
         status = subprocess.run(["git", "-C", str(workspace), "status", "--porcelain"], text=True, capture_output=True)
@@ -1516,12 +1554,17 @@ class MaestroDaemon:
     def _verify(self, workspace: Path, task_id: str, doc: HandoffDoc, output_tail: str | None = None) -> bool:
         import shlex
 
+        from .worker import _pytest_found_no_tests
+
         configured = None
         if doc.verification == "command":
             # The command is verification_command when set; otherwise the
             # original handoff carried it in request (M2 simplification).
             configured = shlex.split(doc.verification_command or doc.request)
-        test_cmd, note = _verification_command(workspace, configured)
+        # Whether the project had a Python test suite when the turn started.
+        # It is used only for auto-detection, and None means it is not known.
+        recorded_suite = self._recorded_python_test_suite(task_id) if configured is None else None
+        test_cmd, note = _verification_command(workspace, configured, had_test_suite=recorded_suite)
         # The auto-detected fallback is `git diff --check` plus a note. It passes
         # trivially on an untouched workspace, so it must never certify a turn
         # that left no changes behind — otherwise a zero-work turn (e.g. an agent
@@ -1529,6 +1572,10 @@ class MaestroDaemon:
         # complete as PASSED. Explicit commands and real test runners are
         # authoritative and keep their current semantics.
         fallback_only = note is not None and test_cmd == ["git", "diff", "--check"]
+        # Whether the turn left work behind is recorded before the test command
+        # runs, so that files the test command itself creates are not mistaken
+        # for the agent's work.
+        has_changes, evidence = self._workspace_has_changes(workspace, task_id)
         diff = subprocess.run(["git", "diff", "--check"], cwd=workspace, text=True, capture_output=True)
         try:
             tests = subprocess.run(test_cmd, cwd=workspace, text=True, capture_output=True)
@@ -1539,22 +1586,52 @@ class MaestroDaemon:
                 stderr = f"verification command could not be launched: {exc}"
 
             tests = _FailedRun()
-        ok = diff.returncode == 0 and tests.returncode == 0
+        # An auto-detected pytest run that found no tests (exit code 5) is not
+        # a test failure when the project had no Python test suite when the
+        # turn started. It proves nothing about the turn either, so it is
+        # treated like the `git diff --check` fallback: it passes only when the
+        # turn left changes behind. When the project did have a test suite,
+        # exit code 5 means the tests were removed or hidden, and it is a
+        # failure. When nothing was recorded, exit code 5 is a failure too,
+        # because there is no evidence that the project had no tests. An
+        # explicit command always keeps its exit code.
+        pytest_no_tests = configured is None and _pytest_found_no_tests(test_cmd, tests.returncode)
+        suite_vanished = pytest_no_tests and recorded_suite is not False
+        no_tests = pytest_no_tests and not suite_vanished
+        ok = diff.returncode == 0 and (tests.returncode == 0 or no_tests)
         no_changes_reason: str | None = None
-        if ok and fallback_only:
-            has_changes, evidence = self._workspace_has_changes(workspace, task_id)
-            if not has_changes:
-                ok = False
-                no_changes_reason = evidence
+        if ok and (fallback_only or no_tests) and not has_changes:
+            ok = False
+            no_changes_reason = evidence
         note_text = f"verification note: {note}\n\n" if note else ""
+        if suite_vanished:
+            note_text += (
+                "verification note: pytest collected no tests although the project had a Python test suite "
+                f"when the turn started (exit code {tests.returncode}). This counts as a failure, because "
+                "the tests may have been deleted, renamed or hidden.\n\n"
+            )
+        if no_tests:
+            note_text += (
+                f"verification note: pytest found no tests to run (exit code {tests.returncode}). "
+                "This is not counted as a test failure, but it is not evidence of work either, "
+                "so the task passes only if the turn changed the workspace.\n\n"
+            )
         no_changes_text = ""
         if no_changes_reason is not None:
             tail_text = f"\n\nlast lines of the agent's output:\n{output_tail}" if output_tail else ""
+            if no_tests:
+                weak_check = (
+                    "The test command found no tests to run, and the only other check is "
+                    "`git diff --check`, which passes trivially on an untouched workspace"
+                )
+            else:
+                weak_check = (
+                    "The only available check is `git diff --check` (no project test runner "
+                    "was detected), which passes trivially on an untouched workspace"
+                )
             no_changes_text = (
                 "\nRESULT: FAILED — no changes detected. "
-                f"{no_changes_reason}. The only available check is `git diff --check` "
-                "(no project test runner was detected), which passes trivially on an "
-                "untouched workspace, so Maestro will not report PASSED without evidence of work."
+                f"{no_changes_reason}. {weak_check}, so Maestro will not report PASSED without evidence of work."
                 + tail_text
             )
         report = (
@@ -1799,7 +1876,7 @@ class MaestroDaemon:
         }
         # What a parked task was waiting for (routing vs. a question), and the
         # gate and verification details the status views show.
-        for key in ("awaiting", "question", "gates", "bounces", "base_head", "verification"):
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification"):
             if runtime.get(key) is not None:
                 record[key] = runtime[key]
         with self._lock:
