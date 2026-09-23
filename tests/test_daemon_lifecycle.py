@@ -1214,3 +1214,15 @@ def test_wait_without_a_timeout_reads_a_record_this_daemon_took_over(home, tmp_p
         assert not waiter.is_alive() and result["status"]["state"] == "completed"
     finally:
         d.stop()
+
+
+def test_a_daemon_without_http_cannot_start_serving_beside_an_owner(owner, home):
+    """start_http on a daemon created without HTTP checks for an owner again."""
+    from maestro import daemonctl
+
+    guest = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    try:
+        with pytest.raises(daemonctl.DaemonAlreadyRunning, match="already owns"):
+            guest.start_http()
+    finally:
+        guest.stop()

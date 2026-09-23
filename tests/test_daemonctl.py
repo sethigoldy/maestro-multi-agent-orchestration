@@ -1171,3 +1171,16 @@ def test_stop_never_removes_a_marker_while_the_owner_lock_is_held(tmp_path, monk
         os.close(fd)
         sleeper.kill()
         sleeper.wait()
+
+
+def test_process_argv_through_ps_on_every_platform(monkeypatch):
+    """The ps path, which Linux normally skips because /proc answers first."""
+    monkeypatch.setattr(daemonctl, "_proc_available", lambda: False)
+    sleeper = _unrelated_sleeper()
+    try:
+        argv = daemonctl.process_argv(sleeper.pid)
+        assert argv is not None and any("time.sleep(60)" in word for word in argv)
+        assert daemonctl.process_start_token(sleeper.pid)
+    finally:
+        sleeper.kill()
+        sleeper.wait()
