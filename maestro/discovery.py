@@ -22,6 +22,21 @@ Design notes:
 - Announcements are untrusted input. ``http_host`` must be an IP address,
   ``http_port`` must be a valid port, and names lose their control characters
   (so ``maestro peers list`` cannot be made to emit terminal escape codes).
+  An announcement from another host may not name a loopback address
+  (127.0.0.1, ::1): a LAN host could otherwise point this machine at its own
+  loopback services. It may name a link-local address (169.254.x.y, fe80::)
+  only when that is the address it was sent from, so a node on a link-local
+  network (a Thunderbolt bridge, for example) can announce itself. A UDP
+  source address is easy to fake for a host on the same link, so this check
+  stops honest mistakes, not a determined neighbour. The well-known cloud
+  metadata addresses (169.254.169.254, 169.254.170.2 and fd00:ec2::254) are
+  therefore rejected whatever the sender. Only an announcement sent from a
+  loopback address may name a loopback host.
+- A node announces itself only on an interface that can reach the host it
+  advertises. A daemon reachable only on loopback announces when the
+  discovery interface is loopback too; on any other interface it listens for
+  peers but never announces 127.0.0.1 to the network. A daemon bound to a
+  link-local address announces it like any other address.
 - ``peers.json`` holds at most ``MAX_PEERS`` entries: discovered peers unseen
   for ``PRUNE_AFTER_S`` are pruned and the oldest are dropped first; manually
   added peers are never dropped. The file is rewritten only when a peer is new
@@ -94,15 +109,43 @@ def _is_loopback(address: str) -> bool:
         return False
 
 
-def _url_host(host: str) -> str | None:
-    """``host`` formatted for a URL, or None when it is not a usable IP address."""
+# Cloud metadata endpoints (AWS, GCP and Azure use 169.254.169.254; ECS task
+# metadata uses 169.254.170.2; AWS over IPv6 uses fd00:ec2::254). A peer URL
+# never points at them, whoever announces them.
+_METADATA_HOSTS = frozenset(ipaddress.ip_address(a) for a in ("169.254.169.254", "169.254.170.2", "fd00:ec2::254"))
+
+
+def _url_host(host: str, sender: str) -> str | None:
+    """``host`` formatted for a URL, or None when it is not a usable IP address.
+
+    ``sender`` is the address the announcement came from. A loopback host is
+    usable only when the sender itself is on loopback, that is, when the
+    announcement came from this machine. A link-local host is usable when the
+    sender is on loopback or is that very address.
+    """
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return None
-    if ip.is_multicast or ip.is_unspecified:
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
+    if ip.is_multicast or ip.is_unspecified or ip in _METADATA_HOSTS:
+        return None
+    if (ip.is_loopback or ip.is_link_local) and not _is_loopback(sender) and str(ip) != sender:
         return None
     return f"[{ip}]" if ip.version == 6 else str(ip)
+
+
+def _announces_host(http_host: str, multicast_if: str) -> bool:
+    """Whether a node advertising ``http_host`` should announce on ``multicast_if``.
+
+    Peers on the network drop a loopback host sent by another machine, and it
+    would be wrong for them anyway, so a loopback host is announced only on a
+    loopback interface, where only this machine hears it.
+    """
+    if _is_loopback(multicast_if):
+        return True
+    return not _is_loopback(http_host)
 
 
 def discovery_interface_from_env() -> str:
@@ -269,6 +312,9 @@ class PresenceServer:
         self.http_host = http_host
         self.nonce = uuid.uuid4().hex[:12]
         self._loopback_only = _is_loopback(multicast_if)
+        # False for a loopback-only daemon on a network interface: it still
+        # records peers it hears, but never sends 127.0.0.1 to the network.
+        self.announces = _announces_host(http_host, multicast_if)
         self._sock: socket.socket | None = None  # receives group traffic
         self._send_sock: socket.socket | None = None  # sends announcements
         self._thread: threading.Thread | None = None
@@ -390,7 +436,7 @@ class PresenceServer:
             if data is not None:
                 self._handle(data, addr)
             now = time.monotonic()
-            if now >= next_announce:
+            if self.announces and now >= next_announce:
                 try:
                     self._send_sock.sendto(self._announcement(), (self.group, self.port))
                 except OSError:
@@ -417,9 +463,9 @@ class PresenceServer:
         host = payload.get("http_host")
         if not isinstance(host, str) or not host:
             host = addr[0]
-        url_host = _url_host(host)
+        url_host = _url_host(host, addr[0])
         if url_host is None:
-            return  # not an IP address: never record a URL built from it
+            return  # not a usable IP address for this sender: never record a URL built from it
         raw_name = payload.get("name")
         name = clean_text(raw_name, MAX_NAME_CHARS) if isinstance(raw_name, str) else ""
         name = name or f"node-{addr[0]}:{http_port}"

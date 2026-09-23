@@ -418,18 +418,26 @@ def test_daemon_endpoint_env_token_pair(tmp_path, monkeypatch):
 
 def test_daemon_endpoint_marker_host_and_token(tmp_path, monkeypatch):
     from maestro import cli as clic
+    from maestro import daemonctl
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "daemon.json").write_text(
-        json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.2", "token": "mk-token"}), encoding="utf-8"
-    )
-    monkeypatch.setenv("MAESTRO_HOME", str(home))
-    monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
-    assert clic._daemon_endpoint() == ("http://127.0.0.2:8790", "mk-token")
-    # marker without host/token (loopback daemon) still resolves
-    (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": 8791}), encoding="utf-8")
-    assert clic._daemon_endpoint() == ("http://127.0.0.1:8791", None)
+    # This process stands in for the daemon: it holds the owner lock that the
+    # marker points at, and its endpoint is reported as answering.
+    lock_fd = daemonctl.acquire_owner_lock(home)
+    monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
+    try:
+        (home / "daemon.json").write_text(
+            json.dumps({"pid": os.getpid(), "port": 8790, "host": "127.0.0.2", "token": "mk-token", "owner_lock": True}), encoding="utf-8"
+        )
+        monkeypatch.setenv("MAESTRO_HOME", str(home))
+        monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
+        assert clic._daemon_endpoint() == ("http://127.0.0.2:8790", "mk-token")
+        # marker without host/token (loopback daemon) still resolves
+        (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": 8791, "owner_lock": True}), encoding="utf-8")
+        assert clic._daemon_endpoint() == ("http://127.0.0.1:8791", None)
+    finally:
+        daemonctl.release_owner_lock(lock_fd)
 
 
 def test_full_swap_demo_script_is_valid():

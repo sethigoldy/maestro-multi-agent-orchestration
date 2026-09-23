@@ -223,20 +223,30 @@ def test_doctor_daemon_status_variants(home, tmp_path, monkeypatch):
     (home / "daemon.json").write_text("not json", encoding="utf-8")
     assert run_doctor(tmp_path)["daemon"]["status"] == "no daemon configured"
 
-    # Live marker (own pid) with a closed port: resolved but unreachable.
-    (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": 9}), encoding="utf-8")
-    d = run_doctor(tmp_path)["daemon"]
-    assert d["reachable"] is False and d["url"] == "http://127.0.0.1:9" and d["status"] == "unreachable"
+    # From here on this process stands in for the daemon: it holds the owner
+    # lock that the markers below name, so the marker's pid is confirmed.
+    from maestro import daemonctl
 
-    # Live marker with a token against a live server: auth from the marker.
-    server, url = _start_server(200)
+    lock_fd = daemonctl.acquire_owner_lock(home)
     try:
-        port = int(url.rsplit(":", 1)[1])
-        (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": port, "host": "127.0.0.1", "token": "tok"}), encoding="utf-8")
+        # Confirmed daemon (own pid) with a closed port: resolved but unreachable.
+        (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": 9, "owner_lock": True}), encoding="utf-8")
         d = run_doctor(tmp_path)["daemon"]
-        assert d["reachable"] is True and d["auth"] == "token" and d["status"] == "ok"
+        assert d["reachable"] is False and d["url"] == "http://127.0.0.1:9" and d["status"] == "unreachable"
+
+        # Confirmed daemon with a token against a live server: auth from the marker.
+        server, url = _start_server(200)
+        try:
+            port = int(url.rsplit(":", 1)[1])
+            (home / "daemon.json").write_text(
+                json.dumps({"pid": os.getpid(), "port": port, "host": "127.0.0.1", "token": "tok", "owner_lock": True}), encoding="utf-8"
+            )
+            d = run_doctor(tmp_path)["daemon"]
+            assert d["reachable"] is True and d["auth"] == "token" and d["status"] == "ok"
+        finally:
+            server.shutdown()
     finally:
-        server.shutdown()
+        daemonctl.release_owner_lock(lock_fd)
 
 
 def test_doctor_invalid_configuration_is_blocking(home, tmp_path):
@@ -532,3 +542,22 @@ def test_format_doctor_synthetic_branches():
     good["ok"] = True
     good.pop("problems")
     assert "✓ environment is usable" in format_doctor(good)
+
+
+def test_doctor_reports_a_marker_whose_pid_is_not_the_daemon_as_stale(home, tmp_path, monkeypatch):
+    """A live pid alone is not the daemon: the marker is stale even though its port answers."""
+    monkeypatch.delenv("MAESTRO_DAEMON_URL", raising=False)
+    server, url = _start_server(200)  # something answers on the marker's port
+    sleeper = subprocess.Popen(["sleep", "60"])  # stands in for a process that reused the daemon's pid
+    try:
+        port = int(url.rsplit(":", 1)[1])
+        (home / "daemon.json").write_text(json.dumps({"pid": sleeper.pid, "port": port, "host": "127.0.0.1", "owner_lock": True}), encoding="utf-8")
+        d = run_doctor(tmp_path)["daemon"]
+        assert d["reachable"] is False and d["url"] is None and d["status"] == "no daemon configured"
+        assert d["stale_marker"] is True and str(sleeper.pid) in d["detail"]
+        text = format_doctor({"daemon": d})
+        assert "stale daemon marker" in text and "not the Maestro daemon" in text
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+        server.shutdown()

@@ -90,9 +90,18 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
   MCP `agents_list` tool show a stored token as `<redacted>`.
 - The web console served by the daemon respects the same token: loopback needs
   none, remote access does.
+- The agent card (`/.well-known/agent.json`) names the daemon's pid and state
+  directory, so `maestro daemon status` and `stop` can confirm that a marker
+  written by an older version belongs to this daemon. The card is served under
+  the same rules as every other data endpoint: with the token beyond loopback,
+  and only to loopback host names on a loopback daemon.
 - The HTTP API limits what one client can make it hold. A POST whose
   `Content-Length` is negative or not a number is refused with 400, and one
-  larger than 8 MiB is refused with 413; neither body is read. A client of an
+  larger than 8 MiB is refused with 413; neither body is parsed or kept in
+  memory. After the reply the daemon reads and discards the body, at most
+  64 MiB of it and only while the client keeps sending (it gives up after
+  5 seconds of silence), so the client receives the reply instead of a reset
+  connection. A client of an
   event stream (SSE) that stops reading is disconnected once it is 2048 events
   behind or a write has waited 30 seconds, so it cannot make the daemon queue
   events forever. A JSON-RPC request that makes the daemon fail unexpectedly
@@ -101,8 +110,15 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
   only, unless `MAESTRO_DISCOVERY=1` is set. Announcements are untrusted input:
   the daemon reads only packets sent to the multicast group, ignores other
   hosts when `MAESTRO_DISCOVERY_IF` is loopback, drops an announcement whose
-  advertised host is not an IP address, strips control characters from names,
-  and keeps at most 256 peers in `peers.json`. Discovered peers are only a
+  advertised host is not an IP address, drops an announcement from another
+  host that advertises a loopback address (such as `127.0.0.1`) or a
+  link-local address other than the one it was sent from, always drops the
+  cloud metadata addresses (`169.254.169.254`, `169.254.170.2` and
+  `fd00:ec2::254`), because a neighbour on the same network can fake the
+  address a packet comes from, strips control characters
+  from names, and keeps at most 256 peers in `peers.json`. A daemon that
+  listens on loopback only never announces `127.0.0.1` on a network
+  interface. Discovered peers are only a
   list; nothing connects to them unless you register one as an agent.
 
 ### State and receipts
