@@ -91,7 +91,7 @@ def test_migration_idempotent(tmp_path, monkeypatch):
     m=Maestro(w1); first=m.list_tasks(project_filter=project); m.close(); n=Maestro(w1); second=n.list_tasks(project_filter=project); n.close(); assert len(first)==len(second)==1
 
 def test_normalize_short_form():
-    assert _normalize_argv(['task','abc'])==['task','status','abc']; assert _normalize_argv(['maestro','task','abc'])==['maestro','task','status','abc']; assert _normalize_argv(['task','list'])==['task','list']
+    assert _normalize_argv(['task','abc'])==['task','status','abc']; assert _normalize_argv(['--workspace','/repo','task','abc'])==['--workspace','/repo','task','status','abc']; assert _normalize_argv(['task','list'])==['task','list']
     # 'continue' is a real subcommand, not a bare task id: it must not be rewritten to status.
     assert _normalize_argv(['task','continue','task-1','--request','x'])==['task','continue','task-1','--request','x']
 
@@ -317,7 +317,8 @@ def test_cli_all_list_scopes_and_helpers(tmp_path, monkeypatch):
 
 def test_cli_normalize_second_shape_and_filter_miss():
     import maestro.cli as cli
-    assert cli._normalize_argv(['prog','task','abc'])==['prog','task','status','abc']
+    # main() strips the program name, so the shorthand is found after top-level options.
+    assert cli._normalize_argv(['--project','/p','task','abc'])==['--project','/p','task','status','abc']
     assert cli._normalize_argv(['task','list'])==['task','list']
     assert cli._filter_tasks([{'project_root':'p','workspace':'w'}],project_root='x')==[]
 
