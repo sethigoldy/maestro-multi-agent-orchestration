@@ -3,8 +3,9 @@
 Fast, deterministic, and strictly read-only: it never modifies the environment,
 installs anything, or changes PATH. Missing optional agents are reported, not
 treated as failures; only a state directory that cannot be used (missing parent
-not creatable, unwritable) or an invalid configuration is blocking. Tokens are
-never printed — only whether authentication applies.
+not creatable, unwritable), an invalid configuration, or a configured storage
+backend that cannot be loaded is blocking. Tokens are never printed — only
+whether authentication applies.
 """
 
 from __future__ import annotations
@@ -187,8 +188,10 @@ def run_doctor(workspace: str | Path | None = None) -> dict[str, Any]:
     resolution); the state directory is always :func:`maestro.core.maestro_user_dir`
     (honoring ``MAESTRO_HOME``). Returns the report dict plus an ``ok`` flag:
     False only when a blocking problem exists (unusable state dir, missing
-    workspace, or invalid configuration). Missing optional agents and a missing
-    daemon are reported but never blocking.
+    workspace, invalid configuration, or a configured storage backend that
+    cannot be loaded, such as memvara when its package is not installed).
+    Missing optional agents and a missing daemon are reported but never
+    blocking.
     """
     state = maestro_user_dir()
     ws = Path(workspace).expanduser().resolve() if workspace else Path.cwd().resolve()
@@ -232,6 +235,19 @@ def run_doctor(workspace: str | Path | None = None) -> dict[str, Any]:
             "error": f"state directory unusable: {exc}",
         }
         blocking.append(f"state directory unusable: {exc}")
+    except RuntimeError as exc:
+        # The configured storage backend cannot be loaded. For example, the
+        # configuration asks for the memvara backend but the memvara package
+        # is not installed. Maestro cannot run until this is fixed.
+        report["state"] = {
+            "dir": str(state),
+            "exists": state_exists,
+            "writable": state_writable,
+            "config_paths": [str(p) for p in config_paths],
+            "storage_backend": None,
+            "error": f"storage backend unavailable: {exc}",
+        }
+        blocking.append(f"storage backend unavailable: {exc}")
     else:
         # Re-probe after construction: on a fresh install the directory did not
         # exist when we first checked, but Maestro() just created it and wrote
