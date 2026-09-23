@@ -41,9 +41,36 @@ def _no_detached_daemon_outlives_a_test(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _pin_discovery_to_loopback(monkeypatch):
-    """Daemons start UDP presence by default; keep test traffic on loopback."""
+    """Daemons start UDP presence by default; keep test traffic on loopback.
+
+    Under pytest-xdist every worker gets its own discovery port, so daemons
+    started by tests running in parallel never hear each other's announcements.
+    """
+    import os
+
     monkeypatch.setenv("MAESTRO_DISCOVERY_TTL", "0")
     monkeypatch.setenv("MAESTRO_DISCOVERY_IF", "127.0.0.1")
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "")  # "gw0", "gw1", … under xdist
+    if worker.startswith("gw") and worker[2:].isdigit():
+        monkeypatch.setenv("MAESTRO_DISCOVERY_PORT", str(19786 + int(worker[2:])))
+
+
+@pytest.fixture(autouse=True)
+def _poll_quickly(monkeypatch):
+    """Poll for cancels and state changes every 50 ms instead of every 500 ms.
+
+    These intervals only decide how soon a waiting loop notices a change, so a
+    shorter one changes no outcome; it only stops each test that cancels an
+    agent or waits on another daemon's task from sleeping up to half a second.
+    Grace periods, which tests do depend on, are left as they are.
+    """
+    import maestro.adapters.a2a_remote as a2a_remote
+    import maestro.adapters.base as base
+    import maestro.daemon as daemon_module
+
+    monkeypatch.setattr(base, "_CANCEL_POLL_S", 0.05)
+    monkeypatch.setattr(a2a_remote, "_CANCEL_POLL_S", 0.05)
+    monkeypatch.setattr(daemon_module, "DURABLE_POLL_S", 0.05)
 
 
 class FakeFastMCP:

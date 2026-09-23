@@ -970,9 +970,8 @@ Tasks are durable per state directory — make sure you're using the same
 
 ```bash
 python -m pip install -e .
-python -m pip install pytest coverage
-python -m coverage run --branch -m pytest -q
-python -m coverage report --fail-under=100     # CI enforces 100% line+branch
+python -m pip install pytest pytest-xdist pytest-cov coverage
+python -m pytest -n auto -q --cov --cov-fail-under=100   # parallel; CI enforces 100% line+branch
 scripts/smoke-fake-agent.sh                    # end-to-end fake-agent smoke test (no CLIs, no network)
 scripts/validate-package.sh                    # clean-install check: wheel + sdist in fresh venvs
 ```

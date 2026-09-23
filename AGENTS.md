@@ -18,4 +18,4 @@ Every code change ships with tests that confirm it works — no exceptions.
 - New behavior, entry points, packaging metadata, and dependency constraints each get at least one test that would fail if the change regressed.
 - Prefer behavioral tests (run the real thing: spawn the console script, send a protocol request) over string-matching assertions when the environment allows it.
 - Keep the suite hermetic: no network, no dependence on host layout beyond what CI provides (`pip install -e .`). Skip gracefully only when an artifact is genuinely absent from the interpreter under test.
-- The coverage gate is 100% (`.coveragerc`); do not add uncovered `maestro/` source lines. Run `coverage run --branch -m pytest -q && coverage report --fail-under=100` before considering a change done.
+- The coverage gate is 100% (`.coveragerc`); do not add uncovered `maestro/` source lines. Run `python -m pytest -n auto -q --cov --cov-fail-under=100` (tests in parallel with pytest-xdist, coverage collected from every worker with pytest-cov) before considering a change done.
