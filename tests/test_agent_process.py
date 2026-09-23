@@ -4,6 +4,13 @@ Each test reproduces a defect found in review: a run killed by one byte that
 is not valid UTF-8, a run that hung (or reported a timeout) because a child
 the agent left running held its output open, a large prompt that deadlocked
 the pipes, and a group kill that was skipped once the agent itself had exited.
+
+The follow-up tests cover the second review: a child that prints all the time
+and so kept the exit grace from starting, a last line without a newline that
+was lost, an RPC abort that blocked the run, children that got SIGKILL with no
+chance to clean up, a group signalled after it was gone, version probes that
+still decoded strictly, and a login-shell snapshot that changed bytes or came
+back empty where ``env -0`` does not work.
 """
 
 from __future__ import annotations
@@ -174,3 +181,259 @@ def test_rpc_agent_that_exits_while_a_child_holds_the_output(binpath, tmp_path):
     result = _SlowRpc(AgentSpec(name="slowrpc", kind="generic")).run("p", tmp_path, "t", timeout=60)
     assert result.ok is False and "closed its stream before settling" in (result.error or "")
     assert time.monotonic() - started < 15
+
+
+# -- review follow-ups ------------------------------------------------------
+
+
+def test_a_child_that_keeps_printing_does_not_keep_a_finished_run_open(binpath, tmp_path):
+    # The child prints every 0.2 s, more often than the 0.5 s poll. The exit
+    # grace must still start when the agent exits, and what the child prints
+    # during the grace must still be recorded.
+    pidfile = tmp_path / "child.pid"
+    _fake_bin(binpath, "ticker", f"cat > /dev/null\n( while :; do echo tick; sleep 0.2; done ) &\necho $! > {pidfile}\necho agent-finished\nexit 0")
+    started = time.monotonic()
+    result = _agent("ticker").run("p", tmp_path, "t", timeout=20, log_dir=tmp_path / "logs")
+    elapsed = time.monotonic() - started
+    assert result.ok is True and result.exit_code == 0, result.error
+    assert elapsed < 10  # the two-second grace, not the 20 s timeout
+    log = Path(result.output_path).read_text(encoding="utf-8")
+    assert "agent-finished" in log and log.count("tick") >= 3
+    assert _wait_dead(int(pidfile.read_text().strip()))
+
+
+def test_the_last_line_without_a_newline_is_kept_after_the_exit_grace(binpath, tmp_path):
+    # A background child holds the output open, so the run ends through the
+    # exit grace. The agent's last line has no trailing newline; it must still
+    # reach the log, the question detection and the error tail.
+    question = '{"question": "Should I delete the old tables?"}'
+    _fake_bin(binpath, "partial", f"cat > /dev/null\nsleep 30 &\necho first-line\nprintf '%s' '{question}'\nexit 3")
+    spec = AgentSpec(name="partial", kind="generic", command="partial --go", input_mode="stdin", output_format="jsonl")
+    seen: list[str] = []
+    result = GenericAdapter(spec).run("p", tmp_path, "t", timeout=20, log_dir=tmp_path / "logs", on_line=seen.append)
+    assert result.ok is False and result.exit_code == 3
+    assert result.question == "Should I delete the old tables?"
+    assert question in (result.error or "")
+    assert Path(result.output_path).read_text(encoding="utf-8") == f"first-line\n{question}"
+    assert seen == ["first-line", question]
+
+
+class _EventRpc(_SlowRpc):
+    """An rpc agent whose events are {"type": "done"} and {"type": "fail"}."""
+
+    def rpc_event(self, event):
+        if event.get("type") == "done":
+            return {"done": True}
+        if event.get("type") == "fail":
+            return {"fail": event.get("message", "")}
+        return {}
+
+
+def _rpc(name: str = "slowrpc") -> _EventRpc:
+    return _EventRpc(AgentSpec(name=name, kind="generic"))
+
+
+def test_rpc_last_line_without_a_newline_reaches_the_error_tail(binpath, tmp_path):
+    _fake_bin(binpath, "slowrpc", "sleep 30 &\necho starting\nprintf 'last words'\nexit 0")
+    result = _rpc().run("p", tmp_path, "t", timeout=20, log_dir=tmp_path / "logs")
+    assert result.ok is False and "closed its stream before settling" in (result.error or "")
+    assert result.error.endswith("starting\nlast words")
+    assert Path(result.output_path).read_text(encoding="utf-8") == "starting\nlast words"
+
+
+def test_rpc_done_event_without_a_newline_settles_the_run(binpath, tmp_path):
+    _fake_bin(binpath, "slowrpc", "sleep 30 &\nprintf '{\"type\": \"done\"}'\nexit 0")
+    result = _rpc().run("p", tmp_path, "t", timeout=20)
+    assert result.ok is True, result.error
+
+
+def test_rpc_fail_event_without_a_newline_fails_the_run(binpath, tmp_path):
+    _fake_bin(binpath, "slowrpc", "sleep 30 &\nprintf '{\"type\": \"fail\", \"message\": \"boom\"}'\nexit 0")
+    result = _rpc().run("p", tmp_path, "t", timeout=20, log_dir=tmp_path / "logs")
+    assert result.ok is False and result.error == "boom"
+    assert result.output_path is not None
+
+
+def test_rpc_lines_after_done_are_logged_but_do_not_change_the_result(binpath, tmp_path):
+    _fake_bin(binpath, "slowrpc", "sleep 30 &\necho '{\"type\": \"done\"}'\nprintf '{\"type\": \"fail\", \"message\": \"late\"}'\nexit 0")
+    result = _rpc().run("p", tmp_path, "t", timeout=20, log_dir=tmp_path / "logs")
+    assert result.ok is True, result.error
+    assert "late" in Path(result.output_path).read_text(encoding="utf-8")
+
+
+class _HugeAbortRpc(_SlowRpc):
+    """The abort command is larger than any pipe buffer, so writing it blocks
+    for as long as the agent does not read its stdin."""
+
+    def rpc_abort_command(self):
+        return {"type": "abort", "pad": "x" * 1_000_000}
+
+
+def test_rpc_abort_that_cannot_be_written_does_not_block_the_run(binpath, tmp_path, monkeypatch):
+    import threading
+
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_RPC_CANCEL_GRACE_S", 1.0, raising=False)
+    pidfile = tmp_path / "agent.pid"
+    _fake_bin(binpath, "slowrpc", f"echo $$ > {pidfile}\nsleep 30")
+    outcome: dict = {}
+
+    def _go():
+        outcome["result"] = _HugeAbortRpc(AgentSpec(name="slowrpc", kind="generic")).run(
+            "p", tmp_path, "t", timeout=60, should_cancel=pidfile.exists,
+        )
+
+    started = time.monotonic()
+    runner = threading.Thread(target=_go, daemon=True)
+    runner.start()
+    runner.join(20)
+    try:
+        assert "result" in outcome, "the run blocked writing the abort command"
+        assert outcome["result"].ok is False and "canceled" in (outcome["result"].error or "")
+        assert time.monotonic() - started < 15
+        assert _wait_dead(int(pidfile.read_text().strip()))
+    finally:
+        try:
+            os.killpg(int(pidfile.read_text().strip()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+
+_CLEANUP_CHILD = (
+    "( trap 'sleep 0.3; rm -f {lock}; exit 0' TERM; touch {lock}; touch {ready}; "
+    "while :; do sleep 0.05; done ) > /dev/null 2>&1 &\n"
+)
+
+
+def test_a_cancel_lets_children_clean_up_before_sigkill(binpath, tmp_path):
+    lock, ready = tmp_path / "index.lock", tmp_path / "ready"
+    _fake_bin(binpath, "worker", "cat > /dev/null\n" + _CLEANUP_CHILD.format(lock=lock, ready=ready) + "wait")
+    result = _agent("worker").run("p", tmp_path, "t", timeout=20, should_cancel=ready.exists)
+    assert result.ok is False and "canceled" in (result.error or "")
+    assert not lock.exists()  # the child got SIGTERM and time to remove its lock
+
+
+def test_leftovers_after_a_successful_run_get_sigterm_first(binpath, tmp_path):
+    lock, ready = tmp_path / "index.lock", tmp_path / "ready"
+    body = "cat > /dev/null\n" + _CLEANUP_CHILD.format(lock=lock, ready=ready)
+    body += f"while [ ! -f {ready} ]; do sleep 0.05; done\nexit 0"
+    _fake_bin(binpath, "worker", body)
+    result = _agent("worker").run("p", tmp_path, "t", timeout=20)
+    assert result.ok is True, result.error
+    assert not lock.exists()
+
+
+def test_a_leftover_that_ignores_sigterm_is_killed_after_the_grace(binpath, tmp_path):
+    pidfile = tmp_path / "child.pid"
+    _fake_bin(binpath, "stubborn", f"cat > /dev/null\n( trap '' TERM; while :; do sleep 0.05; done ) > /dev/null 2>&1 &\necho $! > {pidfile}\nexit 0")
+    started = time.monotonic()
+    result = _agent("stubborn").run("p", tmp_path, "t", timeout=20)
+    assert result.ok is True, result.error
+    assert _wait_dead(int(pidfile.read_text().strip()), timeout=1.0)
+    assert 2.0 <= time.monotonic() - started < 10  # the two-second grace, then SIGKILL
+
+
+class _FakeProc:
+    pid = 987654
+
+    def wait(self, timeout=None):
+        return 0
+
+    def poll(self):
+        return 0
+
+
+def test_a_group_that_is_gone_is_never_signalled(monkeypatch):
+    # Once the agent's group is empty its id may be reused by an unrelated
+    # process. Maestro checks first and never signals a group it saw gone.
+    import maestro.adapters.base as base_mod
+
+    calls: list[tuple[int, int]] = []
+    state = {"exists": False}
+
+    def _killpg(pgid, sig):
+        calls.append((pgid, sig))
+        if not state["exists"]:
+            raise ProcessLookupError("no such group")
+
+    monkeypatch.setattr(base_mod.os, "killpg", _killpg)
+    proc = _FakeProc()
+    base_mod._kill_leftovers(proc)
+    assert calls == [(987654, 0)]  # checked, not signalled
+    state["exists"] = True  # the id now names someone else's group
+    base_mod._kill_leftovers(proc)
+    base_mod._kill_group(proc)
+    assert calls == [(987654, 0)]
+
+
+def test_a_group_owned_by_someone_else_is_never_signalled(monkeypatch):
+    import maestro.adapters.base as base_mod
+
+    calls: list[int] = []
+
+    def _killpg(pgid, sig):
+        calls.append(sig)
+        raise PermissionError("not our group")
+
+    monkeypatch.setattr(base_mod.os, "killpg", _killpg)
+    base_mod._kill_group(_FakeProc())
+    assert calls == [0]
+
+
+def _latin_binary(path: Path) -> str:
+    path.write_text("#!/bin/sh\nprintf 'caf\\351 1.0\\n'\n", encoding="utf-8")
+    path.chmod(0o755)
+    return str(path)
+
+
+def test_version_probes_replace_bytes_that_are_not_utf8(tmp_path, monkeypatch):
+    from maestro import agents, doctor
+
+    binary = _latin_binary(tmp_path / "latinver")
+    assert agents._probe_version(binary) == "caf� 1.0"
+    assert doctor._probe_binary_version(binary) == "caf� 1.0"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    _latin_binary(bindir / "git")
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    assert doctor._git_info() == {"installed": True, "version": "caf� 1.0"}
+
+
+def test_login_env_values_pass_to_agents_byte_for_byte(tmp_path, monkeypatch):
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    shell = tmp_path / "shell"
+    shell.write_text("#!/bin/sh\nexport LATIN_DIR=\"$(printf '/data/caf\\351')\"\nexport CRLF=\"$(printf 'a\\r\\nb')\"\nexec /bin/sh -c \"$2\"\n", encoding="utf-8")
+    shell.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(shell))
+    env = base_mod.capture_login_env()
+    assert os.fsencode(env["LATIN_DIR"]) == b"/data/caf\xe9"
+    assert env["CRLF"] == "a\r\nb"
+
+
+@pytest.mark.parametrize("env_zero", [
+    "echo 'env: illegal option -- 0' >&2; exit 1",  # an env without -0
+    "exit 0",  # an env that accepts -0 but prints nothing
+])
+def test_login_env_falls_back_to_plain_env(tmp_path, monkeypatch, capsys, env_zero):
+    import maestro.adapters.base as base_mod
+
+    monkeypatch.setattr(base_mod, "_LOGIN_ENV_CACHE", None)
+    monkeypatch.delenv("MAESTRO_LOGIN_ENV", raising=False)
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    fake_env = fakebin / "env"
+    fake_env.write_text(f"#!/bin/sh\ncase \"$1\" in -0) {env_zero};; esac\nexec /usr/bin/env \"$@\"\n", encoding="utf-8")
+    fake_env.chmod(0o755)
+    shell = tmp_path / "shell"
+    shell.write_text(f"#!/bin/sh\nexport PATH={fakebin}:$PATH\nexport API_KEY=from-profile\necho banner\nexec /bin/sh -c \"$2\"\n", encoding="utf-8")
+    shell.chmod(0o755)
+    monkeypatch.setenv("SHELL", str(shell))
+    env = base_mod.capture_login_env()
+    assert env["API_KEY"] == "from-profile"
+    assert "banner" not in env
+    err = capsys.readouterr().err
+    assert err.count("warning") == 1 and "multi-line values may be cut" in err

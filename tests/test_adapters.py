@@ -794,14 +794,16 @@ def test_kill_group_term_lookup_error_swallowed(monkeypatch):
 
     def _killpg(pgid, sig):
         seen.append(sig)
-        raise ProcessLookupError("group already gone")
+        if sig != 0:  # the existence check passes, then the group is gone
+            raise ProcessLookupError("group already gone")
 
     monkeypatch.setattr(base_mod.os, "getpgid", lambda pid: 12345)
     monkeypatch.setattr(base_mod.os, "killpg", _killpg)
     base_mod._kill_group(_Proc())  # must not raise
-    # SIGTERM first; after the agent exits, a SIGKILL sweep reaches any child
-    # in its group that ignored SIGTERM. Both lookup errors are swallowed.
-    assert seen == [signal.SIGTERM, signal.SIGKILL]
+    # The group is checked, then sent SIGTERM, which finds it gone. The lookup
+    # error is swallowed, and a group seen gone is never signalled again (its
+    # id could now belong to an unrelated process), so no SIGKILL follows.
+    assert seen == [0, signal.SIGTERM]
 
 
 def test_spawn_streaming_oserror(monkeypatch, tmp_path):

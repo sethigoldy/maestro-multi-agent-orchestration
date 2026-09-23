@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -35,6 +36,15 @@ _ENV_MARKER = "__MAESTRO_ENV__"
 # After an agent's own process exits, how long to keep reading output that a
 # child it left running may still hold open.
 _EXIT_GRACE_S = 2.0
+# After a cancel, how long an rpc agent gets to act on its abort command (and
+# how long Maestro tries to write that command) before its group is stopped.
+_RPC_CANCEL_GRACE_S = 5.0
+# After SIGTERM, how long the processes in an agent's group get to exit (to
+# remove a lock file, for example) before SIGKILL, and how often they are checked.
+_GROUP_TERM_GRACE_S = 2.0
+_GROUP_POLL_S = 0.05
+# How long to wait for the agent's own process after SIGTERM, and again after SIGKILL.
+_LEADER_WAIT_S = 5.0
 
 
 def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
@@ -42,10 +52,20 @@ def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
 
     The daemon may be started from a context that lacks variables the user's
     shell profile exports — API keys above all (launchd, a GUI app, an old
-    terminal). We run ``$SHELL -lc env`` once per process so spawned agents see
-    the same defaults as an interactive session. Set ``MAESTRO_LOGIN_ENV=0`` to
-    disable. Any failure (missing shell, timeout, bad output) degrades to the
-    empty dict: the daemon's own environment still flows through unchanged.
+    terminal). Once per process we run ``$SHELL -lc`` with a command that
+    prints a marker and then ``env -0``, so spawned agents see the same
+    defaults as an interactive session. ``env -0`` separates variables with
+    NUL, so a value that spans several lines (a PEM key) stays whole, and the
+    marker skips anything the profile itself prints first. Values are decoded
+    like ``os.environ`` (surrogateescape), so bytes that are not UTF-8 reach
+    the agent unchanged.
+
+    If ``env -0`` fails or prints nothing after the marker (an ``env`` without
+    ``-0``), the shell is run a second time with plain ``env``, which is parsed
+    line by line, and a warning that multi-line values may be cut is printed to
+    stderr. Both runs share one timeout. Set ``MAESTRO_LOGIN_ENV=0`` to disable.
+    Any other failure (missing shell, timeout, no marker) degrades to the empty
+    dict: the daemon's own environment still flows through unchanged.
     """
     global _LOGIN_ENV_CACHE
     if _LOGIN_ENV_CACHE is not None:
@@ -55,16 +75,22 @@ def capture_login_env(timeout_s: float | None = None) -> dict[str, str]:
         shell = (os.environ.get("SHELL") or "").strip() or ("/bin/zsh" if sys.platform == "darwin" else "/bin/bash")
         try:
             timeout = timeout_s if timeout_s is not None else float(os.environ.get("MAESTRO_LOGIN_ENV_TIMEOUT_S", "10"))
-            # `env -0` separates variables with NUL, so a value that spans
-            # several lines (a PEM key) stays whole. The marker skips anything
-            # the profile itself prints before the variables.
-            proc = subprocess.run(
-                [shell, "-lc", f"printf '\\0{_ENV_MARKER}\\0'; env -0"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
-            )
-            _, found, listing = (proc.stdout or "").rpartition(f"\0{_ENV_MARKER}\0")
-            for entry in listing.split("\0") if found else []:
-                key, sep, value = entry.partition("=")
+            deadline = time.monotonic() + timeout
+            # Bytes, not text: text mode would also turn "\r\n" in a value into "\n".
+            proc = subprocess.run([shell, "-lc", f"printf '\\0{_ENV_MARKER}\\0'; env -0"], capture_output=True, timeout=timeout)
+            _, found, listing = proc.stdout.rpartition(f"\0{_ENV_MARKER}\0".encode())
+            if proc.returncode == 0 and found and listing:
+                entries = listing.split(b"\0")
+            else:
+                print(f"[maestro] warning: `env -0` did not work in the login shell {shell}; reading plain `env` output instead, so multi-line values may be cut", file=sys.stderr)
+                proc = subprocess.run(
+                    [shell, "-lc", f"printf '\\n{_ENV_MARKER}\\n'; env"],
+                    capture_output=True, timeout=max(0.0, deadline - time.monotonic()),
+                )
+                _, found, listing = proc.stdout.rpartition(f"\n{_ENV_MARKER}\n".encode())
+                entries = listing.split(b"\n") if found else []
+            for entry in entries:
+                key, sep, value = os.fsdecode(entry).partition("=")
                 if sep and _ENV_KEY_RE.match(key):
                     env[key] = value
         except (OSError, ValueError, subprocess.SubprocessError):
@@ -281,9 +307,26 @@ class BaseAdapter:
             _threading.Thread(target=_write_and_close, args=(process.stdin, stdin_data), daemon=True).start()
         deadline = started + timeout if timeout else None
         idle = _exit_watch(process)
+        lines: list[str] = []
+        line_question: str | None = None
+
+        def _take(line: str) -> None:
+            """Record one output line: log, live callback, usage and question."""
+            nonlocal usage, line_question
+            lines.append(line.rstrip("\n"))
+            if log_path is not None:
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            if on_line is not None:
+                on_line(line.rstrip("\n"))
+            parsed = self.parse_line(line.rstrip("\n"))
+            if parsed:
+                if isinstance(parsed.get("usage"), dict):
+                    usage = {**(usage or {}), **parsed["usage"]}
+                if isinstance(parsed.get("question"), str) and parsed["question"].strip():
+                    line_question = parsed["question"].strip()
+
         try:
-            lines: list[str] = []
-            line_question: str | None = None
             while True:
                 outcome, line = _next_line(line_q, deadline, should_cancel, idle)
                 if outcome == "timeout":
@@ -294,28 +337,21 @@ class BaseAdapter:
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} was canceled", duration_s=time.monotonic() - started)
                 if outcome == "idle" or line is None:
                     break  # output closed, or the agent exited and a child still holds it
-                lines.append(line.rstrip("\n"))
-                if log_path is not None:
-                    with log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(line)
-                if on_line is not None:
-                    on_line(line.rstrip("\n"))
-                parsed = self.parse_line(line.rstrip("\n"))
-                if parsed:
-                    if isinstance(parsed.get("usage"), dict):
-                        usage = {**(usage or {}), **parsed["usage"]}
-                    if isinstance(parsed.get("question"), str) and parsed["question"].strip():
-                        line_question = parsed["question"].strip()
+                _take(line)
             try:
                 exit_code = process.wait(timeout=5)
             except subprocess.SubprocessError:
                 _kill_group(process)
                 return AdapterResult(ok=False, error=f"Agent {self.kind!r} did not exit after closing its output", duration_s=time.monotonic() - started)
+            _kill_leftovers(process)  # background children the agent left behind
+            # With the group stopped the output closes, and the reader hands
+            # over the agent's last line even when it has no trailing newline.
+            reader.join(timeout=5)
+            for line in _drain(line_q):
+                _take(line)
         except (OSError, ValueError) as exc:
             _kill_group(process)
             return AdapterResult(ok=False, error=f"Agent {self.kind!r} failed while streaming output: {exc}", duration_s=time.monotonic() - started)
-        _kill_leftovers(process)  # background children the agent left behind
-        reader.join(timeout=5)
         output_text = "\n".join(lines)
         question = line_question or self.detect_question(output_text)
         ok = exit_code == 0
@@ -501,7 +537,13 @@ class BaseAdapter:
                 process.stdin.write(_json.dumps(obj) + "\n")  # type: ignore[union-attr]
                 process.stdin.flush()  # type: ignore[union-attr]
             except (OSError, ValueError):
-                pass
+                # Close our end so the unsent data is dropped now, instead of
+                # failing again (and printing an error) when the stream is
+                # garbage collected.
+                try:
+                    process.stdin.close()  # type: ignore[union-attr]
+                except (OSError, ValueError):
+                    pass
 
         usage: dict[str, Any] | None = None
         failed: str | None = None
@@ -547,8 +589,19 @@ class BaseAdapter:
         idle = _exit_watch(process)
         done = False
         cancel_grace_until: float | None = None
+        abort_writer: "_threading.Thread | None" = None
+        lines: list[str] = []
+
+        def _take(line: str) -> None:
+            """Record one output line: log and live callback."""
+            lines.append(line.rstrip("\n"))
+            if log_path is not None:
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line)
+            if on_line is not None:
+                on_line(line.rstrip("\n"))
+
         try:
-            lines: list[str] = []
             while True:
                 if cancel_grace_until is None:
                     outcome, line = _next_line(line_q, deadline, should_cancel, idle)
@@ -564,17 +617,16 @@ class BaseAdapter:
                     abort = self.rpc_abort_command()
                     sender.join(timeout=1)  # never interleave the abort with the start command
                     if abort is not None and not sender.is_alive():
-                        _send(abort)
-                    cancel_grace_until = time.monotonic() + 5
+                        # Written from its own thread: an agent that does not
+                        # read its stdin would block this write for ever, and
+                        # neither the cancel grace nor the deadline could fire.
+                        abort_writer = _threading.Thread(target=_send, args=(abort,), daemon=True)
+                        abort_writer.start()
+                    cancel_grace_until = time.monotonic() + _RPC_CANCEL_GRACE_S
                     continue
                 if outcome == "idle" or line is None:
                     break  # stream closed (or the agent exited) before it settled
-                lines.append(line.rstrip("\n"))
-                if log_path is not None:
-                    with log_path.open("a", encoding="utf-8") as fh:
-                        fh.write(line)
-                if on_line is not None:
-                    on_line(line.rstrip("\n"))
+                _take(line)
                 action = _handle(line.rstrip("\n"))
                 if action == "fail":
                     _kill_group(process)
@@ -584,9 +636,10 @@ class BaseAdapter:
                     done = True
                     break
             sender.join(timeout=1)
-            if sender.is_alive():
-                # The agent never took its start command. Closing stdin would
-                # wait behind that blocked write, so stop the agent instead.
+            if sender.is_alive() or (abort_writer is not None and abort_writer.is_alive()):
+                # The agent never took its start command, or did not take the
+                # abort within the cancel grace. Closing stdin would wait
+                # behind that blocked write, so stop the agent instead.
                 _kill_group(process)
                 exit_code = process.poll()
             else:
@@ -599,11 +652,19 @@ class BaseAdapter:
                 except subprocess.SubprocessError:
                     _kill_group(process)
                     exit_code = None
+            _kill_leftovers(process)
+            # With the group stopped the output closes, and the reader hands
+            # over the agent's last line even when it has no trailing newline.
+            # Those lines are recorded; they settle the run only if nothing
+            # before them did.
+            reader.join(timeout=5)
+            for line in _drain(line_q):
+                _take(line)
+                if not done and failed is None:
+                    done = _handle(line.rstrip("\n")) == "done"
         except (OSError, ValueError) as exc:
             _kill_group(process)
             return AdapterResult(ok=False, error=f"Agent {self.kind!r} failed while streaming output: {exc}", duration_s=time.monotonic() - started)
-        _kill_leftovers(process)
-        reader.join(timeout=5)
         if cancel_grace_until is not None:
             return AdapterResult(
                 ok=False, exit_code=exit_code, output_path=str(log_path) if log_path else None,
@@ -613,6 +674,11 @@ class BaseAdapter:
             return AdapterResult(
                 ok=True, exit_code=exit_code, output_path=str(log_path) if log_path else None,
                 usage=usage, duration_s=time.monotonic() - started,
+            )
+        if failed is not None:  # a failure event among the last lines
+            return AdapterResult(
+                ok=False, exit_code=exit_code, output_path=str(log_path) if log_path else None,
+                usage=usage, error=failed or f"Agent {self.kind!r} failed", duration_s=time.monotonic() - started,
             )
         tail = "\n".join(lines[-10:])
         error = f"Agent {self.kind!r} closed its stream before settling (exit code {exit_code})" + (f"; last output:\n{tail}" if tail else "")
@@ -634,14 +700,14 @@ def _next_line(
 
     Returns ("line", text) with text None once the output has closed,
     ("timeout", None) when the deadline passes, ("cancel", None) when
-    ``should_cancel`` reports a cancel, or ("idle", None) when ``idle``
-    returns True after a poll interval with no output. Cancellation is checked
-    at least every _CANCEL_POLL_S seconds, so an agent that is silent for a
-    long time (for example while it runs a test suite) is still stopped
-    promptly.
+    ``should_cancel`` reports a cancel, or ("idle", None) as soon as ``idle``
+    returns True, even when more output is waiting (the caller drains it
+    later). Cancellation and ``idle`` are checked on every call and at least
+    every _CANCEL_POLL_S seconds, so an agent that is silent for a long time
+    (for example while it runs a test suite) is still stopped promptly, and a
+    child that prints all the time cannot hold a finished run open.
     """
     import queue as _queue
-    import time
 
     while True:
         if should_cancel is not None and should_cancel():
@@ -649,14 +715,31 @@ def _next_line(
         remaining = None if deadline is None else deadline - time.monotonic()
         if remaining is not None and remaining <= 0:
             return "timeout", None
+        if idle is not None and idle():
+            return "idle", None
         wait = remaining
         if should_cancel is not None or idle is not None:
             wait = _CANCEL_POLL_S if wait is None else min(wait, _CANCEL_POLL_S)
         try:
             return "line", line_q.get(timeout=wait)
         except _queue.Empty:
-            if idle is not None and idle():
-                return "idle", None
+            pass
+
+
+def _drain(line_q: Any) -> list[str]:
+    """Take the lines already waiting in the queue, without blocking.
+
+    Stops at the end-of-output sentinel. It takes at most the number of lines
+    waiting when it starts, so a process outside the agent's group that keeps
+    printing cannot keep the run in this loop. The caller is the only reader
+    of the queue, so every line counted by qsize() is still there."""
+    out: list[str] = []
+    for _ in range(line_q.qsize()):
+        item = line_q.get_nowait()
+        if item is None:
+            break
+        out.append(item)
+    return out
 
 
 def _write_and_close(stream: Any, data: str | None) -> None:
@@ -670,12 +753,13 @@ def _write_and_close(stream: Any, data: str | None) -> None:
 
 
 def _exit_watch(process: subprocess.Popen) -> Callable[[], bool]:
-    """An ``idle`` check for _next_line: True once the agent's own process has
-    exited and _EXIT_GRACE_S has passed with no more output. A child the
-    agent started in the background can keep the output pipe open for ever;
-    without this the run would wait for that child instead of the agent."""
-    import time
-
+    """An ``idle`` check for _next_line: True once _EXIT_GRACE_S has passed
+    since the agent's own process exited, whether or not output is still
+    arriving. A child the agent started in the background can keep the output
+    pipe open for ever, and may print all the time (a dev server, a watcher);
+    without this the run would wait for that child instead of the agent. The
+    exit is noticed within _CANCEL_POLL_S, because _next_line calls this at
+    least that often."""
     exited_at: list[float] = []
 
     def _idle() -> bool:
@@ -688,33 +772,88 @@ def _exit_watch(process: subprocess.Popen) -> Callable[[], bool]:
     return _idle
 
 
+# Stopping an agent's process group
+#
+# Agents start with start_new_session=True, so the process group id is the
+# agent's pid. os.getpgid(pid) is not used: it fails once the agent itself has
+# exited, even while children in its group are still running.
+#
+# Before every signal the group is checked with os.killpg(pgid, 0). A group
+# that is seen gone once (ProcessLookupError, or PermissionError because the
+# id now names another user's group) is remembered on the Popen object and
+# never signalled again. The kernel does not hand out a pid while a process
+# group with that id still exists, so while the check finds the group, the id
+# is still ours. One race remains in theory: the group empties between the
+# check and the signal, and in that instant the pid comes round again and a
+# new process makes itself the leader of a group with that id. That needs the
+# whole pid range to wrap within microseconds, and the window is only the time
+# between two system calls.
+
+
+def _group_alive(process: subprocess.Popen) -> bool:
+    """True while the agent's process group exists and may be signalled."""
+    if getattr(process, "_maestro_group_gone", False):
+        return False
+    try:
+        os.killpg(process.pid, 0)
+    except OSError:
+        process._maestro_group_gone = True  # type: ignore[attr-defined]
+        return False
+    return True
+
+
 def _signal_group(process: subprocess.Popen, sig: int) -> None:
-    # Agents start with start_new_session=True, so the process group id is
-    # the agent's pid. os.getpgid(pid) is not used: it fails once the agent
-    # itself has exited, even while children in its group are still running.
+    if not _group_alive(process):
+        return
     try:
         os.killpg(process.pid, sig)
     except OSError:
-        pass
+        process._maestro_group_gone = True  # type: ignore[attr-defined]  # gone between the check and the signal
+
+
+def _finish_group(process: subprocess.Popen, term_sent_at: float) -> None:
+    """Wait until _GROUP_TERM_GRACE_S after SIGTERM for the group to empty,
+    then SIGKILL whatever is left."""
+    while _group_alive(process):
+        if time.monotonic() - term_sent_at >= _GROUP_TERM_GRACE_S:
+            _signal_group(process, signal.SIGKILL)
+            return
+        time.sleep(_GROUP_POLL_S)
 
 
 def _kill_group(process: subprocess.Popen) -> None:
+    """Stop an agent that is still running (timeout, cancel, failure) and
+    every process in its group.
+
+    The whole group gets SIGTERM first. The agent's own process then has up
+    to _LEADER_WAIT_S to exit before it gets SIGKILL (and up to _LEADER_WAIT_S
+    more to be reaped). The rest of the group has until _GROUP_TERM_GRACE_S
+    after the SIGTERM, so a child can remove a lock file, before SIGKILL.
+    The worst case is about 10 seconds; a group that exits on SIGTERM takes
+    only as long as its slowest process."""
+    term_sent_at = time.monotonic()
     _signal_group(process, signal.SIGTERM)
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=_LEADER_WAIT_S)
     except subprocess.SubprocessError:
         _signal_group(process, signal.SIGKILL)
         try:
-            process.wait(timeout=5)  # reap it
+            process.wait(timeout=_LEADER_WAIT_S)  # reap it
         except subprocess.SubprocessError:
             pass
-    _signal_group(process, signal.SIGKILL)  # anything in the group that ignored SIGTERM
+    _finish_group(process, term_sent_at)
 
 
 def _kill_leftovers(process: subprocess.Popen) -> None:
     """After a run ends normally, stop any process the agent left running in
-    its group. A task is a batch run; nothing it started should outlive it."""
-    _signal_group(process, signal.SIGKILL)
+    its group. A task is a batch run; nothing it started should outlive it.
+    They get SIGTERM, then SIGKILL after at most _GROUP_TERM_GRACE_S. When
+    nothing is left, this returns at once."""
+    if not _group_alive(process):
+        return
+    term_sent_at = time.monotonic()
+    _signal_group(process, signal.SIGTERM)
+    _finish_group(process, term_sent_at)
 
 
 def _probe_version(path: str) -> str | None:

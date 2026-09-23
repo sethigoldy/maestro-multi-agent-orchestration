@@ -31,7 +31,7 @@ def _git_info() -> dict[str, Any]:
     if not path:
         return {"installed": False, "version": None}
     try:
-        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError):
         return {"installed": True, "version": None}
     output = (result.stdout or "").strip()
@@ -43,7 +43,7 @@ def _probe_binary_version(path: str | None) -> str | None:
     if not path:
         return None
     try:
-        result = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=5)
+        result = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
     output = (result.stdout or result.stderr or "").strip()

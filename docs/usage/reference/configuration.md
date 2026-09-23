@@ -210,8 +210,8 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_NODE_NAME` | `maestro-node` | Name this daemon announces under discovery |
 | `MAESTRO_STORAGE` | — | Storage backend fallback when no config file sets it |
 | `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort fallbacks when no config file sets them |
-| `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc 'env -0'`) to spawned agents. Values that span several lines, such as a PEM key, are kept whole, and anything the profile prints before the variables is ignored |
-| `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment |
+| `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc 'env -0'`) to spawned agents. Values that span several lines, such as a PEM key, are kept whole, and anything the profile prints before the variables is ignored. Values are passed to agents byte for byte, even when they are not valid UTF-8. If `env -0` fails or prints nothing (an `env` without `-0`), Maestro runs the login shell again with plain `env`, reads it line by line and prints a warning to stderr, because a value that spans several lines is then cut to its first line |
+| `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment. When the plain `env` fallback runs, both runs share this one limit |
 | `MAESTRO_CONTINUATION_MAX_TOKENS` | from `[continuation]` | Positive-integer override of the continuation context budget (see `[continuation]`) |
 | `MAESTRO_PYTHON` | — | Interpreter for verification's pytest probe (must be a file) |
 
