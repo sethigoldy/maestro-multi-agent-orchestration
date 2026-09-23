@@ -161,13 +161,53 @@ non-git directories where a branch would be ceremony without value.
 Each agent runs in its own process group. When a run ends, for any reason
 (success, failure, timeout or cancel), Maestro stops every process still left
 in that group. A task is a batch run, so nothing it starts in the background,
-such as a dev server or a watcher, outlives it. If the agent exits while a
-background child still holds its output open, Maestro waits two seconds for
-remaining output and then treats the run as finished.
+such as a dev server or a watcher, outlives it.
+
+Stopping a group always starts with SIGTERM, so the processes in it can clean
+up, for example by removing a `.git/index.lock` file. Whatever is still
+running two seconds after the SIGTERM gets SIGKILL. After a successful run
+this adds at most two seconds, and nothing at all when the agent left no
+process behind. After a timeout or cancel, the agent's own process gets up to
+five seconds to exit before it gets SIGKILL, and up to five more seconds to be
+reaped, so stopping a group takes at most about ten seconds. Maestro checks that the group still exists
+before each signal, and never signals a group it has already seen gone,
+because its id could by then belong to an unrelated process.
+
+If the agent exits while a background child still holds its output open,
+Maestro keeps reading for two seconds after it notices the exit (it checks at
+least every half second) and then treats the run as finished, even if the
+child is still printing. Output that arrives during those two seconds is
+recorded like any other output. After the leftover processes are stopped,
+Maestro also reads everything still waiting, including a last line that has no
+trailing newline. That line is often the agent's question or error, so it
+reaches the log, question detection and the error message. One case is not
+covered: a process that moved itself out of the group (for example with
+`setsid`) and still holds the output open. Maestro does not stop such a
+process, and it waits at most five seconds for the output to close; a last
+line without a newline is then lost.
 
 A cancel reaches a running agent within about half a second, even while the
-agent prints nothing. Agent output that is not valid UTF-8 is read with the
-bad bytes replaced, so it never stops a run.
+agent prints nothing. A spawned agent is then stopped straight away, as
+described above.
+
+An RPC agent first gets its abort command. If the agent is still taking its
+start command, Maestro waits up to one second for that write to finish, and
+sends no abort if it does not, because the two would get mixed up. From that
+point the agent has five seconds to stop and close its output. The abort is
+written from a separate thread, so an agent that has stopped reading its input
+cannot block the run. When the five seconds end and the agent is still running
+(whether it ignored the abort, never read it, or got none), Maestro stops its
+process group at once, without waiting any longer for it to exit on its own.
+That stop is the one described above: SIGTERM, up to five seconds for the
+agent's own process and two for the rest of the group, then SIGKILL. So an RPC
+agent that ignores the abort but exits on SIGTERM is stopped about five
+seconds after the cancel. The worst case, an agent that also ignores SIGTERM,
+is about fifteen seconds, plus up to one second when the start command was
+still being written. If the agent exits within the five seconds, only the
+processes it left behind are stopped.
+
+Agent output that is not valid UTF-8 is read with the bad bytes replaced, so
+it never stops a run.
 
 ## Verification: evidence, not vibes
 
