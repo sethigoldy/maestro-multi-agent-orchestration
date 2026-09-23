@@ -799,7 +799,9 @@ def test_kill_group_term_lookup_error_swallowed(monkeypatch):
     monkeypatch.setattr(base_mod.os, "getpgid", lambda pid: 12345)
     monkeypatch.setattr(base_mod.os, "killpg", _killpg)
     base_mod._kill_group(_Proc())  # must not raise
-    assert seen == [signal.SIGTERM]
+    # SIGTERM first; after the agent exits, a SIGKILL sweep reaches any child
+    # in its group that ignored SIGTERM. Both lookup errors are swallowed.
+    assert seen == [signal.SIGTERM, signal.SIGKILL]
 
 
 def test_spawn_streaming_oserror(monkeypatch, tmp_path):

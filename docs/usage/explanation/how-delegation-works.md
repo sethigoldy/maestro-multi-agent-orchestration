@@ -156,6 +156,19 @@ branch, and nothing is ever committed by Maestro itself. Commit policy
 with `no-commit`, the agent works directly in your tree, for sandboxes and
 non-git directories where a branch would be ceremony without value.
 
+## Agent processes
+
+Each agent runs in its own process group. When a run ends, for any reason
+(success, failure, timeout or cancel), Maestro stops every process still left
+in that group. A task is a batch run, so nothing it starts in the background,
+such as a dev server or a watcher, outlives it. If the agent exits while a
+background child still holds its output open, Maestro waits two seconds for
+remaining output and then treats the run as finished.
+
+A cancel reaches a running agent within about half a second, even while the
+agent prints nothing. Agent output that is not valid UTF-8 is read with the
+bad bytes replaced, so it never stops a run.
+
 ## Verification: evidence, not vibes
 
 The design stance is that an agent reporting success is a *claim*, and claims
