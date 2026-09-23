@@ -243,7 +243,9 @@ maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode 
   or parks with a question (section 3).
 - `--fallback`: repeatable fallback agents, tried in order when the target fails.
 - `--branch NAME`: name for the task's git branch (default `maestro/<task-id>`).
-  It must not exist yet. Same as `[expectations] branch` in a handoff file.
+  It must not exist yet and must not clash with an existing branch as a folder
+  (`feat` and `feat/login` cannot both exist). Same as `[expectations] branch`
+  in a handoff file.
 - `--context TEXT` / `--context-file PATH` / `--skill DIR`: inject standing
   context into the agent turns (text entry, inlined file, or Agent Skills
   directory containing SKILL.md).
@@ -370,8 +372,8 @@ When your environment exposes the Maestro MCP server, these tools are available
   defaults and the input-required question behave exactly as in section 3.
   `branch` names the task's git branch (default `maestro/<task-id>`); use it
   when the repository has branch naming conventions, instead of renaming later.
-- **`followup(workspace, task_id, instruction, context_mode="reuse")`** — send a precise fix pass to a
-  finished/failed task; blocks until that follow-up turn settles. `context_mode="reuse"` (default) injects the compact task-knowledge snapshot; `"fresh"` starts a clean reasoning context.
+- **`followup(workspace, task_id, instruction, context_mode="reuse", branch="")`** — send a precise fix pass to a
+  finished/failed task; blocks until that follow-up turn settles. `context_mode="reuse"` (default) injects the compact task-knowledge snapshot; `"fresh"` starts a clean reasoning context. `branch` renames the task's branch first; use it when the first turn failed because its branch could not be created.
 - **`task_wait(workspace, task_id)`** — block on an earlier (e.g. queued or
   `--no-wait`) task until it reaches a terminal state or needs input.
 - **`task_status(workspace, task_id)`** — current status object (state, question
@@ -385,7 +387,8 @@ When your environment exposes the Maestro MCP server, these tools are available
 - **`cancel_task(workspace, task_id)`** — cancel a running/queued task.
 - **`rename_task_branch(workspace, task_id, branch)`** — rename a finished task's
   branch in git and in the task's record. If the branch was already renamed with
-  `git branch -m`, this only updates the record.
+  `git branch -m`, this only updates the record. If the task has no branch yet,
+  this changes the name its next turn creates.
 
 ## 12. What you never do
 

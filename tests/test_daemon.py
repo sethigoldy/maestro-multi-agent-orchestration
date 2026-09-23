@@ -1591,7 +1591,7 @@ def test_mcp_tools_keep_stable_signatures():
         "agents_list": [],
         "cancel_task": ["workspace", "task_id", "reason"],
         "answer_task_question": ["workspace", "task_id", "answer"],
-        "followup": ["workspace", "task_id", "instruction", "context_mode"],
+        "followup": ["workspace", "task_id", "instruction", "context_mode", "branch"],
         "rename_task_branch": ["workspace", "task_id", "branch"],
     }
     for name, params in expected.items():

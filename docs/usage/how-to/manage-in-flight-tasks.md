@@ -111,11 +111,29 @@ was renamed from the task's branch, and then only updates the record. If git
 has no record of that rename, the command refuses, because the new branch may
 be unrelated to the task.
 
+You do not have to record a hand rename before the next follow-up. When a
+turn starts and the task's branch is missing, Maestro looks for the rename in
+git's reflog and, if exactly one branch was renamed from it, uses that branch
+and updates the record. If the branch was deleted instead, the turn fails
+rather than starting again on a new, empty branch; recreate the branch with
+`git branch <name> <commit>` and send the follow-up again.
+
+If the task has no branch yet, because its first turn could not create the
+branch it asked for, the same command changes the name that the next turn will
+create. You can also rename as part of the follow-up:
+
+```bash
+maestro task continue 3 --request "try again" --branch feat/login-form-2
+```
+
 Rules:
 
-- The task must not be running. Wait for it to finish or park first.
+- The task must not be running. Wait for it to finish or park first. A
+  follow-up or answer sent while a rename is under way waits for the rename
+  to finish.
 - The new name must not already exist, unless it is the task's branch that
-  you renamed by hand.
+  you renamed by hand. It also must not clash with an existing branch as a
+  folder (`feat` and `feat/login` cannot both exist).
 - Only the local branch is renamed. If you pushed the old branch, rename or
   delete it on the remote yourself.
 

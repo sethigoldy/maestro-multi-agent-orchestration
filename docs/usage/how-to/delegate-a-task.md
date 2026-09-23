@@ -183,8 +183,23 @@ branch = "feat/login-form"
 From an MCP client, pass `branch="feat/login-form"` to `delegate`.
 
 The branch must not exist yet. Maestro refuses the delegation if it does, so an
-agent never ends up working on a branch that already holds other work. Every
-later turn of the task, including follow-ups, uses the same branch.
+agent never ends up working on a branch that already holds other work. The name
+also must not clash with an existing branch as a folder: git keeps `feat/login`
+as a file inside a folder called `feat`, so if a branch `feat` exists,
+`feat/login` cannot be created, and if `feat/x` exists, `feat` cannot be
+created. Maestro refuses those names at delegation too. Every later turn of the
+task, including follow-ups, uses the same branch.
+
+If the branch cannot be created when the first turn starts (for example, two
+queued handoffs asked for the same name), the task fails and the message names
+the fix. Run `maestro task rename-branch <task> <new-name>` to pick another
+name, then send a follow-up; or run
+`maestro task continue <task> --request "…" --branch <new-name>` to do both at
+once.
+
+The branch name applies to the workspace of the daemon that runs the task. If
+the target agent is a remote daemon, the handoff forwarded to it does not carry
+the name, and the remote puts its work on its own default branch.
 
 If a task has already run under the default name, rename its branch with
 `maestro task rename-branch <task> <new-name>` (or the `rename_task_branch`
@@ -239,7 +254,8 @@ These fail fast, before any agent runs — read the error rather than retrying:
 - **Workspace not a directory**, or **not a git repository** with
   `commit_policy = "branch"`.
 - **Branch name problems** — a `branch` that is not a valid git branch name,
-  that already exists in the workspace, or that is combined with
+  that already exists in the workspace, that clashes with an existing branch
+  as a folder (`feat` and `feat/login`), or that is combined with
   `commit_policy = "no-commit"`.
 - **Budget cap exceeded** for the target agent.
 - **Work-mode problems** — an unknown `mode` name, an unknown agent in any

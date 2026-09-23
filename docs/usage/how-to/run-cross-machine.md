@@ -75,7 +75,11 @@ maestro delegate --title "T" --request "R" --target remote-b --workspace /path/t
 ```
 
 The full handoff document travels with the request, so routing survives the
-hop. Maestro checks the remote's agent card before delegating, streams its
+hop. The one field left out is `[expectations] branch`: a task branch name
+applies only to the workspace of the daemon that runs the task. The remote
+daemon gets a new request on every attempt and every turn, so it puts its work
+on its own default branch, `maestro/<remote-task-id>`, instead of refusing
+every request after the first because the named branch already exists. Maestro checks the remote's agent card before delegating, streams its
 output and usage live, and forwards cancellation. If the remote has no free
 workspace slot it queues the task; a missing/wrong token fails fast with
 `HTTP 401 — check this agent's token`.

@@ -147,8 +147,11 @@ def rename_task_branch(workspace: str, task_id: str, branch: str) -> str:
     the new name. Numeric task numbers such as '1' are accepted.
 
     If the branch was already renamed by hand with 'git branch -m', this only
-    updates the record. Only the local branch is renamed; a copy already
-    pushed to a remote keeps its old name there."""
+    updates the record. If the task has no branch yet (for example its first
+    turn could not create the branch it asked for), this changes the name its
+    next turn creates, and the result has "pending": true. Only the local
+    branch is renamed; a copy already pushed to a remote keeps its old name
+    there."""
     d = get_daemon()
     try:
         result = d.rename_branch(d.resolve(task_id), branch)
@@ -160,7 +163,7 @@ def rename_task_branch(workspace: str, task_id: str, branch: str) -> str:
 
 
 @mcp.tool()
-def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str:
+def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse", branch: str = "") -> str:
     """Send a follow-up instruction to a finished task (completed/failed/canceled).
     The same agent resumes on the same task branch with the new instruction —
     unless the task's handoff pins a fixer agent, in which case the follow-up
@@ -172,10 +175,15 @@ def followup(workspace: str, task_id: str, instruction: str, context_mode: str =
     history stays in the durable record and is never replayed. 'fresh' skips the
     snapshot for a clean reasoning context (same task/workspace/branch).
 
+    branch: optional new name for the task's branch. The branch is renamed
+    first, exactly as rename_task_branch does, and the turn then runs on it. If
+    the task has no branch yet (its first turn could not create the branch it
+    asked for), this sets the name the turn creates.
+
     Blocks until the follow-up turn finishes or needs input — no polling."""
     d = get_daemon()
     try:
-        started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode)
+        started = d.followup(d.resolve(task_id), instruction, context_mode=context_mode, branch=branch.strip() or None)
     except KeyError as exc:
         return json.dumps({"error": exc.args[0]}, indent=2)
     except ValueError as exc:

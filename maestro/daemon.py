@@ -37,7 +37,7 @@ from .a2a import (
 )
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec
-from .branches import branch_exists, rename_task_branch
+from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
 from .context import RenderedContext, compose_context, entry_from_dict, render_context
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
@@ -101,6 +101,21 @@ def _runtime_from_claims(claims: dict[str, str]) -> dict[str, Any]:
         except (ValueError, TypeError):
             pass
     return {}
+
+
+def _forwarded_handoff(doc: HandoffDoc) -> dict[str, Any]:
+    """The handoff as sent to a remote daemon, without the branch name.
+
+    The branch name belongs to this daemon's workspace, where this daemon
+    creates the branch on the first turn and checks it out on later turns. A
+    remote daemon gets a fresh ``message/send`` on every attempt and every
+    turn, so a branch name in it would make the remote refuse every send after
+    the first ("already exists"), and on the same machine even the first. The
+    remote daemon puts its work on its own default branch instead.
+    """
+    data = doc.to_dict()
+    data["expectations"]["branch"] = None
+    return data
 
 
 def build_prompt(doc: HandoffDoc, task_id: str, workspace: Path, transcript: list[dict[str, str]], context_block: str = "") -> str:
@@ -287,6 +302,10 @@ class MaestroDaemon:
         self._queue: list[tuple[HandoffDoc, Path]] = []
         self._cancel_flags: dict[str, threading.Event] = {}
         self._lock = threading.RLock()
+        # Tasks whose next turn has been started by answer_question but whose
+        # thread has not yet set the state to working. rename_branch treats
+        # them as running.
+        self._turn_starting: set[str] = set()
         self.port: int | None = None
         self.bind = bind or "127.0.0.1"
         self.token: str | None = None  # set in _resolve_bind when auth is required
@@ -651,9 +670,10 @@ class MaestroDaemon:
                     f"Workspace {ws} is not a git repository but commit_policy={doc.commit_policy!r} requires one; "
                     "run 'git init' there or set commit_policy='no-commit'"
                 )
-            if doc.branch and branch_exists(ws, doc.branch):
+            clash = branch_name_clash(ws, doc.branch) if doc.branch else None
+            if clash:
                 raise ValueError(
-                    f"Branch {doc.branch!r} already exists in {ws}; pick a new name for this task's branch"
+                    f"Cannot use branch {doc.branch!r} in {ws}: {clash}; pick a new name for this task's branch"
                 )
         key = str(ws)
         self._enforce_budgets(doc.target_agent)
@@ -796,7 +816,10 @@ class MaestroDaemon:
         its own) and frees the workspace slot.
         """
         try:
-            self._set_state(task_id, STATE_WORKING)
+            try:
+                self._set_state(task_id, STATE_WORKING)
+            finally:
+                self._turn_starting.discard(task_id)
             self._run_turn(task_id, doc, workspace)
         except Exception as exc:
             self._handle_turn_crash(task_id, exc)
@@ -823,15 +846,17 @@ class MaestroDaemon:
         turn = (record.get("turn") or 0) + 1 if record is not None else 1
         if record is not None:
             record["turn"] = turn  # follow-ups/answers are new turns; result files must not collide
-        branch = self._prepare_branch(
-            workspace, task_id, doc.commit_policy,
-            requested=doc.branch, recorded=(record or {}).get("branch"),
-        )
+        recorded = (record or {}).get("branch")
+        branch = self._prepare_branch(workspace, task_id, doc.commit_policy, requested=doc.branch, recorded=recorded)
         if branch:
             record = self._tasks.get(task_id)
             if record is not None:
                 record["branch"] = branch
             self.maestro._write_claim(task_id, "task_branch", branch)
+            if recorded and branch != recorded:
+                # The branch was renamed by hand since the last turn and this
+                # turn adopted the new name: tell every view.
+                self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
         base_head = self._base_head(workspace)
         if base_head:
             record = self._tasks.get(task_id)
@@ -930,7 +955,7 @@ class MaestroDaemon:
             **doc.agent_settings,
             # Reserved key for api-mode adapters (e.g. a2a_remote) so
             # the full handoff survives daemon-to-daemon hops.
-            "maestro_handoff": doc.to_dict(),
+            "maestro_handoff": _forwarded_handoff(doc),
         }
 
     def _rendered_context(self, doc: HandoffDoc, task_id: str, phase: str, adapter_kind: str, workspace: Path) -> RenderedContext:
@@ -1316,24 +1341,46 @@ class MaestroDaemon:
     ) -> str | None:
         """Check out the task branch, creating it on the task's first turn.
 
-        The name is, in order: the branch already recorded for this task (a
-        later turn, possibly after a rename), the name the handoff asked for,
-        or the default ``maestro/<task_id>``. A branch the handoff asked for
-        must be created fresh. If git cannot create or check out the task
-        branch, the turn fails rather than letting the agent work on whatever
-        branch is checked out while the record names the task branch.
+        On the first turn (no branch recorded yet) the branch is created with
+        the name the handoff asked for, or the default ``maestro/<task_id>``.
+        A branch the handoff asked for must be created fresh; if git cannot
+        create it, the turn fails and the message names the command that picks
+        another name. A default branch that already exists is checked out.
+
+        On a later turn the recorded branch is checked out. If it no longer
+        exists, git's reflog is searched for a hand rename (``git branch -m``):
+        when exactly one branch was renamed from it, that branch is adopted and
+        returned. Otherwise the turn fails; a fresh branch is never created in
+        place of the task's branch, because the agent would then work without
+        the task's earlier commits.
+
+        If git cannot check out the task branch, the turn fails rather than
+        letting the agent work on whatever branch is checked out while the
+        record names the task branch.
         """
         if commit_policy == "no-commit":
             return None
         probe = subprocess.run(["git", "-C", str(workspace), "rev-parse", "--show-toplevel"], text=True, capture_output=True)
         if probe.returncode != 0:
             return None
-        branch = recorded or requested or f"maestro/{task_id}"
+        if recorded:
+            branch = recorded if branch_exists(workspace, recorded) else self._renamed_task_branch(workspace, task_id, recorded)
+            checked = subprocess.run(["git", "-C", str(workspace), "checkout", branch], text=True, capture_output=True)
+            if checked.returncode != 0:
+                raise RuntimeError(
+                    f"could not check out the task branch {branch!r}: {(checked.stderr or checked.stdout).strip()}"
+                )
+            return branch
+        branch = requested or f"maestro/{task_id}"
         created = subprocess.run(["git", "-C", str(workspace), "checkout", "-b", branch], text=True, capture_output=True)
         if created.returncode != 0:
-            if requested and not recorded:
+            if requested:
+                ref = self._task_ref(task_id)
                 raise RuntimeError(
-                    f"could not create the requested branch {branch!r}: {(created.stderr or created.stdout).strip()}"
+                    f"could not create the requested branch {branch!r}: {(created.stderr or created.stdout).strip()}. "
+                    f"Pick another name with 'maestro task rename-branch {ref} <new-name>' (MCP tool: rename_task_branch), "
+                    f"then send the follow-up again; or do both at once with "
+                    f"'maestro task continue {ref} --request <instruction> --branch <new-name>' (MCP tool: followup with branch)"
                 )
             existing = subprocess.run(["git", "-C", str(workspace), "checkout", branch], text=True, capture_output=True)
             if existing.returncode != 0:
@@ -1342,39 +1389,64 @@ class MaestroDaemon:
                 )
         return branch
 
+    def _renamed_task_branch(self, workspace: Path, task_id: str, recorded: str) -> str:
+        """Return the branch that ``recorded`` was renamed to by hand, or fail the turn."""
+        candidates = find_renamed_branches(workspace, recorded)
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise RuntimeError(
+                f"the task branch {recorded!r} no longer exists, and git has no record that it was renamed, "
+                "so this turn will not create a new, empty branch in its place. Recreate it under that name "
+                f"(for example 'git branch {recorded} <commit>') and send the follow-up again"
+            )
+        raise RuntimeError(
+            f"the task branch {recorded!r} no longer exists, and git records more than one branch that came from "
+            f"it ({', '.join(candidates)}). Record the right one with "
+            f"'maestro task rename-branch {self._task_ref(task_id)} <branch>'"
+        )
+
+    def _task_ref(self, task_id: str) -> str:
+        """The short task number when there is one (what users type), else the task id."""
+        return str(self.maestro._claims(task_id).get("task_number") or task_id)
+
     # ------------------------------------------------------------ interactions
     def answer_question(self, task_id: str, answer: str) -> dict[str, Any]:
         # Durable-aware: a task parked in an earlier daemon run can be answered
         # after a restart (its record is reconstructed from claims).
-        record = self._tasks.get(task_id) or self._durable_record(task_id)
-        if record is None:
-            raise KeyError(f"Unknown task reference {task_id!r}")
-        if record["state"] != STATE_INPUT_REQUIRED:
-            raise ValueError(f"Task {task_id} is not awaiting input (state={record['state']})")
-        if not str(answer).strip():
-            raise ValueError("Answer cannot be empty")
-        doc = self._doc_from_record(record)
-        if record.get("awaiting") == "routing":
-            # The task is parked on the routing question: the answer selects the
-            # agent/model, then the task starts. A bad answer raises and leaves
-            # the task input-required for another attempt.
-            doc = self._parse_routing_answer(record, answer)
-            record["doc"] = doc.to_dict()
-            record["target_agent"] = doc.target_agent
-            record.pop("awaiting", None)
-            self._persist(task_id, doc)
-        elif not self._apply_defaults(doc):
-            # Parked for another reason (e.g. sensitive approval) while routing was
-            # never resolved: ask now instead of running under a guessed target.
-            record["awaiting"] = "routing"
-            self._persist(task_id, doc)
-            self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
-            return {"task_id": task_id, "state": STATE_INPUT_REQUIRED}
-        workspace = Path(record["workspace"])
-        record_transcript_answer(self._tasks.get(task_id), answer)
-        thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace), daemon=True)
-        thread.start()
-        return {"task_id": task_id, "state": STATE_WORKING}
+        # The check and the start of the turn happen under the daemon lock, so
+        # a branch rename (rename_branch) cannot run between them.
+        with self._lock:
+            record = self._tasks.get(task_id) or self._durable_record(task_id)
+            if record is None:
+                raise KeyError(f"Unknown task reference {task_id!r}")
+            if record["state"] != STATE_INPUT_REQUIRED:
+                raise ValueError(f"Task {task_id} is not awaiting input (state={record['state']})")
+            if not str(answer).strip():
+                raise ValueError("Answer cannot be empty")
+            doc = self._doc_from_record(record)
+            if record.get("awaiting") == "routing":
+                # The task is parked on the routing question: the answer selects the
+                # agent/model, then the task starts. A bad answer raises and leaves
+                # the task input-required for another attempt.
+                doc = self._parse_routing_answer(record, answer)
+                record["doc"] = doc.to_dict()
+                record["target_agent"] = doc.target_agent
+                record.pop("awaiting", None)
+                self._persist(task_id, doc)
+            elif not self._apply_defaults(doc):
+                # Parked for another reason (e.g. sensitive approval) while routing was
+                # never resolved: ask now instead of running under a guessed target.
+                record["awaiting"] = "routing"
+                self._persist(task_id, doc)
+                self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
+                return {"task_id": task_id, "state": STATE_INPUT_REQUIRED}
+            workspace = Path(record["workspace"])
+            record_transcript_answer(self._tasks.get(task_id), answer)
+            self._turn_starting.add(task_id)
+            thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace), daemon=True)
+            thread.start()
+            return {"task_id": task_id, "state": STATE_WORKING}
 
     # ------------------------------------------------------------ task knowledge
     def _refresh_knowledge(self, task_id: str) -> TaskKnowledge | None:
@@ -1457,7 +1529,9 @@ class MaestroDaemon:
                 total += st.st_size
         return total
 
-    def followup(self, task_id: str, instruction: str, context_mode: str = "reuse") -> dict[str, Any]:
+    def followup(
+        self, task_id: str, instruction: str, context_mode: str = "reuse", branch: str | None = None,
+    ) -> dict[str, Any]:
         """Resume a finished task (completed/failed/canceled) with a new instruction.
 
         The same target agent continues on the same task branch. With
@@ -1468,6 +1542,11 @@ class MaestroDaemon:
         reasoning context (same task/workspace/branch). Depth is decremented so
         follow-up chains cannot nest forever. Works after a daemon restart: an
         unknown in-memory task is reconstructed from durable claims.
+
+        ``branch`` renames the task's branch first, exactly as
+        :meth:`rename_branch` does; when the task has no branch yet it changes
+        the name this turn creates. It is the way out when the first turn
+        could not create the branch it asked for.
         """
         if context_mode not in ("reuse", "fresh"):
             raise ValueError(f"context_mode must be 'reuse' or 'fresh': {context_mode!r}")
@@ -1477,95 +1556,113 @@ class MaestroDaemon:
         instruction = str(instruction).strip()
         if not instruction:
             raise ValueError("Follow-up instruction cannot be empty")
-        state = record["state"]
-        if state not in TERMINAL_STATES:
-            raise ValueError(
-                f"Task {task_id} is still active (state={state}); cancel it or answer its question before following up"
+        # Everything from the state check to the start of the turn happens
+        # under the daemon lock, so a branch rename cannot run in between.
+        with self._lock:
+            state = record["state"]
+            if state not in TERMINAL_STATES:
+                raise ValueError(
+                    f"Task {task_id} is still active (state={state}); cancel it or answer its question before following up"
+                )
+            if branch is not None:
+                self.rename_branch(task_id, branch)
+            doc = self._doc_from_record(record)
+            followup_doc = HandoffDoc(
+                title=f"{record.get('title') or task_id} — follow-up",
+                request=instruction,
+                design=doc.design,
+                context_files=list(doc.context_files),
+                context_notes=(
+                    (doc.context_notes + "\n" if doc.context_notes else "")
+                    + "Follow-up turn: the previous work for this task is already on the task branch/working tree; build on it rather than redoing it."
+                ),
+                # A pinned fixer owns follow-up turns (a follow-up is a fix); otherwise
+                # the original target continues as before. Work-mode slots carry over so
+                # later turns keep the same profile.
+                target_agent=doc.fix_agent or record.get("target_agent") or doc.target_agent,
+                explicit_target=True,
+                fallback=list(doc.fallback),
+                origin_agent=record.get("origin_agent") or doc.origin_agent,
+                parent_task_id=task_id,
+                mode=doc.mode,
+                review_agent=doc.review_agent,
+                verify_agent=doc.verify_agent,
+                fix_agent=doc.fix_agent,
+                max_bounces=doc.max_bounces,
+                artifacts=list(doc.artifacts),
+                verification=doc.verification,
+                commit_policy=doc.commit_policy,
+                branch=doc.branch,
+                budget_hint=doc.budget_hint,
+                sensitive=doc.sensitive,
+                max_depth_remaining=max(0, doc.max_depth_remaining - 1),
             )
-        doc = self._doc_from_record(record)
-        followup_doc = HandoffDoc(
-            title=f"{record.get('title') or task_id} — follow-up",
-            request=instruction,
-            design=doc.design,
-            context_files=list(doc.context_files),
-            context_notes=(
-                (doc.context_notes + "\n" if doc.context_notes else "")
-                + "Follow-up turn: the previous work for this task is already on the task branch/working tree; build on it rather than redoing it."
-            ),
-            # A pinned fixer owns follow-up turns (a follow-up is a fix); otherwise
-            # the original target continues as before. Work-mode slots carry over so
-            # later turns keep the same profile.
-            target_agent=doc.fix_agent or record.get("target_agent") or doc.target_agent,
-            explicit_target=True,
-            fallback=list(doc.fallback),
-            origin_agent=record.get("origin_agent") or doc.origin_agent,
-            parent_task_id=task_id,
-            mode=doc.mode,
-            review_agent=doc.review_agent,
-            verify_agent=doc.verify_agent,
-            fix_agent=doc.fix_agent,
-            max_bounces=doc.max_bounces,
-            artifacts=list(doc.artifacts),
-            verification=doc.verification,
-            commit_policy=doc.commit_policy,
-            branch=doc.branch,
-            budget_hint=doc.budget_hint,
-            sensitive=doc.sensitive,
-            max_depth_remaining=max(0, doc.max_depth_remaining - 1),
-        )
-        if followup_doc.max_depth_remaining <= 0:
-            raise ValueError("Max delegation depth exceeded; refusing to nest further")
-        # Continuation context: carry the task's composed [[context]] entries
-        # forward (follow-up turns must see what earlier turns saw), dropping
-        # any stale knowledge entry from an earlier turn; in reuse mode a fresh
-        # compact knowledge snapshot is then injected as its own entry, rendered
-        # through the standard context pipeline.
-        followup_doc.context_entries = [e for e in doc.context_entries if e.get("label") != "task-knowledge"]
-        raw_history = self._raw_history_bytes(task_id)
-        continuation_config = self.maestro.config.get("continuation") or {}
-        if context_mode == "reuse" and continuation_config.get("enabled", True):
-            knowledge = self._refresh_knowledge(task_id)
-            block = render_continuation_block(knowledge, continuation_budget_chars(self.maestro.config)) if knowledge is not None else ""
-            if block:
-                followup_doc.context_entries.append({"label": "task-knowledge", "kind": "text", "text": block})
-            record["context_stats"] = {
-                "mode": "reuse",
-                "knowledge_chars": len(knowledge.serialize()) if knowledge is not None else 0,
-                "context_chars": len(block),
-                "raw_history_bytes": raw_history,
-                # chars/4 estimate — labeled as an estimate in receipts/docs.
-                "estimated_tokens": estimate_tokens(block),
-                "reduction_ratio": round(1 - len(block) / raw_history, 3) if (block and raw_history > 0) else None,
-            }
-        elif context_mode == "fresh":
-            record["context_stats"] = {"mode": "fresh", "raw_history_bytes": raw_history}
-        record["doc"] = followup_doc.to_dict()  # the chain accumulates: later follow-ups see reduced depth
-        record["target_agent"] = followup_doc.target_agent  # a pinned fixer becomes the task's current target
-        self._persist(task_id, followup_doc)
-        workspace = Path(record["workspace"])
-        self._set_state(task_id, STATE_SUBMITTED)
-        thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
-        thread.start()
-        return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
+            if followup_doc.max_depth_remaining <= 0:
+                raise ValueError("Max delegation depth exceeded; refusing to nest further")
+            # Continuation context: carry the task's composed [[context]] entries
+            # forward (follow-up turns must see what earlier turns saw), dropping
+            # any stale knowledge entry from an earlier turn; in reuse mode a fresh
+            # compact knowledge snapshot is then injected as its own entry, rendered
+            # through the standard context pipeline.
+            followup_doc.context_entries = [e for e in doc.context_entries if e.get("label") != "task-knowledge"]
+            raw_history = self._raw_history_bytes(task_id)
+            continuation_config = self.maestro.config.get("continuation") or {}
+            if context_mode == "reuse" and continuation_config.get("enabled", True):
+                knowledge = self._refresh_knowledge(task_id)
+                block = render_continuation_block(knowledge, continuation_budget_chars(self.maestro.config)) if knowledge is not None else ""
+                if block:
+                    followup_doc.context_entries.append({"label": "task-knowledge", "kind": "text", "text": block})
+                record["context_stats"] = {
+                    "mode": "reuse",
+                    "knowledge_chars": len(knowledge.serialize()) if knowledge is not None else 0,
+                    "context_chars": len(block),
+                    "raw_history_bytes": raw_history,
+                    # chars/4 estimate — labeled as an estimate in receipts/docs.
+                    "estimated_tokens": estimate_tokens(block),
+                    "reduction_ratio": round(1 - len(block) / raw_history, 3) if (block and raw_history > 0) else None,
+                }
+            elif context_mode == "fresh":
+                record["context_stats"] = {"mode": "fresh", "raw_history_bytes": raw_history}
+            record["doc"] = followup_doc.to_dict()  # the chain accumulates: later follow-ups see reduced depth
+            record["target_agent"] = followup_doc.target_agent  # a pinned fixer becomes the task's current target
+            self._persist(task_id, followup_doc)
+            workspace = Path(record["workspace"])
+            self._set_state(task_id, STATE_SUBMITTED)
+            thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
+            thread.start()
+            return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
 
     def rename_branch(self, task_id: str, new_branch: str) -> dict[str, Any]:
         """Rename a task's branch in git and in the task's record.
 
         Refused while an agent is working on the task, because the agent's
-        checkout would change under it. See :func:`maestro.branches.rename_task_branch`
-        for the git side, including the case where the branch was already
-        renamed by hand.
+        checkout would change under it. The check and the rename run under the
+        daemon lock, and ``followup`` and ``answer_question`` start a turn
+        under the same lock, so a turn cannot start in the middle of a rename
+        and check out (or recreate) the old name. See
+        :func:`maestro.branches.rename_task_branch` for the git side, including
+        the case where the branch was already renamed by hand and the case
+        where the task has no branch yet (the result then has ``pending``).
         """
-        record = self._tasks.get(task_id) or self._durable_record(task_id)
-        if record is None:
-            raise KeyError(f"Unknown task reference {task_id!r}")
-        if record["state"] in (STATE_SUBMITTED, STATE_WORKING):
-            raise ValueError(f"Task {task_id} is running (state={record['state']}); rename its branch after it finishes")
-        result = rename_task_branch(self.maestro, task_id, new_branch)
-        record["branch"] = result["branch"]
-        self._persist(task_id)
-        self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": result["old_branch"], "branch": result["branch"]}))
-        return result
+        with self._lock:
+            record = self._tasks.get(task_id) or self._durable_record(task_id)
+            if record is None:
+                raise KeyError(f"Unknown task reference {task_id!r}")
+            state = STATE_WORKING if task_id in self._turn_starting else record["state"]
+            if state in (STATE_SUBMITTED, STATE_WORKING):
+                raise ValueError(f"Task {task_id} is running (state={state}); rename its branch after it finishes")
+            result = rename_task_branch(self.maestro, task_id, new_branch)
+            if result.get("pending"):
+                # No branch exists yet: the new name goes into the handoff
+                # record, which the next turn reads. rename_task_branch refuses
+                # a task without a recorded handoff, so record["doc"] is a dict.
+                record["doc"]["expectations"]["branch"] = result["branch"]
+                self._persist(task_id)
+                return result
+            record["branch"] = result["branch"]
+            self._persist(task_id)
+            self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": result["old_branch"], "branch": result["branch"]}))
+            return result
 
     def _doc_from_record(self, record: dict[str, Any]) -> HandoffDoc:
         from .handoff import from_dict

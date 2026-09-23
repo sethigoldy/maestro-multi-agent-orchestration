@@ -55,7 +55,7 @@ gate fields behaves exactly as before (deterministic verification only). See
 | `artifacts` | list of strings | `["code"]` | no | What the work should produce (e.g. `"code"`, `"tests"`, `"docs"`) — guidance, not enforced |
 | `verification` | string | `"auto"` | no | One of: `auto`, `command`, `none`. `auto`: deterministic auto-detected check after the agent finishes. `command`: the `request` field is shlex-split and run as the check command. `none`: skipped |
 | `commit_policy` | string | `"branch"` | no | One of: `no-commit`, `branch`, `pr`. `branch`/`pr` create the task branch (named by `branch` below) and require a git workspace; `no-commit` works in place |
-| `branch` | string or null | `null` | no | The name of the task's git branch, for example `"feat/login-form"`. When it is not set, the branch is `maestro/<task-id>`. The branch must not exist yet: delegation is refused if it does. It must be a valid git branch name, and it cannot be combined with `commit_policy = "no-commit"`. Every later turn of the task, including follow-ups, uses the same branch. To change the name after the task has run, see `maestro task rename-branch` in the [CLI reference](cli.md#task) |
+| `branch` | string or null | `null` | no | The name of the task's git branch, for example `"feat/login-form"`. When it is not set, the branch is `maestro/<task-id>`. The branch must not exist yet, and its name must not clash with an existing branch as a folder. Git keeps a branch such as `feat/login` as a file inside a folder called `feat`, so when a branch `feat` exists, `feat/login` cannot be created, and when `feat/x` exists, `feat` cannot be created. Delegation is refused in both cases. It must be a valid git branch name, and it cannot be combined with `commit_policy = "no-commit"`. Every later turn of the task, including follow-ups, uses the same branch. To change the name after the task has run, or when its first turn could not create the branch, see `maestro task rename-branch` in the [CLI reference](cli.md#task). The name applies only to the workspace of the daemon that runs the task. When the task runs on a remote daemon (an `a2a_remote` agent), the handoff Maestro forwards to it has `branch` removed, because the remote gets a new request on every attempt and every turn and would otherwise refuse each one after the first as "already exists". The remote daemon puts its work on its own default branch, `maestro/<remote-task-id>` |
 | `budget_hint` | number or null | `null` | no | Must be positive when set. Recorded on the task for visibility; enforcement is via the `MAESTRO_BUDGET_*_USD` environment caps, not this field |
 
 ### `[constraints]`
@@ -111,7 +111,7 @@ Additional refusals happen at delegation time (see
 [Delegate a task — rules](../how-to/delegate-a-task.md#rules-that-will-refuse-your-delegation)):
 self-delegation, depth exhausted, missing workspace, non-git workspace with
 `commit_policy = "branch"`, a `branch` name that already exists in the
-workspace, budget cap exceeded. With work modes: an unknown
+workspace or clashes with an existing branch as a folder, budget cap exceeded. With work modes: an unknown
 `mode` name, an unknown agent in any of the preset's slots or the explicit gate
 fields (the error lists the registered agents), and `review_agent == target_agent`
 (self-review is not a gate).

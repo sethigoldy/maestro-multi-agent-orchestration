@@ -172,8 +172,11 @@ class A2ADispatcher:
         context_mode = params.get("context_mode", "reuse")
         if context_mode not in ("reuse", "fresh"):
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.context_mode must be 'reuse' or 'fresh'")
+        branch = params.get("branch")
+        if branch is not None and (not isinstance(branch, str) or not branch.strip()):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.branch must be a non-empty string when given")
         try:
-            result = self.daemon.followup(self.daemon.resolve(task_ref), instruction, context_mode=context_mode)
+            result = self.daemon.followup(self.daemon.resolve(task_ref), instruction, context_mode=context_mode, branch=branch)
         except KeyError as exc:
             return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
         except ValueError as exc:

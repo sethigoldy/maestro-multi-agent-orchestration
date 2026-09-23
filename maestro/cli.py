@@ -322,11 +322,10 @@ def _cmd_task_receipt(args: argparse.Namespace) -> int:
 
 def _cmd_task_continue(args: argparse.Namespace) -> int:
     url, token = _daemon_endpoint()
-    result = _post_jsonrpc(
-        url, "tasks/followup",
-        {"id": args.task_id, "instruction": args.request, "context_mode": args.context},
-        token=token,
-    )
+    params = {"id": args.task_id, "instruction": args.request, "context_mode": args.context}
+    if args.branch is not None:
+        params["branch"] = args.branch
+    result = _post_jsonrpc(url, "tasks/followup", params, token=token)
     task = (result or {}).get("task") or {}
     task_id = task.get("id")
     if not task_id:
@@ -355,7 +354,9 @@ def _cmd_task_rename_branch(args: argparse.Namespace) -> int:
             rename = rename_task_branch(m, m.resolve_task(args.task_id), args.branch)
         finally:
             m.close()
-    if rename.get("git_renamed"):
+    if rename.get("pending"):
+        print(f"Task {rename['task_id']} has no branch yet; its next turn will create {rename['branch']} (instead of {rename['old_branch']})")
+    elif rename.get("git_renamed"):
         print(f"Renamed branch {rename['old_branch']} -> {rename['branch']} for {rename['task_id']}")
     elif rename.get("old_branch") == rename.get("branch"):
         print(f"Task {rename['task_id']} is already on branch {rename['branch']}; nothing changed")
@@ -602,6 +603,8 @@ def main(argv: list[str] | None = None) -> int:
     task_continue.add_argument("--context", choices=("reuse", "fresh"), default="reuse",
                                help="'reuse' injects the compact task-knowledge snapshot (default); 'fresh' starts a clean reasoning context")
     task_continue.add_argument("--no-wait", action="store_true", help="Return as soon as the turn is submitted (no SSE streaming)")
+    task_continue.add_argument("--branch", default=None, metavar="NAME",
+                               help="Rename the task's branch to NAME before this turn (same rules as 'task rename-branch')")
     task_rename = task_sub.add_parser(
         "rename-branch",
         help="Rename a finished task's git branch and update its record (or record a rename already done with 'git branch -m')",

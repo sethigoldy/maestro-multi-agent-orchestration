@@ -76,21 +76,25 @@ Signature unchanged: the context lives in the file.
 
 `branch` names the task's git branch, for example `"feat/login-form"`. It
 overrides `[expectations] branch` in the handoff file. When neither is set, the
-branch is `maestro/<task-id>`. The branch must not exist yet; an invalid or
-existing name returns `{"error": …}` before any agent runs.
+branch is `maestro/<task-id>`. The branch must not exist yet, and its name must
+not clash with an existing branch as a folder (with a branch `feat` present,
+`feat/login` cannot be created, and the reverse). An invalid, existing or
+clashing name returns `{"error": …}` before any agent runs. The name applies to
+this daemon's workspace only: when the target is a remote daemon, the forwarded
+handoff leaves it out and the remote uses its own default branch.
 
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
 - If the workspace already has an active task, returns immediately with
   `{"queued": true, "reason": "workspace already has an active task; this handoff is next in line", "ts": …}`.
 - Errors (unknown file, invalid handoff, self-delegation, depth exhausted,
-  budget cap, non-git workspace, invalid or existing `branch`) return
+  budget cap, non-git workspace, invalid, existing or clashing `branch`) return
   `{"error": "<message>"}`.
 
 ## followup
 
 ```text
-followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse") -> str
+followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse", branch: str = "") -> str
 ```
 
 Resumes a finished task (`completed`/`failed`/`canceled`) with a new
@@ -109,9 +113,16 @@ snapshot for a clean reasoning context (same task/workspace/branch). See
 [Configuration: `[continuation]`](./configuration.md#continuation--task-continuation-context)
 to disable reuse or resize its budget.
 
+`branch`: optional new name for the task's branch. The branch is renamed first,
+with the same rules as `rename_task_branch`, and the turn then runs on it. If
+the task has no branch yet (its first turn could not create the branch it asked
+for), this sets the name the turn creates. An empty string leaves the branch as
+it is.
+
 Errors: unknown task (`KeyError` text), empty instruction, task still active
-(`"…cancel it or answer its question before following up"`), depth exhausted —
-each returned as `{"error": …}`.
+(`"…cancel it or answer its question before following up"`), depth exhausted,
+any `rename_task_branch` refusal when `branch` is set — each returned as
+`{"error": …}`. A refused `branch` changes nothing and starts no turn.
 
 ## rename_task_branch
 
@@ -124,16 +135,24 @@ Renames a task's git branch and updates the task's record, so `list_tasks`,
 Accepts a task id or a task number. If the branch was already renamed by hand
 with `git branch -m`, the call only updates the record.
 
+If the task has no branch yet, because it has not started or its first turn
+could not create the branch it asked for, the call changes the name that the
+next turn will create. The new name must be one that can be created, as at
+delegation.
+
 Returns `{"task_id": …, "old_branch": …, "branch": …, "git_renamed": true|false}`.
-`git_renamed` is `false` when only the record changed.
+`git_renamed` is `false` when only the record changed. When the task had no
+branch yet, the result also has `"pending": true`, and `old_branch` is the name
+the next turn would have created.
 
 Only the local branch is renamed. A copy already pushed to a remote keeps its
 old name there.
 
 Errors, each returned as `{"error": …}`: unknown task; the task is still
-running (`submitted` or `working`); the task has no branch (it has not started,
-or it uses `commit_policy = "no-commit"`); an invalid branch name; the new
-branch already exists; neither the old nor the new branch exists; the old
+running (`submitted` or `working`) or a turn is starting; the task uses
+`commit_policy = "no-commit"`, so it never has a branch; an invalid branch
+name; the new branch already exists or clashes with an existing branch as a
+folder; neither the old nor the new branch exists; the old
 branch is gone and git's reflog shows no rename from it to the new branch (the
 new branch may be unrelated to the task).
 
