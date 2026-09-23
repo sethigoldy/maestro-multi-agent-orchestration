@@ -45,11 +45,25 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
 
 - The daemon **binds to loopback (`127.0.0.1`) by default** and requires no
   token on loopback. Nothing listens on your LAN unless you ask for it.
+- A web page open in your browser can also reach `127.0.0.1`, so a loopback
+  daemon refuses requests that a browser page could send:
+  - A request whose `Host` header is not `127.0.0.1`, `localhost` or `::1` is
+    refused with 403. This stops a DNS-rebinding page, whose own domain has
+    been pointed at 127.0.0.1, from reading tasks or live agent output.
+  - A POST must have `Content-Type: application/json`. A browser can only send
+    that cross-site after asking the server first (a CORS preflight), and the
+    daemon never agrees, so a page cannot submit work to it.
+  - A POST whose `Origin` header names a different site is refused with 403.
 - Binding a non-loopback address (e.g. `--host 0.0.0.0` or an explicit IP)
   **always requires a bearer token**: either `MAESTRO_DAEMON_TOKEN` (stable
   across restarts) or an auto-generated one written to the local
-  `$MAESTRO_HOME/daemon.json` marker. The API is not designed for public
-  exposure; put it behind your own authentication if you must.
+  `$MAESTRO_HOME/daemon.json` marker. The token is compared in constant time.
+  The API is not designed for public exposure; put it behind your own
+  authentication if you must.
+- Files that can hold a token are readable by their owner only (mode 0600):
+  the `daemon.json` marker and each agent registry entry under
+  `$MAESTRO_HOME/agents/`. `maestro agents list`, `maestro agents add` and the
+  MCP `agents_list` tool show a stored token as `<redacted>`.
 - The web console served by the daemon respects the same token: loopback needs
   none, remote access does.
 
@@ -63,6 +77,8 @@ data (and note that `maestro doctor` output includes paths but no task content).
 ## Security-relevant behavior we commit to
 
 - Loopback-only binding by default; token required for any non-loopback bind.
+- A loopback daemon refuses foreign `Host` headers, non-JSON POSTs and
+  cross-origin POSTs, so a web page cannot drive it.
 - Read-only diagnostics: `maestro doctor` never mutates state or runs agents'
   work (its agent probes run version checks only).
 - No network calls from the core library beyond what you configure (agent CLIs,

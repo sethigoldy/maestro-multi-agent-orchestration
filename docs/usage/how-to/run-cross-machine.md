@@ -33,7 +33,8 @@ On startup it prints JSON that includes the two values you need:
   keep a stable token across restarts.
 
 The token is also written into the local `daemon.json` marker, so your own
-machine's CLI keeps working without extra configuration.
+machine's CLI keeps working without extra configuration. The marker is readable
+by your user only (mode 0600).
 
 ## Step 2 — Verify reachability
 

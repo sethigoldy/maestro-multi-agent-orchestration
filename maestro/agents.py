@@ -9,6 +9,7 @@ code (launch command + input/output mode + workspace policy).
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -94,7 +95,9 @@ class AgentSpec:
     output_format: str = "text"
     workspace_policy: str = "cwd"
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, redact: bool = False) -> dict[str, Any]:
+        """The spec as a plain dict. ``redact=True`` replaces the bearer token
+        with "<redacted>"; use it for anything shown to a person or a model."""
         data: dict[str, Any] = {
             "name": self.name,
             "kind": self.kind,
@@ -110,7 +113,7 @@ class AgentSpec:
         if self.timeout_s is not None:
             data["timeout_s"] = self.timeout_s
         if self.token is not None:
-            data["token"] = self.token
+            data["token"] = "<redacted>" if redact else self.token
         if self.kind == GENERIC_KIND:
             data.update(
                 {
@@ -255,7 +258,12 @@ class AgentRegistry:
 
     def save(self, spec: AgentSpec) -> AgentSpec:
         spec = validate_agent_spec(spec)
-        self._path(spec.name).write_text(_dump_toml(spec.to_dict()), encoding="utf-8")
+        # The entry can hold a bearer token, so only the owner may read it.
+        path = self._path(spec.name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(_dump_toml(spec.to_dict()))
+        os.chmod(path, 0o600)
         return spec
 
     def remove(self, name: str) -> bool:

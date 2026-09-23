@@ -6,6 +6,11 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Security
+
+- **A web page can no longer drive the local daemon.** A daemon on 127.0.0.1 needs no token, and until now it accepted any request that reached it. A page open in your browser could send a plain-text POST to it and start an agent in any folder, and a DNS-rebinding page could read the task list and live agent output. A loopback daemon now refuses requests whose `Host` header is not `127.0.0.1`, `localhost` or `::1`. Every daemon now requires `Content-Type: application/json` on POST, which a browser cannot send cross-site without a preflight that the daemon never approves, and refuses a POST whose `Origin` names another site. Maestro's own CLI, MCP server, remote-agent adapter and web console already send requests that pass these checks.
+- **Tokens are kept private.** The `daemon.json` marker and agent registry entries are now written with mode 0600, and an existing world-readable marker is tightened on the next start. `maestro agents list`, `maestro agents add` and the MCP `agents_list` tool show a stored token as `<redacted>`; before, `agents_list` put remote-agent tokens into the supervising model's transcript. Bearer tokens are compared in constant time. The foreground `maestro-daemon` still prints its token at startup, because that is how you give it to another machine.
+
 ## [0.12.0] — 2026-09-22
 
 ### Fixed

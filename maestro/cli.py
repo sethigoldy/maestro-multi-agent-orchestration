@@ -726,7 +726,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "agents":
             registry = AgentRegistry(maestro_user_dir())
             if args.agents_cmd == "list":
-                print(json.dumps([s.to_dict() for s in registry.list()], indent=2)); return 0
+                print(json.dumps([s.to_dict(redact=True) for s in registry.list()], indent=2)); return 0
             if args.agents_cmd == "add":
                 spec = AgentSpec(
                     name=args.name, kind=args.kind, display_name=args.display_name,
@@ -735,7 +735,7 @@ def main(argv: list[str] | None = None) -> int:
                     workspace_policy=args.workspace_policy, token=args.token,
                 )
                 registry.save(spec)
-                print(json.dumps(registry.get(args.name).to_dict(), indent=2)); return 0
+                print(json.dumps(registry.get(args.name).to_dict(redact=True), indent=2)); return 0
             if args.agents_cmd == "remove":
                 if not registry.remove(args.name):
                     raise ValueError(f"Agent not registered: {args.name}")
