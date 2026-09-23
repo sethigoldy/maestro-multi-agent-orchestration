@@ -112,8 +112,10 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
   hosts when `MAESTRO_DISCOVERY_IF` is loopback, drops an announcement whose
   advertised host is not an IP address, drops an announcement from another
   host that advertises a loopback address (such as `127.0.0.1`) or a
-  link-local address other than the one it was sent from (such as the cloud
-  metadata address `169.254.169.254`), strips control characters
+  link-local address other than the one it was sent from, always drops the
+  cloud metadata addresses (`169.254.169.254`, `169.254.170.2` and
+  `fd00:ec2::254`), because a neighbour on the same network can fake the
+  address a packet comes from, strips control characters
   from names, and keeps at most 256 peers in `peers.json`. A daemon that
   listens on loopback only never announces `127.0.0.1` on a network
   interface. Discovered peers are only a

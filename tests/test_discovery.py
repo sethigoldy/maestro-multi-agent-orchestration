@@ -783,3 +783,14 @@ def test_a_daemon_bound_to_a_link_local_address_announces_itself(tmp_path):
     server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), port=1, multicast_if="0.0.0.0", http_host="169.254.10.20")
     assert server.announces is True
     assert len(_one_announce_tick(server).sent) == 1
+
+
+@pytest.mark.parametrize("host", ["169.254.169.254", "169.254.170.2", "fd00:ec2::254"])
+def test_cloud_metadata_addresses_are_rejected_even_from_their_own_address(tmp_path, host):
+    """A UDP source address is easy to fake, so the well-known metadata endpoints are never recorded."""
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "md", "http_port": 80, "http_host": host}).encode(), (host, 9786))
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "md", "http_port": 81}).encode(), (host, 9786))
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "md", "http_port": 82, "http_host": host}).encode(), ("127.0.0.1", 9786))
+    assert table.load() == {}

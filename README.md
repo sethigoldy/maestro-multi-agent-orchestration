@@ -552,10 +552,13 @@ address or its port is not a valid port, and names lose their control
 characters, so `maestro peers list` never prints terminal escape codes. An
 announcement from another host is also dropped when it advertises a loopback
 address (such as `127.0.0.1` or `::1`), because that would point this machine
-at its own loopback services, or a link-local address (such as
-`169.254.169.254`, a cloud metadata endpoint) other than the address it was
-sent from. A node on a link-local-only network, such as a Thunderbolt bridge,
-can therefore still announce its own `169.254.x.y` address. Only an
+at its own loopback services, or a link-local address other than the address
+it was sent from. A node on a link-local-only network, such as a Thunderbolt
+bridge, can therefore still announce its own `169.254.x.y` address. A host on
+the same network can fake the address a UDP packet comes from, so this check
+stops mistakes, not a determined neighbour. For that reason the well-known
+cloud metadata addresses (`169.254.169.254`, `169.254.170.2` and
+`fd00:ec2::254`) are always dropped, whoever announces them. Only an
 announcement sent from this machine may advertise a loopback address.
 `peers.json` holds at most 256 peers: a discovered peer that has not been heard
 for an hour is removed, and when the table is full the oldest discovered peers

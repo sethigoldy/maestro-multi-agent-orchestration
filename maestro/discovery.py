@@ -26,9 +26,11 @@ Design notes:
   (127.0.0.1, ::1): a LAN host could otherwise point this machine at its own
   loopback services. It may name a link-local address (169.254.x.y, fe80::)
   only when that is the address it was sent from, so a node on a link-local
-  network (a Thunderbolt bridge, for example) can announce itself, but no
-  host can point peers at another link-local address such as the cloud
-  metadata endpoint 169.254.169.254. Only an announcement sent from a
+  network (a Thunderbolt bridge, for example) can announce itself. A UDP
+  source address is easy to fake for a host on the same link, so this check
+  stops honest mistakes, not a determined neighbour. The well-known cloud
+  metadata addresses (169.254.169.254, 169.254.170.2 and fd00:ec2::254) are
+  therefore rejected whatever the sender. Only an announcement sent from a
   loopback address may name a loopback host.
 - A node announces itself only on an interface that can reach the host it
   advertises. A daemon reachable only on loopback announces when the
@@ -107,6 +109,12 @@ def _is_loopback(address: str) -> bool:
         return False
 
 
+# Cloud metadata endpoints (AWS, GCP and Azure use 169.254.169.254; ECS task
+# metadata uses 169.254.170.2; AWS over IPv6 uses fd00:ec2::254). A peer URL
+# never points at them, whoever announces them.
+_METADATA_HOSTS = frozenset(ipaddress.ip_address(a) for a in ("169.254.169.254", "169.254.170.2", "fd00:ec2::254"))
+
+
 def _url_host(host: str, sender: str) -> str | None:
     """``host`` formatted for a URL, or None when it is not a usable IP address.
 
@@ -121,7 +129,7 @@ def _url_host(host: str, sender: str) -> str | None:
         return None
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped  # ::ffff:127.0.0.1 is 127.0.0.1
-    if ip.is_multicast or ip.is_unspecified:
+    if ip.is_multicast or ip.is_unspecified or ip in _METADATA_HOSTS:
         return None
     if (ip.is_loopback or ip.is_link_local) and not _is_loopback(sender) and str(ip) != sender:
         return None

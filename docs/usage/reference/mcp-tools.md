@@ -44,7 +44,17 @@ MCP server never runs tasks beside it:
   `{"error": …}` saying to retry or run `maestro daemon restart`. Once the
   daemon has exited, the next tool call starts a new one. A blocking
   `delegate`, `followup` or `task_wait` that is waiting at that moment carries
-  on waiting in the new daemon.
+  on waiting in the new daemon. One deadline covers the whole wait, however
+  often the daemon changes: when it passes, the wait returns the task as it
+  was last seen.
+- A daemon from Maestro 0.12.0 or earlier does not have the methods the MCP
+  server forwards its calls with. When such a daemon owns the state directory
+  (for example, another session still runs the older version), the MCP server
+  runs its tasks in a daemon inside its own process, without an HTTP endpoint
+  and without taking the directory over, as older versions did. It prints a
+  note on stderr. The older daemon cannot see or cancel those tasks. Restart
+  the older daemon with `maestro daemon restart`, or close the sessions that
+  still use the older version, to share one daemon again.
 
 `task_status` and `list_tasks` read the durable task state directly and do not
 need a daemon.

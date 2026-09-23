@@ -854,6 +854,9 @@ def test_process_start_token_without_ps(monkeypatch):
     def missing(*args, **kwargs):
         raise FileNotFoundError("ps")
 
+    # The ps path, which is the only source outside Linux; on Linux /proc
+    # would answer without ps.
+    monkeypatch.setattr(daemonctl, "_proc_available", lambda: False)
     monkeypatch.setattr(daemonctl.subprocess, "run", missing)
     assert daemonctl.process_start_token(os.getpid()) is None
 
@@ -990,26 +993,78 @@ def test_start_token_on_linux_reads_proc(tmp_path, monkeypatch):
     assert daemonctl.process_start_token(4242) == "987654"  # no boot id: the start time alone
 
 
-def test_process_command_reads_proc_or_ps(tmp_path, monkeypatch):
+def test_process_argv_reads_proc_or_ps(tmp_path, monkeypatch):
     sleeper = _unrelated_sleeper()
     try:
-        assert "time.sleep(60)" in daemonctl.process_command(sleeper.pid)
+        argv = daemonctl.process_argv(sleeper.pid)
+        assert any("time.sleep(60)" in word for word in argv)
     finally:
         sleeper.kill()
         sleeper.wait()
-    assert daemonctl.process_command(_dead_pid()) is None
-    root = _fake_proc(tmp_path / "proc", 4242, "4242 (x) S 1\n", cmdline=b"/usr/bin/python3\x00-m\x00maestro.daemon_main\x00")
+    assert daemonctl.process_argv(_dead_pid()) is None
+    root = _fake_proc(tmp_path / "proc", 4242, "4242 (x) S 1\n", cmdline=b"/usr/bin/python3\x00-m\x00maestro.daemon_main\x00--state-dir\x00/a b\x00")
     monkeypatch.setattr(daemonctl, "_PROC", root)
-    assert daemonctl.process_command(4242) == "/usr/bin/python3 -m maestro.daemon_main"
-    assert daemonctl.process_command(4243) is None
+    assert daemonctl.process_argv(4242) == ["/usr/bin/python3", "-m", "maestro.daemon_main", "--state-dir", "/a b"]
+    assert daemonctl.process_argv(4243) is None
 
 
-def test_process_command_without_ps(monkeypatch):
+def test_process_argv_without_ps(monkeypatch):
     def missing(*args, **kwargs):
         raise FileNotFoundError("ps")
 
+    # The ps path, which is the only source outside Linux; on Linux /proc
+    # would answer without ps.
+    monkeypatch.setattr(daemonctl, "_proc_available", lambda: False)
     monkeypatch.setattr(daemonctl.subprocess, "run", missing)
-    assert daemonctl.process_command(os.getpid()) is None
+    assert daemonctl.process_argv(os.getpid()) is None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["/usr/bin/python3", "-m", "maestro.daemon_main", "--state-dir", "/x"],
+        ["/usr/bin/python3", "-u", "-m", "maestro.mcp_server"],
+        ["/home/u/.local/pipx/venvs/maestro-multi-agent-orchestration/bin/python", "/home/u/.local/bin/maestro-mcp"],
+        ["/home/u/.local/share/uv/tools/maestro/bin/python3", "/home/u/.local/share/uv/tools/maestro/bin/maestro-daemon", "--port", "0"],
+        ["C:\\Tools\\maestro-daemon.exe"],
+        ["/opt/venv/bin/python", "-m", "maestro.mcp_server"],  # what scripts/maestro-mcp execs
+    ],
+)
+def test_maestro_commands_are_recognised(argv):
+    assert daemonctl._is_maestro_command(argv) is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["vim", "maestro-daemon.py"],
+        ["tail", "-f", "/var/log/maestro-mcp.log"],
+        ["grep", "maestro.daemon_main", "notes.txt"],
+        ["python", "-m", "maestro.cli"],
+        ["python", "-m"],
+        [],
+    ],
+)
+def test_other_commands_that_mention_maestro_are_not(argv):
+    assert daemonctl._is_maestro_command(argv) is False
+
+
+def test_a_long_command_line_is_read_in_full_whatever_columns_says(tmp_path, monkeypatch):
+    """Reviewer's columns.py: macOS ps cuts its output at COLUMNS even into a pipe."""
+    longdir = tmp_path / ("a" * 60) / ".local" / "pipx" / "venvs" / "maestro-multi-agent-orchestration" / "bin"
+    longdir.mkdir(parents=True)
+    script = longdir / "maestro-mcp"
+    script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    process = subprocess.Popen([sys.executable, str(script)])
+    try:
+        time.sleep(0.3)
+        for columns in ("80", "120"):
+            monkeypatch.setenv("COLUMNS", columns)
+            argv = daemonctl.process_argv(process.pid)
+            assert argv is not None and daemonctl._is_maestro_command(argv), argv
+    finally:
+        process.kill()
+        process.wait()
 
 
 _OLD_DAEMON = r"""
@@ -1051,7 +1106,10 @@ def _start_old_daemon(state_dir: Path, *argv: str) -> subprocess.Popen:
 @pytest.mark.parametrize("entry", ["maestro.daemon_main", "maestro-daemon", "maestro.mcp_server", "maestro-mcp"])
 def test_a_daemon_from_the_last_release_is_still_confirmed_and_stopped(tmp_path, entry):
     """Reviewer's old_marker.py: after an upgrade, a running 0.12.0 daemon must still be found and stopped."""
-    old = _start_old_daemon(tmp_path, entry)
+    # A module is launched as ``python -m <module>``; a console script's name
+    # is an argv word of its own.
+    words = ("-m", entry) if entry.startswith("maestro.") else (entry,)
+    old = _start_old_daemon(tmp_path, *words)
     try:
         info = daemonctl.status(tmp_path)
         assert info.running is True and info.pid == old.pid

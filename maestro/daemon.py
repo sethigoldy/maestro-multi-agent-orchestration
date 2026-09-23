@@ -38,7 +38,7 @@ from .a2a import (
     sse_encode,
 )
 from . import daemonctl
-from .daemon_client import DaemonClient
+from .daemon_client import DaemonClient, unanswered_message
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
 from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
@@ -2715,22 +2715,68 @@ def get_daemon(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
             _instance = None
         else:
             _instance_kwargs = dict(kwargs)
-        _instance = _connect(**_instance_kwargs)
+        _instance = _connect(_instance_kwargs)
         return _instance
 
 
-def _client_for(state_dir: Path, info: daemonctl.DaemonInfo) -> "DaemonClient":
-    client = DaemonClient(state_dir, str(info.url), info.token, info.pid, fallback=lambda: None)
-    client._fallback = lambda: _replace_client(client)
+def _client_for(state_dir: Path, info: daemonctl.DaemonInfo, kwargs: dict[str, Any]) -> "DaemonClient":
+    client = DaemonClient(state_dir, str(info.url), info.token, info.pid, fallback=lambda give_up_at=None: None)
+    client._fallback = lambda give_up_at=None: _replace_client(client, give_up_at)
+    client._legacy = lambda: _use_legacy_embedded(state_dir, info, kwargs)
     return client
 
 
-def _connect(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
+def _is_legacy_owner(info: daemonctl.DaemonInfo) -> bool:
+    """True when the owner's agent card has no ``maestro`` block: it is from 0.12.0 or earlier.
+
+    Such a daemon lacks the JSON-RPC methods an MCP server forwards its tools
+    with (tasks/delegate, tasks/wait, tasks/resolve, tasks/answer,
+    agents/list). A card that cannot be read is not taken as proof of age;
+    a forwarded call that gets "Method not found" catches that case.
+    """
+    import urllib.request
+
+    request = urllib.request.Request(f"{info.url}/.well-known/agent.json")
+    if info.token:
+        request.add_header("Authorization", f"Bearer {info.token}")
+    try:
+        with urllib.request.urlopen(request, timeout=3) as resp:
+            card = json.loads(resp.read())
+    except daemonctl._PORT_ERRORS:
+        return False
+    return isinstance(card, dict) and "maestro" not in card
+
+
+def _legacy_embedded(state_dir: Path, info: daemonctl.DaemonInfo, kwargs: dict[str, Any]) -> "MaestroDaemon":
+    """A daemon in this process, beside an older owner, without taking the directory over."""
+    print(
+        f"maestro: an older Maestro daemon (pid {info.pid}, {info.url}) owns the state directory {state_dir} and "
+        "cannot take calls from this MCP server. This MCP server runs its own tasks without an HTTP endpoint, as "
+        "older versions did, so that daemon cannot see or cancel them. Restart that daemon with "
+        "'maestro daemon restart', or close the sessions that still use the older version, to share one daemon again.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return MaestroDaemon(**{**kwargs, "start_http": False})
+
+
+def _use_legacy_embedded(state_dir: Path, info: daemonctl.DaemonInfo, kwargs: dict[str, Any]) -> "MaestroDaemon | DaemonClient":
+    """Switch this process to a daemon of its own after the owner answered "Method not found"."""
+    global _instance
+    with _instance_lock:
+        if _instance is None or isinstance(_instance, DaemonClient):
+            _instance = _legacy_embedded(state_dir, info, kwargs)
+        return _instance
+
+
+def _connect(kwargs: dict[str, Any], give_up_at: float | None = None) -> "MaestroDaemon | DaemonClient":
     """The daemon to use for ``kwargs['state_dir']``: the answering owner, or a newly started one.
 
-    Raises DaemonUnavailable when, for OWNER_RETRY_S seconds, the directory
-    is held by a daemon that does not answer, or no daemon could be started
-    or reached.
+    An owner from an older version gets a daemon in this process beside it
+    instead (see _legacy_embedded). Raises DaemonUnavailable when, for
+    OWNER_RETRY_S seconds (or until ``give_up_at``, if that is sooner), the
+    directory is held by a daemon that does not answer, or no daemon could be
+    started or reached.
     """
     import time
 
@@ -2739,22 +2785,22 @@ def _connect(**kwargs: Any) -> "MaestroDaemon | DaemonClient":
     raw = kwargs.get("state_dir")
     state_dir = Path(raw).expanduser() if raw else maestro_user_dir()
     deadline = time.monotonic() + OWNER_RETRY_S
+    if give_up_at is not None:
+        deadline = min(deadline, give_up_at)
     pause = 0.1
     while True:
         info = daemonctl.live_owner(state_dir)
         if info is not None and info.running and info.url:
-            return _client_for(state_dir, info)
+            if _is_legacy_owner(info):
+                return _legacy_embedded(state_dir, info, kwargs)
+            return _client_for(state_dir, info, kwargs)
         if info is None:
             started = _start_owner(state_dir, kwargs)
             if started is not None:
                 return started
         if time.monotonic() >= deadline:
             if info is not None:
-                raise DaemonUnavailable(
-                    f"the Maestro daemon (pid {info.pid}) owns the state directory {state_dir} but does not answer at "
-                    f"{info.url}. This MCP server does not run tasks beside it. Try again, or restart it with "
-                    "'maestro daemon restart'."
-                )
+                raise DaemonUnavailable(unanswered_message(info.pid, state_dir, info.url))
             raise DaemonUnavailable(f"could not start or reach a Maestro daemon for the state directory {state_dir}; see {state_dir / 'daemon.log'}")
         time.sleep(pause)
         pause = min(pause * 2, 2.0)
@@ -2776,20 +2822,23 @@ def _start_owner(state_dir: Path, kwargs: dict[str, Any]) -> "MaestroDaemon | Da
                 flush=True,
             )
         else:
-            return _client_for(state_dir, info)
+            return _client_for(state_dir, info, kwargs)
     try:
         return MaestroDaemon(**kwargs)
     except daemonctl.DaemonAlreadyRunning:
         return None  # another daemon took the directory first; the caller connects to it
 
 
-def _replace_client(client: "DaemonClient") -> "MaestroDaemon | DaemonClient":
-    """The daemon to use after ``client``'s owner stopped answering (see DaemonClient.wait)."""
+def _replace_client(client: "DaemonClient", give_up_at: float | None = None) -> "MaestroDaemon | DaemonClient":
+    """The daemon to use after ``client``'s owner stopped answering (see DaemonClient.wait).
+
+    ``give_up_at`` is the waiting caller's deadline; the search stops there.
+    """
     global _instance
     with _instance_lock:
         if _instance is client or _instance is None:
             _instance = None
-            _instance = _connect(**_instance_kwargs)
+            _instance = _connect(_instance_kwargs, give_up_at)
         return _instance
 
 

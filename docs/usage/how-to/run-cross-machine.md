@@ -97,8 +97,9 @@ machine hear it; it never announces `127.0.0.1` to the network.
 
 Announcements are untrusted: one whose advertised host is not an IP address is
 dropped, one from another host that advertises a loopback address (such as
-`127.0.0.1`) or a link-local address other than its own (such as
-`169.254.169.254`) is dropped, names lose their
+`127.0.0.1`) or a link-local address other than the one it was sent from is
+dropped, the cloud metadata addresses (`169.254.169.254`, `169.254.170.2` and
+`fd00:ec2::254`) are dropped from every sender, names lose their
 control characters, and `peers.json` keeps at most 256 peers (a discovered
 peer unheard for an hour is removed).
 

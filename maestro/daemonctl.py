@@ -198,9 +198,31 @@ def owner_lock_holder(state_dir: Path) -> int | None:
 _PORT_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError, ValueError)
 
 
-# Words in the command line of a process that runs a Maestro daemon: the
-# daemon itself, or an MCP server with the daemon inside it (released versions).
-_MAESTRO_COMMANDS = ("maestro-daemon", "maestro.daemon_main", "maestro-mcp", "maestro.mcp_server")
+# How a process that runs a Maestro daemon was started: the daemon itself, or
+# an MCP server with the daemon inside it (released versions). A console
+# script (pip, pipx, uv tool) has one of these names as an argv word; a
+# ``python -m`` launch (daemonctl.start, scripts/maestro-mcp) names the module.
+_MAESTRO_SCRIPTS = frozenset({"maestro-daemon", "maestro-mcp"})
+_MAESTRO_MODULES = frozenset({"maestro.daemon_main", "maestro.mcp_server"})
+
+
+def _is_maestro_command(argv: list[str]) -> bool:
+    """True when ``argv`` starts a Maestro daemon or MCP server.
+
+    Whole words are compared, so ``vim maestro-daemon.py`` or
+    ``tail -f maestro-mcp.log`` do not count: some word's file name (after the
+    last / or \\) must be ``maestro-daemon`` or ``maestro-mcp``, optionally
+    ending in ``.exe``, or the word after ``-m`` must be one of the modules.
+    """
+    for index, word in enumerate(argv):
+        name = word.replace("\\", "/").rsplit("/", 1)[-1]
+        if name.endswith(".exe"):
+            name = name[: -len(".exe")]
+        if name in _MAESTRO_SCRIPTS:
+            return True
+        if word == "-m" and index + 1 < len(argv) and argv[index + 1] in _MAESTRO_MODULES:
+            return True
+    return False
 
 
 def _answers_as_maestro(url: str, token: str | None, pid: int, state_dir: Path, timeout: float = 3.0) -> bool:
@@ -227,8 +249,7 @@ def _answers_as_maestro(url: str, token: str | None, pid: int, state_dir: Path, 
         return False
     identity = card.get("maestro")
     if identity is None:
-        command = process_command(pid) or ""
-        return any(word in command for word in _MAESTRO_COMMANDS)
+        return _is_maestro_command(process_argv(pid) or [])
     if not isinstance(identity, dict) or not isinstance(identity.get("state_dir"), str):
         return False
     return identity.get("pid") == pid and os.path.realpath(identity["state_dir"]) == os.path.realpath(state_dir)
@@ -260,10 +281,13 @@ def _ps(field: str, pid: int) -> str | None:
     The environment pins the time zone and the locale, so the output is the
     same whatever TZ or LANG the caller runs with.
     """
+    # -ww and no COLUMNS: macOS ps otherwise cuts long lines to the terminal
+    # width, even when its output goes to a pipe.
+    env = {key: value for key, value in os.environ.items() if key != "COLUMNS"}
     try:
         result = subprocess.run(
-            ["ps", "-o", f"{field}=", "-p", str(pid)],
-            capture_output=True, text=True, timeout=5, env={**os.environ, "TZ": "UTC0", "LC_ALL": "C"},
+            ["ps", "-ww", "-o", f"{field}=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, env={**env, "TZ": "UTC0", "LC_ALL": "C"},
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -298,15 +322,21 @@ def process_start_token(pid: int) -> str | None:
     return f"{boot_id}:{start_ticks}"
 
 
-def process_command(pid: int) -> str | None:
-    """The command line of process ``pid``, or None when it cannot be read."""
+def process_argv(pid: int) -> list[str] | None:
+    """The command-line words of process ``pid``, or None when they cannot be read.
+
+    On Linux these are the exact arguments. Elsewhere ``ps`` prints one line,
+    which is split at spaces, so an argument that contains a space becomes
+    several words; its last part still ends in the file name.
+    """
     if not _proc_available():
-        return _ps("command", pid)
+        line = _ps("command", pid)
+        return line.split() if line is not None else None
     try:
         raw = (_PROC / str(pid) / "cmdline").read_bytes()
     except OSError:
         return None
-    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
 
 
 def runner_state(runner: dict[str, Any]) -> str:

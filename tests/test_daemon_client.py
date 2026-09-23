@@ -15,6 +15,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -28,7 +29,7 @@ from maestro import daemonctl, mcp_server
 from maestro.a2a_client import post_jsonrpc
 from maestro.agents import AgentSpec
 from maestro.daemon import MaestroDaemon
-from maestro.daemon_client import DaemonClient, DaemonUnavailable
+from maestro.daemon_client import DaemonClient, DaemonUnavailable, OwnerTooOld
 from maestro.handoff import HandoffDoc
 
 
@@ -400,7 +401,7 @@ def test_wait_moves_to_the_replacement_daemon_when_the_owner_stops_answering(hom
         def wait(self, task_id, timeout=None):
             return {"id": task_id, "status": {"state": "failed"}, "timeout": timeout}
 
-    client = DaemonClient(home, f"http://127.0.0.1:{_closed_port()}", None, 1, fallback=Replacement)
+    client = DaemonClient(home, f"http://127.0.0.1:{_closed_port()}", None, 1, fallback=lambda give_up_at=None: Replacement())
     out = client.wait("task-20260101-000000-abcdef", timeout=5)
     assert out["status"]["state"] == "failed" and 0 < out["timeout"] <= 5
     unbounded = client.wait("task-20260101-000000-abcdef")
@@ -580,3 +581,241 @@ def test_tools_report_an_owner_that_stopped_answering(home, monkeypatch):
     monkeypatch.setattr(mcp_server, "get_daemon", lambda: gone)
     assert "did not answer" in json.loads(mcp_server.task_wait("/tmp", "1"))["error"]
     assert "did not answer" in json.loads(mcp_server.agents_list())["error"]
+
+
+# ------------------------------------------------------------ owners that cannot serve the new methods
+class _FakeOwner:
+    """An HTTP server in this process that holds the owner lock, as a daemon that owns ``home`` does.
+
+    ``card_identity`` adds the ``maestro`` block to the agent card (this
+    version does; 0.12.0 does not). ``post`` decides what a JSON-RPC request
+    gets: "unknown" answers -32601 Method not found, "hang" never answers, and
+    "working-then-hang" answers the first tasks/wait with a working task and
+    then never answers again.
+    """
+
+    def __init__(self, home: Path, *, card_identity: bool, post: str) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        home.mkdir(parents=True, exist_ok=True)
+        self.home = home
+        self.release = threading.Event()
+        self.posts = 0
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _json(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):  # noqa: N802
+                if self.path == "/.well-known/agent.json":
+                    card = {"name": "maestro-node", "url": "http://x", "capabilities": {}}
+                    if card_identity:
+                        card["maestro"] = {"pid": os.getpid(), "state_dir": str(home)}
+                    self._json(200, card)
+                else:
+                    self._json(200, {"console": True})
+
+            def do_POST(self):  # noqa: N802
+                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+                outer.posts += 1
+                if post == "unknown":
+                    self._json(400, {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32601, "message": f"Method not found: {payload['method']}"}})
+                elif post == "working-then-hang" and outer.posts == 1:
+                    self._json(200, {"jsonrpc": "2.0", "id": 1, "result": {"task": {"kind": "task", "id": "task-20260101-000000-abcdef", "status": {"state": "working"}}}})
+                else:
+                    outer.release.wait(60)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.lock_fd = daemonctl.acquire_owner_lock(home)
+        (home / "daemon.json").write_text(json.dumps({"pid": os.getpid(), "port": self.server.server_address[1], "host": "127.0.0.1", "owner_lock": True}), encoding="utf-8")
+
+    def close(self) -> None:
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+        daemonctl.release_owner_lock(self.lock_fd)
+
+
+@pytest.fixture
+def fake_owner(home):
+    owners: list = []
+
+    def make(**kwargs):
+        owner = _FakeOwner(home, **kwargs)
+        owners.append(owner)
+        return owner
+
+    yield make
+    instance = dm._instance
+    dm._instance = None
+    if isinstance(instance, MaestroDaemon):
+        instance.stop()
+    for owner in owners:
+        owner.close()
+
+
+def test_a_legacy_owner_detected_from_its_card_gets_an_embedded_daemon(home, fake_owner, capsys):
+    """An owner whose card has no maestro block is 0.12.0 or older: it lacks the forwarding methods."""
+    fake_owner(card_identity=False, post="unknown")
+    before = (home / "daemon.json").read_text()
+    d = dm.get_daemon()
+    assert isinstance(d, MaestroDaemon) and d._httpd is None
+    assert (home / "daemon.json").read_text() == before  # the directory was not taken over
+    assert isinstance(d.agents(), list)
+    assert dm.get_daemon() is d
+    err = capsys.readouterr().err
+    assert err.count("older Maestro daemon") == 1 and "restart" in err
+
+
+def test_a_legacy_owner_detected_from_method_not_found_gets_an_embedded_daemon(home, fake_owner, capsys):
+    """An owner that answers -32601 to a forwarded call is treated the same way, and the call still succeeds."""
+    fake_owner(card_identity=True, post="unknown")
+    client = dm.get_daemon()
+    assert isinstance(client, DaemonClient)
+    listing = client.agents()
+    assert isinstance(listing, list)
+    assert isinstance(dm._instance, MaestroDaemon) and dm._instance._httpd is None
+    assert client.agents() == listing  # later calls through the old client go to the same daemon
+    assert capsys.readouterr().err.count("older Maestro daemon") == 1
+
+
+def test_a_real_0_12_0_owner_gets_an_embedded_daemon(home, capsys, tmp_path):
+    """Reviewer's old_owner_forward.py, without the 0.12.0 sources: a process named like maestro-daemon,
+    with an old-format marker, a card without identity, and no forwarding methods."""
+    script = r"""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _json(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self._json(200, {"name": "maestro-node", "url": "http://x", "capabilities": {}})
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self._json(400, {"jsonrpc": "2.0", "id": payload.get("id"), "error": {"code": -32601, "message": "Method not found"}})
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+with open(os.path.join(sys.argv[1], "daemon.json"), "w") as f:
+    f.write(json.dumps({"pid": os.getpid(), "port": srv.server_address[1], "host": "127.0.0.1"}))
+print("ready", flush=True)
+srv.serve_forever()
+"""
+    home.mkdir(parents=True, exist_ok=True)
+    old = subprocess.Popen([sys.executable, "-c", script, str(home), "maestro-daemon"], stdout=subprocess.PIPE, text=True)
+    try:
+        assert old.stdout.readline().strip() == "ready"
+        d = dm.get_daemon()
+        assert isinstance(d, MaestroDaemon) and d._httpd is None
+        assert "older Maestro daemon" in capsys.readouterr().err
+        assert old.poll() is None
+    finally:
+        instance = dm._instance
+        dm._instance = None
+        if isinstance(instance, MaestroDaemon):
+            instance.stop()
+        old.kill()
+        old.wait()
+
+
+def _quick_client_timeouts(monkeypatch):
+    monkeypatch.setattr(DaemonClient, "WAIT_SLICE_S", 0.2)
+    monkeypatch.setattr(DaemonClient, "WAIT_REPLY_GRACE_S", 0.3)
+
+
+def test_wait_honours_its_timeout_when_the_owner_answers_probes_but_not_json_rpc(home, fake_owner, monkeypatch):
+    """Reviewer's hung_wait.py: no endless reconnect to the same owner, and no recursion."""
+    _quick_client_timeouts(monkeypatch)
+    owner = fake_owner(card_identity=True, post="hang")
+    client = dm.get_daemon()
+    assert isinstance(client, DaemonClient)
+    began = time.monotonic()
+    with pytest.raises(DaemonUnavailable, match="does not answer"):
+        client.wait("task-20260101-000000-abcdef", timeout=1.5)
+    assert time.monotonic() - began < 8 and owner.posts >= 1
+
+
+def test_wait_returns_the_last_answer_when_its_timeout_passes(home, fake_owner, monkeypatch):
+    _quick_client_timeouts(monkeypatch)
+    fake_owner(card_identity=True, post="working-then-hang")
+    client = dm.get_daemon()
+    began = time.monotonic()
+    task = client.wait("task-20260101-000000-abcdef", timeout=1.5)
+    assert task["status"]["state"] == "working" and time.monotonic() - began < 8
+
+
+def test_wait_without_a_timeout_gives_up_on_an_owner_that_never_answers(home, fake_owner, monkeypatch):
+    _quick_client_timeouts(monkeypatch)
+    monkeypatch.setattr(dm, "OWNER_RETRY_S", 1.0)
+    fake_owner(card_identity=True, post="hang")
+    client = dm.get_daemon()
+    began = time.monotonic()
+    with pytest.raises(DaemonUnavailable, match="maestro daemon restart"):
+        client.wait("task-20260101-000000-abcdef")
+    assert time.monotonic() - began < 10
+
+
+def _client_of(owner, home, **kwargs) -> DaemonClient:
+    """A client wired straight to ``owner``, with the fallbacks the test chooses."""
+    url = f"http://127.0.0.1:{owner.server.server_address[1]}"
+    return DaemonClient(home, url, None, os.getpid(), **kwargs)
+
+
+def test_a_too_old_owner_without_a_local_fallback_raises(home, fake_owner):
+    owner = fake_owner(card_identity=False, post="unknown")
+    client = _client_of(owner, home, fallback=lambda give_up_at=None: None)
+    with pytest.raises(OwnerTooOld, match="Method not found: agents/list"):
+        client.agents()
+
+
+def test_wait_returns_the_last_answer_when_no_replacement_is_found_before_the_deadline(home, fake_owner, monkeypatch):
+    _quick_client_timeouts(monkeypatch)
+    owner = fake_owner(card_identity=True, post="working-then-hang")
+
+    def no_replacement(give_up_at=None):
+        time.sleep(max(0.0, give_up_at - time.monotonic()))  # the search runs until the caller's deadline
+        raise DaemonUnavailable("nothing answers")
+
+    client = _client_of(owner, home, fallback=no_replacement)
+    task = client.wait("task-20260101-000000-abcdef", timeout=1.0)
+    assert task["status"]["state"] == "working"
+
+
+def test_wait_raises_when_no_replacement_is_found_and_time_is_left(home, fake_owner, monkeypatch):
+    _quick_client_timeouts(monkeypatch)
+    owner = fake_owner(card_identity=True, post="hang")
+
+    def no_replacement(give_up_at=None):
+        raise DaemonUnavailable("nothing answers")
+
+    client = _client_of(owner, home, fallback=no_replacement)
+    with pytest.raises(DaemonUnavailable, match="nothing answers"):
+        client.wait("task-20260101-000000-abcdef", timeout=30)
+
+
+def test_a_second_switch_to_an_embedded_daemon_keeps_the_first(home, monkeypatch):
+    """Two calls that both hit "Method not found" share one embedded daemon."""
+    embedded = object()  # stands in for the MaestroDaemon the first call created
+    monkeypatch.setattr(dm, "_instance", embedded)
+    info = daemonctl.DaemonInfo(running=True, pid=os.getpid(), url="http://127.0.0.1:1", state_dir=home)
+    assert dm._use_legacy_embedded(home, info, {}) is embedded
