@@ -8,9 +8,18 @@ the Maestro state directory (``~/.maestro`` by default).
 Design notes:
 - The marker written by the daemon itself (pid, port, host, token, started_at)
   is the single source of truth; this module never keeps a second copy.
-- Liveness = the recorded pid answers signal 0 **and** the HTTP endpoint
-  answers. A stale marker from a dead process is reported as stopped and is
-  cleaned up by ``stop`` (or ignored, read-only, by ``status``).
+- Liveness = the recorded pid answers signal 0, the process is confirmed to be
+  the daemon that wrote the marker, **and** the HTTP endpoint answers. A stale
+  marker (a dead process, or a live process that is not the daemon) is reported
+  as stopped and is cleaned up by ``stop`` (or ignored, read-only, by ``status``).
+- Identity: a running daemon holds an exclusive lock on
+  ``<state_dir>/daemon.owner.lock`` for its whole life and writes its pid into
+  that file. The operating system releases the lock when the process exits, so
+  "the lock is held and the file names the marker's pid" proves that the pid is
+  still the daemon, even after a crash left the marker behind and the pid was
+  reused. A marker written by an older version (no ``owner_lock`` field) is
+  confirmed instead by its HTTP endpoint answering with a Maestro agent card.
+  ``stop`` never signals a process whose identity it cannot confirm.
 - Start is guarded by an exclusive advisory lock on ``<state_dir>/daemon.lock``
   so two concurrent starts for the same state directory cannot fork duplicates.
 - The child runs in its own session (``start_new_session=True``) so it survives
@@ -37,6 +46,13 @@ from typing import Any, Iterator
 DEFAULT_STOP_GRACE_S = 10.0
 READY_TIMEOUT_S = 20.0
 LOCK_WAIT_S = 30.0
+OWNER_LOCK_NAME = "daemon.owner.lock"  # held by the daemon that serves HTTP and owns daemon.json
+USERS_LOCK_NAME = "daemon.users.lock"  # held (shared) by every daemon process using the state directory
+OWNER_LOCK_WAIT_S = 2.0  # covers the moment a status check holds the lock to test it
+
+
+class DaemonAlreadyRunning(RuntimeError):
+    """Raised when a daemon starts on a state directory that a live daemon already owns."""
 
 
 def _state_dir() -> Path:
@@ -105,6 +121,95 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def open_lock(path: Path) -> int:
+    """Open (creating if needed) a lock file readable by the owner only."""
+    return os.open(str(path), os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def try_exclusive(fd: int) -> bool:
+    """Take an exclusive lock on ``fd`` without waiting; False when someone else holds it."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def hold_shared(fd: int) -> None:
+    """Hold a shared lock on ``fd``, waiting while another process holds it exclusively."""
+    fcntl.flock(fd, fcntl.LOCK_SH)
+
+
+def acquire_owner_lock(state_dir: Path, wait_s: float = OWNER_LOCK_WAIT_S) -> int | None:
+    """Take the owner lock for ``state_dir`` and record this process's pid in it.
+
+    Returns the open file descriptor, which must stay open for as long as the
+    daemon runs, or None when another process still holds the lock after
+    ``wait_s`` seconds.
+    """
+    fd = open_lock(state_dir / OWNER_LOCK_NAME)
+    deadline = time.monotonic() + wait_s
+    while not try_exclusive(fd):
+        if time.monotonic() >= deadline:
+            os.close(fd)
+            return None
+        time.sleep(0.05)
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, f"{os.getpid()}\n".encode("ascii"), 0)
+    return fd
+
+
+def release_owner_lock(fd: int) -> None:
+    """Release the owner lock; closing the descriptor drops the lock."""
+    os.close(fd)
+
+
+def owner_lock_holder(state_dir: Path) -> int | None:
+    """The pid recorded by the process holding the owner lock.
+
+    Returns None when no process holds the lock, and 0 when a process holds it
+    but the recorded pid cannot be read.
+    """
+    try:
+        fd = os.open(str(state_dir / OWNER_LOCK_NAME), os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        if try_exclusive(fd):
+            return None  # nobody held it; closing the descriptor releases it again
+        try:
+            return int(os.pread(fd, 32, 0).decode("ascii").strip())
+        except ValueError:
+            return 0
+    finally:
+        os.close(fd)
+
+
+def _answers_as_maestro(url: str, token: str | None, timeout: float = 3.0) -> bool:
+    """True when ``url`` serves a Maestro agent card (used for markers from older versions)."""
+    request = urllib.request.Request(url + "/.well-known/agent.json")
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as resp:
+            card = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+    return isinstance(card, dict) and "capabilities" in card and "url" in card
+
+
+def _identity_confirmed(base: Path, marker: dict[str, Any], pid: int, url: str | None) -> bool:
+    """True when the live process ``pid`` is the daemon that wrote this marker.
+
+    A current daemon proves it by holding the owner lock with its pid recorded.
+    A marker from an older version carries no ``owner_lock`` field, so the only
+    evidence available is its HTTP endpoint answering as a Maestro daemon.
+    """
+    if marker.get("owner_lock"):
+        return owner_lock_holder(base) == pid
+    return url is not None and _answers_as_maestro(url, marker.get("token"))
+
+
 def probe(url: str, timeout: float = 3.0) -> bool:
     """True when the daemon's HTTP endpoint answers (public static route)."""
     try:
@@ -129,9 +234,11 @@ def _uptime_s(started_at: str | None) -> float | None:
 def status(state_dir: Path | None = None) -> DaemonInfo:
     """Resolve the daemon state for one state directory (read-only).
 
-    Distinguishes: no marker (stopped), marker with a dead pid (stale), and a
-    live, answering daemon. A live pid that does not answer HTTP is reported as
-    not running with an explanatory detail so callers never trust a hung process.
+    Distinguishes: no marker (stopped), marker with a dead pid (stale), a live
+    pid that is not the daemon (stale: the pid was reused), and a live,
+    answering daemon. A confirmed daemon that does not answer HTTP is reported
+    as not running with an explanatory detail so callers never trust a hung
+    process.
     """
     base = state_dir or _state_dir()
     if not (base / "daemon.json").is_file():
@@ -153,6 +260,16 @@ def status(state_dir: Path | None = None) -> DaemonInfo:
             state_dir=base, started_at=str(started_at) if started_at else None,
             stale_marker=True, detail="daemon marker exists but the process is dead",
         )
+    if not _identity_confirmed(base, marker, pid, url):
+        return DaemonInfo(
+            running=False, pid=pid, port=port or None, host=host, url=url,
+            state_dir=base, started_at=str(started_at) if started_at else None,
+            stale_marker=True,
+            detail=(
+                f"pid {pid} is alive but is not the Maestro daemon that wrote the marker "
+                "(the pid was probably reused after a crash); the marker is stale"
+            ),
+        )
     if url is None or not probe(url):
         return DaemonInfo(
             running=False, pid=pid, port=port or None, host=host, url=url,
@@ -165,6 +282,18 @@ def status(state_dir: Path | None = None) -> DaemonInfo:
         started_at=str(started_at) if started_at else None,
         uptime_s=_uptime_s(str(started_at) if started_at else None),
     )
+
+
+def live_owner(state_dir: Path) -> DaemonInfo | None:
+    """The live daemon that owns ``state_dir``, or None when no daemon owns it.
+
+    A confirmed daemon that has stopped answering HTTP still owns the directory:
+    starting a second daemon beside it would make two brokers share one state.
+    """
+    info = status(state_dir)
+    if info.running or (not info.stale_marker and info.pid is not None):
+        return info
+    return None
 
 
 @contextlib.contextmanager
@@ -284,6 +413,9 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
 
     SIGTERM first, then a grace period (``MAESTRO_DAEMON_STOP_GRACE_S`` or the
     argument), then SIGKILL if required. Stale markers are cleaned up either way.
+    A process is only signalled when it is confirmed to be the daemon that wrote
+    the marker; a live process with a reused pid is left alone and the stale
+    marker is removed.
     """
     base = state_dir or _state_dir()
     if grace_s is None:
@@ -311,6 +443,16 @@ def stop(state_dir: Path | None = None, *, grace_s: float | None = None) -> Daem
         return DaemonInfo(
             running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base,
             stale_marker=True, detail="daemon was not running; removed stale marker",
+        )
+    if not _identity_confirmed(base, marker, pid, url):
+        (base / "daemon.json").unlink(missing_ok=True)
+        return DaemonInfo(
+            running=False, pid=pid, port=port or None, host=host, url=url, state_dir=base,
+            stale_marker=True,
+            detail=(
+                f"removed a stale daemon marker: pid {pid} is alive but is not the Maestro daemon "
+                "for this state directory (the pid was probably reused after a crash), so it was not signalled"
+            ),
         )
     deadline = time.monotonic() + grace_s
     try:

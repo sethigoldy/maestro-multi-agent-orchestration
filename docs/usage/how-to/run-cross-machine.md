@@ -33,7 +33,8 @@ On startup it prints JSON that includes the two values you need:
   keep a stable token across restarts.
 
 The token is also written into the local `daemon.json` marker, so your own
-machine's CLI keeps working without extra configuration.
+machine's CLI keeps working without extra configuration. The marker is readable
+by your user only (mode 0600).
 
 ## Step 2 — Verify reachability
 
@@ -75,7 +76,11 @@ maestro delegate --title "T" --request "R" --target remote-b --workspace /path/t
 ```
 
 The full handoff document travels with the request, so routing survives the
-hop. Maestro checks the remote's agent card before delegating, streams its
+hop. The one field left out is `[expectations] branch`: a task branch name
+applies only to the workspace of the daemon that runs the task. The remote
+daemon gets a new request on every attempt and every turn, so it puts its work
+on its own default branch, `maestro/<remote-task-id>`, instead of refusing
+every request after the first because the named branch already exists. Maestro checks the remote's agent card before delegating, streams its
 output and usage live, and forwards cancellation. If the remote has no free
 workspace slot it queues the task; a missing/wrong token fails fast with
 `HTTP 401 — check this agent's token`.
@@ -84,7 +89,13 @@ workspace slot it queues the task; a missing/wrong token fails fast with
 
 Daemons on the same LAN find each other automatically: each daemon periodically
 announces itself over UDP multicast (port 9786) and peers are recorded in
-`~/.maestro/peers.json`.
+`~/.maestro/peers.json`. Only a daemon that listens beyond loopback (for
+example `--bind 0.0.0.0`, as in Step 1) announces itself by default; a daemon
+on `127.0.0.1` announces only when `MAESTRO_DISCOVERY=1` is set.
+
+Announcements are untrusted: one whose advertised host is not an IP address is
+dropped, names lose their control characters, and `peers.json` keeps at most
+256 peers (a discovered peer unheard for an hour is removed).
 
 ```bash
 maestro peers list          # live + stale peers, with URLs
@@ -112,6 +123,42 @@ http://10.0.0.5:8790/?token=<t>
 
 The token is captured into the browser session and stripped from the address
 bar.
+
+## Step 6 (optional) — Put the daemon behind a reverse proxy
+
+The daemon refuses a browser POST whose `Origin` header does not exactly match
+the address the request was sent to (its `Host` header). A reverse proxy that
+forwards `https://maestro.example.com` to the daemon usually changes the `Host`
+header to the daemon's own address, such as `127.0.0.1:8790`, while the browser
+still sends `Origin: https://maestro.example.com`. The daemon then refuses the
+console's POSTs with `HTTP 403 — cross-origin requests are not allowed`.
+
+List the proxy's public origin so the daemon accepts it:
+
+```bash
+maestro-daemon --port 8790 --allow-origin https://maestro.example.com
+```
+
+Repeat `--allow-origin` for more than one origin. For a daemon started with
+`maestro daemon start` or by the MCP server, which take no options, set the
+environment variable instead, as a comma-separated list:
+
+```bash
+export MAESTRO_DAEMON_ALLOWED_ORIGINS=https://maestro.example.com,https://maestro.internal:8443
+maestro daemon start
+```
+
+The `--allow-origin` option wins over the environment variable when both are
+given. Write each origin the way a browser sends it: `scheme://host[:port]`,
+with no path. An invalid entry stops the daemon from starting. Requests without
+an `Origin` header, such as the CLI, the MCP server and `curl`, are not
+affected.
+
+A daemon on loopback also refuses any `Host` header other than `127.0.0.1`,
+`localhost` or `::1`, so configure the proxy to send the daemon's own address
+as `Host` (for nginx, `proxy_pass http://127.0.0.1:8790;` without
+`proxy_set_header Host $host;`). A daemon bound beyond loopback accepts any
+`Host` but needs its token on every data request.
 
 ## Security notes
 
