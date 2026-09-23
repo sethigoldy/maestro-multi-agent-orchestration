@@ -350,7 +350,7 @@ def test_durable_record_keeps_park_details(tmp_path, monkeypatch):
     first = _new_daemon(home)
     tid, record = first._make_record(_doc(), str(ws))
     first._register_and_claims(tid, _doc(), str(ws))
-    record.update({"awaiting": "routing", "gates": {"review": {"ok": False}}, "bounces": 1, "base_head": "abc", "verification": "FAILED"})
+    record.update({"awaiting": "routing", "gates": {"review": {"ok": False}}, "bounces": 1, "base_head": "abc", "python_test_suite": False, "verification": "FAILED"})
     first._set_state(tid, "input-required", question="Which agent?")
     first.stop()
     second = _new_daemon(home)
@@ -359,6 +359,7 @@ def test_durable_record_keeps_park_details(tmp_path, monkeypatch):
         assert rebuilt["awaiting"] == "routing" and rebuilt["question"] == "Which agent?"
         assert rebuilt["gates"] == {"review": {"ok": False}} and rebuilt["bounces"] == 1
         assert rebuilt["base_head"] == "abc" and rebuilt["verification"] == "FAILED"
+        assert rebuilt["python_test_suite"] is False
     finally:
         second.stop()
 
