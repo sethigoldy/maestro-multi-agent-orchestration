@@ -666,7 +666,7 @@ phases = ["implementer"]         # optional — default: all phases
 | `MAESTRO_BUDGET_DAILY_USD` | off | Daily USD cap, all agents, UTC day |
 | `MAESTRO_DISCOVERY` / `_PORT` / `_IF` / `_TTL` | on/9786/default/1 | P2P discovery tuning (see P2P discovery) |
 | `MAESTRO_NODE_NAME` | `maestro-node` | Announced name for discovery |
-| `MAESTRO_PYTHON` | — | Interpreter used for verification's pytest probe (must be a file) |
+| `MAESTRO_PYTHON` | — | Python interpreter that verification uses to run pytest (must be a file). Set it when the project's environment is not in `.venv/` or `venv/` inside the workspace |
 | `MAESTRO_STORAGE` | — | Storage backend when no config file sets it (file values win) |
 | `MAESTRO_CODEX_MODEL` / `MAESTRO_CODEX_EFFORT` | — | Codex model/effort when no config file sets them (file values win) |
 
@@ -702,11 +702,15 @@ the project root.
 ## Deterministic verification
 
 After an agent finishes, Maestro runs a deterministic check before reporting
-completion: an auto-detected test command — `make check` when a `Makefile`
-exists, else the Node `test` script (npm/pnpm/yarn per lockfile), then Go,
-Cargo, or pytest — plus `git diff --check`, which always runs. Both must pass;
-when no runner is detected the check degrades to the whitespace check with an
-explicit note. The full report is saved per task (`verification.txt`). The
+completion: an auto-detected test command — `make check` when the `Makefile`
+has a `check` target, else the Node `test` script (npm/pnpm/yarn per
+lockfile), then Go, Cargo, or pytest — plus `git diff --check`, which always
+runs. Both must pass. When no test runner is detected, the check degrades to
+the whitespace check with an explicit note, and it passes only if the agent
+left changes in the workspace. A Python project that has tests but no pytest
+in the selected interpreter fails verification with a note that says how to
+fix it (set `MAESTRO_PYTHON`, or configure an explicit command); its tests
+are never skipped silently. The full report is saved per task (`verification.txt`). The
 handoff's `verification` field can switch this to an explicit command or skip
 it — see the [configuration reference](docs/usage/reference/configuration.md#verification-auto-detection).
 

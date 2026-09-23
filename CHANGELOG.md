@@ -6,6 +6,13 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Python project's tests are no longer skipped when pytest is missing.** Maestro looks for pytest in `MAESTRO_PYTHON`, then in the project's `.venv/`, then in Maestro's own interpreter. When pytest was not in the interpreter it picked, verification used to fall back to `git diff --check` and reported PASSED whenever the workspace had changes, so a project whose environment lives in `venv/`, in poetry or conda, or in the main checkout of a git worktree had its failing tests skipped. Now, when the project clearly has a test suite (a `tests/` directory or a pytest configuration) and pytest cannot be imported, verification fails. The report names the interpreter and says how to fix it: set `MAESTRO_PYTHON`, or configure an explicit verification command. Maestro also looks for a `venv/` directory in addition to `.venv/` when it chooses the interpreter.
+- **A Makefile without a `check` target no longer fails every task.** Maestro used to run `make check` for any repository with a `Makefile`, and every task then failed with "No rule to make target 'check'". Maestro now runs `make check` only when the `Makefile` defines a `check` target, either written in the file or found by a `make -n check` dry run. Otherwise detection continues with the next test runner.
+- **A Python project with no tests no longer fails every task.** pytest exits with code 5 when it collects no tests, and Maestro treated that as a test failure. For the auto-detected pytest command, exit code 5 now means "no tests to run". It is not a failure, but it does not prove any work was done either, so the task passes only if the turn left working-tree changes or new commits, which is the same rule that applies to the `git diff --check` fallback. An explicitly configured command still fails on any non-zero exit code.
+- **The default `npm init` test script is no longer treated as a failing test suite.** The script `echo "Error: no test specified" && exit 1` always fails. Maestro now recognises it as "this package has no tests" and continues with the next test runner instead of running `npm test`.
+
 ## [0.12.0] — 2026-09-22
 
 ### Fixed

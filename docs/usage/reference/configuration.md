@@ -162,24 +162,57 @@ selected in this order — first match wins:
 
 | # | Condition | Command |
 |---|---|---|
-| 1 | `Makefile` exists | `make check` |
-| 2 | `package.json` with a `test` script + `pnpm-lock.yaml` | `pnpm test` |
+| 1 | `Makefile` defines a `check` target | `make check` |
+| 2 | `package.json` with a `test` script (other than the `npm init` default) + `pnpm-lock.yaml` | `pnpm test` |
 | 3 | same, with `yarn.lock` | `yarn test` |
 | 4 | same, without pnpm/yarn lockfile | `npm test` |
 | 5 | `go.mod` exists | `go test ./...` |
 | 6 | `Cargo.toml` exists | `cargo test` |
 | 7 | Python project (`pyproject.toml`, or `pytest.ini`/`tox.ini`/`setup.cfg`, or a `tests/` directory) and pytest imports in the selected interpreter | `<python> -m pytest` |
-| 8 | fallback (including case 7 without pytest installed) | `git diff --check` |
+| 8 | Python project with a test suite (see below), but pytest does not import in the selected interpreter | `<python> -m pytest`, which fails; see below |
+| 9 | fallback (including a Python project with no test suite and no pytest) | `git diff --check` |
 
-The selected Python interpreter is, in order: `$MAESTRO_PYTHON` (if it is a
-file), `<workspace>/.venv/bin/python` (if executable), else the daemon's own
-interpreter. In every case `git diff --check` also runs; verification passes
-only if both it and the selected command exit 0. The full report (command,
-stdout, stderr) is written to `~/.maestro/tasks/<task-id>/verification.txt`.
+Details of each rule:
+
+- **Makefile.** Maestro first reads the `Makefile` and looks for a rule whose
+  targets include `check` (for example `check:` or `lint check:`). If none is
+  written there, it asks make with a dry run, `make -n check`, which also finds
+  a `check` target defined in an included file. A `Makefile` without a `check`
+  target is skipped and detection continues with the next rule.
+- **Node.** The test script that `npm init` writes,
+  `echo "Error: no test specified" && exit 1`, always fails. Maestro treats it
+  as "this package has no tests" and continues with the next rule.
+- **Python interpreter.** The selected Python interpreter is, in order:
+  `$MAESTRO_PYTHON` (if it is a file), `<workspace>/.venv/bin/python` (if
+  executable), `<workspace>/venv/bin/python` (if executable), else the daemon's
+  own interpreter.
+- **pytest missing.** A project has a Python test suite when it has a `tests/`
+  directory, a `pytest.ini` file, a `[tool.pytest.ini_options]` table in
+  `pyproject.toml`, a `[tool:pytest]` section in `setup.cfg`, or a `[pytest]`
+  section in `tox.ini`. If such a project's tests cannot run because pytest is
+  not installed in the selected interpreter, verification fails. The report
+  names the interpreter and says how to fix it: set `MAESTRO_PYTHON` to the
+  interpreter of the project's environment (for example a poetry or conda
+  environment, or the main checkout's `.venv` when you work in a git
+  worktree), or use `verification = "command"` with an explicit test command.
+- **No tests collected.** When pytest finds no tests, it exits with code 5.
+  For the auto-detected pytest command this is not counted as a test failure.
+  It is not evidence of work either, so it is handled like the
+  `git diff --check` fallback: the task passes only if the turn left
+  working-tree changes or new commits in the workspace.
+- **Fallback.** `git diff --check` alone passes on an untouched workspace, so
+  when it is the only check, verification fails unless the turn left
+  working-tree changes or new commits.
+
+In every case `git diff --check` also runs; verification passes only if both
+it and the selected command succeed. The full report (command, notes, stdout,
+stderr) is written to `~/.maestro/tasks/<task-id>/verification.txt`.
 
 With `verification = "command"`, the handoff's `request` field is shlex-split
-and run as the check command instead of auto-detection. With `verification =
-"none"`, no check runs and the completion metadata records `skipped`.
+and run as the check command instead of auto-detection. Any non-zero exit
+code from that command is a failure, including exit code 5 from pytest. With
+`verification = "none"`, no check runs and the completion metadata records
+`skipped`.
 
 ## Environment variables
 
@@ -204,7 +237,7 @@ and run as the check command instead of auto-detection. With `verification =
 | `MAESTRO_LOGIN_ENV` | `1` | Set `0` to stop passing a login-shell environment snapshot (`$SHELL -lc env`) to spawned agents |
 | `MAESTRO_LOGIN_ENV_TIMEOUT_S` | `10` | Max seconds to wait for the login-shell snapshot before falling back to the daemon's own environment |
 | `MAESTRO_CONTINUATION_MAX_TOKENS` | from `[continuation]` | Positive-integer override of the continuation context budget (see `[continuation]`) |
-| `MAESTRO_PYTHON` | — | Interpreter for verification's pytest probe (must be a file) |
+| `MAESTRO_PYTHON` | — | Python interpreter that verification uses to run pytest (must be a file). Set it when the project's environment is not in `.venv/` or `venv/` inside the workspace |
 
 Misconfigured budget values (non-numeric, negative) are ignored rather than
 blocking delegation.

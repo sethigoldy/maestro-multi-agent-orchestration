@@ -1251,6 +1251,8 @@ class MaestroDaemon:
     def _verify(self, workspace: Path, task_id: str, doc: HandoffDoc, output_tail: str | None = None) -> bool:
         import shlex
 
+        from .worker import _pytest_found_no_tests
+
         configured = None
         if doc.verification == "command":
             configured = shlex.split(doc.request)  # explicit command mode carries the command in request (M2 simplification)
@@ -1262,6 +1264,10 @@ class MaestroDaemon:
         # complete as PASSED. Explicit commands and real test runners are
         # authoritative and keep their current semantics.
         fallback_only = note is not None and test_cmd == ["git", "diff", "--check"]
+        # Whether the turn left work behind is recorded before the test command
+        # runs, so that files the test command itself creates are not mistaken
+        # for the agent's work.
+        has_changes, evidence = self._workspace_has_changes(workspace, task_id)
         diff = subprocess.run(["git", "diff", "--check"], cwd=workspace, text=True, capture_output=True)
         try:
             tests = subprocess.run(test_cmd, cwd=workspace, text=True, capture_output=True)
@@ -1272,22 +1278,39 @@ class MaestroDaemon:
                 stderr = f"verification command could not be launched: {exc}"
 
             tests = _FailedRun()
-        ok = diff.returncode == 0 and tests.returncode == 0
+        # An auto-detected pytest run that found no tests (exit code 5) is not
+        # a test failure, but it proves nothing about the turn either. It is
+        # treated like the `git diff --check` fallback: it passes only when the
+        # turn left changes behind. An explicit command keeps its exit code.
+        no_tests = configured is None and _pytest_found_no_tests(test_cmd, tests.returncode)
+        ok = diff.returncode == 0 and (tests.returncode == 0 or no_tests)
         no_changes_reason: str | None = None
-        if ok and fallback_only:
-            has_changes, evidence = self._workspace_has_changes(workspace, task_id)
-            if not has_changes:
-                ok = False
-                no_changes_reason = evidence
+        if ok and (fallback_only or no_tests) and not has_changes:
+            ok = False
+            no_changes_reason = evidence
         note_text = f"verification note: {note}\n\n" if note else ""
+        if no_tests:
+            note_text += (
+                f"verification note: pytest found no tests to run (exit code {tests.returncode}). "
+                "This is not counted as a test failure, but it is not evidence of work either, "
+                "so the task passes only if the turn changed the workspace.\n\n"
+            )
         no_changes_text = ""
         if no_changes_reason is not None:
             tail_text = f"\n\nlast lines of the agent's output:\n{output_tail}" if output_tail else ""
+            if no_tests:
+                weak_check = (
+                    "The test command found no tests to run, and the only other check is "
+                    "`git diff --check`, which passes trivially on an untouched workspace"
+                )
+            else:
+                weak_check = (
+                    "The only available check is `git diff --check` (no project test runner "
+                    "was detected), which passes trivially on an untouched workspace"
+                )
             no_changes_text = (
                 "\nRESULT: FAILED — no changes detected. "
-                f"{no_changes_reason}. The only available check is `git diff --check` "
-                "(no project test runner was detected), which passes trivially on an "
-                "untouched workspace, so Maestro will not report PASSED without evidence of work."
+                f"{no_changes_reason}. {weak_check}, so Maestro will not report PASSED without evidence of work."
                 + tail_text
             )
         report = (

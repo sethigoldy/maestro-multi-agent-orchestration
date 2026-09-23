@@ -159,15 +159,19 @@ non-git directories where a branch would be ceremony without value.
 
 The design stance is that an agent reporting success is a *claim*, and claims
 get checked. After a successful run, the daemon executes a deterministic check
-in the task's workspace — auto-detected (Makefile → `make check`, Node test
-script per lockfile, Go, Cargo, pytest) or explicitly configured via the
+in the task's workspace — auto-detected (a Makefile `check` target → `make check`,
+Node test script per lockfile, Go, Cargo, pytest) or explicitly configured via the
 handoff's `verification` mode — plus `git diff --check` unconditionally. Both
 must pass for the task to reach `completed`; the full command output is saved
 to `verification.txt`.
 
 This is deliberately narrow: Maestro never installs dependencies or changes
-tooling, and a missing test runner degrades to the whitespace check with an
-explicit note rather than inventing a pass. The alternative — trusting agent
+tooling. When a project has no test runner at all, the check degrades to the
+whitespace check with an explicit note, and that check alone passes only if
+the agent left changes in the workspace. When a project has tests but the test
+runner is not installed (for example, pytest is missing from the selected
+Python interpreter), verification fails and the report says how to fix it.
+Maestro does not invent a pass in either case. The alternative — trusting agent
 self-reports — would make "completed" mean "the agent stopped", which in
 multi-agent chains is exactly where errors compound: each downstream consumer
 inherits the previous agent's unverified claim. Verification is what makes a
