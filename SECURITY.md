@@ -90,6 +90,20 @@ workspaces and real agent CLIs to real tasks. Consequences to understand:
   MCP `agents_list` tool show a stored token as `<redacted>`.
 - The web console served by the daemon respects the same token: loopback needs
   none, remote access does.
+- The HTTP API limits what one client can make it hold. A POST whose
+  `Content-Length` is negative or not a number is refused with 400, and one
+  larger than 8 MiB is refused with 413; neither body is read. A client of an
+  event stream (SSE) that stops reading is disconnected once it is 2048 events
+  behind or a write has waited 30 seconds, so it cannot make the daemon queue
+  events forever. A JSON-RPC request that makes the daemon fail unexpectedly
+  gets a `-32603` error reply instead of a dropped connection.
+- P2P discovery (UDP multicast) is off for a daemon that listens on loopback
+  only, unless `MAESTRO_DISCOVERY=1` is set. Announcements are untrusted input:
+  the daemon reads only packets sent to the multicast group, ignores other
+  hosts when `MAESTRO_DISCOVERY_IF` is loopback, drops an announcement whose
+  advertised host is not an IP address, strips control characters from names,
+  and keeps at most 256 peers in `peers.json`. Discovered peers are only a
+  list; nothing connects to them unless you register one as an agent.
 
 ### State and receipts
 
@@ -105,6 +119,8 @@ data (and note that `maestro doctor` output includes paths but no task content).
   POSTs from any browser origin other than its own address or an origin you
   listed with `--allow-origin` or `MAESTRO_DAEMON_ALLOWED_ORIGINS`, so a web
   page cannot drive it.
+- `maestro daemon stop` signals only a process it has confirmed to be the
+  daemon, never a process that reused a crashed daemon's pid.
 - Read-only diagnostics: `maestro doctor` never mutates state or runs agents'
   work (its agent probes run version checks only).
 - No network calls from the core library beyond what you configure (agent CLIs,

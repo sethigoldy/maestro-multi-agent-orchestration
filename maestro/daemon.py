@@ -25,6 +25,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from .a2a import (
+    ERR_INTERNAL,
     A2ADispatcher,
     STATE_CANCELED,
     STATE_COMPLETED,
@@ -36,6 +37,7 @@ from .a2a import (
     agent_card,
     sse_encode,
 )
+from . import daemonctl
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
 from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
@@ -320,9 +322,26 @@ class MaestroDaemon:
         self._presence: Any | None = None
         self._stopped = False
         self.sse_heartbeat_s = 15.0  # keepalive interval for /tasks/<id>/events streams
-        self._reconcile_interrupted_tasks()
+        self.sse_queue_max = 2048  # events one SSE client may fall behind before it is disconnected
+        self.sse_write_timeout_s = 30.0  # an SSE client that accepts no data for this long is disconnected
+        self._owner_lock_fd: int | None = None  # set while this daemon serves HTTP and owns daemon.json
+        # Every daemon process that uses this state directory holds a shared
+        # lock on it. Only a process that can briefly take that lock
+        # exclusively is alone here, and only then may it fail tasks that look
+        # interrupted: otherwise they may belong to another live daemon.
+        self._users_lock_fd = daemonctl.open_lock(self.state_dir / daemonctl.USERS_LOCK_NAME)
+        alone = daemonctl.try_exclusive(self._users_lock_fd)
+        # A daemon from an older version holds no lock, so its answering marker is checked too.
+        if alone and daemonctl.live_owner(self.state_dir) is None:
+            self._reconcile_interrupted_tasks()
+        daemonctl.hold_shared(self._users_lock_fd)
         if start_http:
-            self.start_http(port)
+            try:
+                self.start_http(port)
+            except BaseException:
+                self._release_state_dir()
+                self.maestro.close()
+                raise
 
     # ------------------------------------------------------------------ http
     def _resolve_bind(self) -> None:
@@ -352,22 +371,45 @@ class MaestroDaemon:
             self.token = env_token or secrets.token_urlsafe(24)
 
     def start_http(self, port: int = 0) -> int:
+        """Serve HTTP and take ownership of the state directory's daemon.json marker.
+
+        Only one daemon may own a state directory. When a live daemon already
+        owns it, this raises :class:`daemonctl.DaemonAlreadyRunning` and leaves
+        that daemon's marker alone.
+        """
         if self._httpd is not None:
             return self.port or 0
+        owner = daemonctl.live_owner(self.state_dir)
+        if owner is not None:
+            raise daemonctl.DaemonAlreadyRunning(
+                f"another Maestro daemon (pid {owner.pid}, {owner.url}) already owns the state directory {self.state_dir}"
+            )
+        lock_fd = daemonctl.acquire_owner_lock(self.state_dir)
+        if lock_fd is None:  # another daemon took ownership after the check above
+            raise daemonctl.DaemonAlreadyRunning(
+                f"another Maestro daemon (pid {daemonctl.owner_lock_holder(self.state_dir)}) already owns the state directory {self.state_dir}"
+            )
         self._resolve_bind()
         handler = _make_handler(self)
-        self._httpd = ThreadingHTTPServer((self.bind, port), handler)
+        try:
+            self._httpd = ThreadingHTTPServer((self.bind, port), handler)
+        except BaseException:
+            daemonctl.release_owner_lock(lock_fd)
+            raise
+        self._owner_lock_fd = lock_fd
         self.port = self._httpd.server_address[1]
-        marker: dict[str, Any] = {"pid": os.getpid(), "port": self.port, "host": self.local_host, "started_at": utcnow_iso()}
+        marker: dict[str, Any] = {"pid": os.getpid(), "port": self.port, "host": self.local_host, "started_at": utcnow_iso(), "owner_lock": True}
         if self.token is not None:
             marker["token"] = self.token
         _write_private(self.state_dir / "daemon.json", json.dumps(marker, indent=2))
         thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         thread.start()
-        # P2P presence: announce over UDP so other Maestro nodes find us.
+        # P2P presence: announce over UDP so other Maestro nodes find us. A
+        # daemon that listens on loopback only cannot be reached by another
+        # machine, so it announces only when MAESTRO_DISCOVERY is set to on.
         from .discovery import PeerTable, PresenceServer, discovery_enabled, discovery_interface_from_env, discovery_ttl_from_env
 
-        if discovery_enabled():
+        if discovery_enabled(loopback_only=self.bind in ("127.0.0.1", "::1")):
             presence = PresenceServer(
                 self.port,
                 PeerTable(self.state_dir / "peers.json"),
@@ -403,12 +445,22 @@ class MaestroDaemon:
             self._httpd.server_close()
             self._httpd = None
         marker = self.state_dir / "daemon.json"
-        if marker.exists():
+        # Only the daemon that wrote the marker removes it: a daemon running
+        # without HTTP beside the owner must leave the owner's marker in place.
+        if self._owner_lock_fd is not None and marker.exists():
             try:
                 marker.unlink()
             except OSError:
                 pass
+        self._release_state_dir()
         self.maestro.close()
+
+    def _release_state_dir(self) -> None:
+        """Drop this daemon's locks on the state directory (owner lock first)."""
+        if self._owner_lock_fd is not None:
+            daemonctl.release_owner_lock(self._owner_lock_fd)
+            self._owner_lock_fd = None
+        os.close(self._users_lock_fd)
 
     def _reconcile_interrupted_tasks(self) -> None:
         """Fail tasks that a previous daemon process left mid-flight.
@@ -1872,6 +1924,9 @@ def _allowed_origins_from_env() -> list[str]:
     return [item for item in (part.strip() for part in raw.split(",")) if item]
 
 
+MAX_REQUEST_BODY_BYTES = 8 * 1024 * 1024  # a JSON-RPC request larger than 8 MiB is refused unread
+
+
 def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
     dispatcher = A2ADispatcher(daemon)
 
@@ -2015,23 +2070,51 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             if refusal is not None:
                 self._send_json(403, {"error": refusal})
                 return
+            # Check the declared size before reading anything: a negative length
+            # would make the read wait until the client hangs up, and a huge one
+            # would be read into memory. The unread body is never parsed as a
+            # request because the connection is closed after the reply.
             try:
                 length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if length < 0:
+                self.close_connection = True
+                self._send_json(400, {"error": "Content-Length must be a non-negative integer"})
+                return
+            if length > MAX_REQUEST_BODY_BYTES:
+                self.close_connection = True
+                self._send_json(413, {"error": f"request body is larger than the {MAX_REQUEST_BODY_BYTES}-byte limit"})
+                return
+            try:
                 body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
             except (ValueError, json.JSONDecodeError):
                 self._send_json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
                 return
             response = dispatcher.handle(body)
-            self._send_json(200 if "result" in response else 400, response)
+            if "result" in response:
+                code = 200
+            else:
+                code = 500 if response["error"]["code"] == ERR_INTERNAL else 400
+            self._send_json(code, response)
 
         def _sse(self, task_id: str | None) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            sub = daemon.bus.subscribe()
+            # A client that stops reading must not hold this thread or grow a
+            # queue forever: writes give up after sse_write_timeout_s, and a
+            # client more than sse_queue_max events behind is disconnected. It
+            # can reconnect and catch up from the event bus's recent history.
+            self.connection.settimeout(daemon.sse_write_timeout_s)
+            sub = daemon.bus.subscribe(maxsize=daemon.sse_queue_max)
             try:
                 while True:
+                    if sub.overflowed:
+                        self.wfile.write(b": subscriber fell too far behind; reconnect to catch up\n\n")
+                        self.wfile.flush()
+                        break
                     event = sub.get(timeout=daemon.sse_heartbeat_s)
                     if event is None:
                         self.wfile.write(b": keepalive\n\n")
@@ -2056,9 +2139,25 @@ _instance_lock = threading.Lock()
 
 
 def get_daemon(**kwargs: Any) -> MaestroDaemon:
-    """Process-wide daemon singleton (used by MCP tools and the CLI)."""
+    """Process-wide daemon singleton (used by MCP tools and the CLI).
+
+    When another live daemon already owns the state directory (for example the
+    background daemon that ``maestro daemon start`` launched), this process
+    must not take over its marker or fail its tasks. The daemon returned here
+    then runs its own tasks without an HTTP endpoint and says so on stderr;
+    the tasks are still written to the shared state directory.
+    """
     global _instance
     with _instance_lock:
         if _instance is None:
-            _instance = MaestroDaemon(**kwargs)
+            try:
+                _instance = MaestroDaemon(**kwargs)
+            except daemonctl.DaemonAlreadyRunning as exc:
+                print(
+                    f"maestro: {exc}. This process runs its own tasks without an HTTP endpoint "
+                    "and leaves that daemon's marker and tasks alone.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _instance = MaestroDaemon(**{**kwargs, "start_http": False})
         return _instance

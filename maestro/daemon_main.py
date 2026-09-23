@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import signal
+import sys
 import threading
 from typing import Any
 
@@ -53,8 +54,21 @@ def run_forever(install_handlers: bool = True) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .daemonctl import DaemonAlreadyRunning
+
     args = _parse_args(argv)
-    info = run_daemon(state_dir=args.state_dir, port=args.port, bind=args.bind, allowed_origins=args.allow_origin)
+    try:
+        info = run_daemon(state_dir=args.state_dir, port=args.port, bind=args.bind, allowed_origins=args.allow_origin)
+    except DaemonAlreadyRunning as exc:
+        # Starting a second daemon here would overwrite the running daemon's
+        # marker and mark its running tasks as failed, so refuse instead.
+        print(
+            f"maestro-daemon: {exc}. Stop that daemon with 'maestro daemon stop', "
+            "or pass a different --state-dir.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
     daemon = info.pop("daemon")
     print(json.dumps(info, indent=2), flush=True)  # flushed: consumers wait for this line
     try:

@@ -41,6 +41,11 @@ class Subscription:
         self._q = q
         self.types = types
 
+    @property
+    def overflowed(self) -> bool:
+        """True when this subscriber fell ``maxsize`` events behind and events were dropped."""
+        return bool(getattr(self._q, "overflowed", False))
+
     def get(self, timeout: float | None = None) -> TaskEvent | None:
         try:
             return self._q.get(timeout=timeout)
@@ -90,16 +95,28 @@ class EventBus:
                 del self._ring[: len(self._ring) - self._ring_size]
             targets = [q for q, types in self._subs if not types or event.type in types]
         for q in targets:
-            q.put(event)
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                q.overflowed = True  # type: ignore[attr-defined]  # read by Subscription.overflowed
         return event
 
-    def subscribe(self, *types: str) -> Subscription:
-        q: "queue.Queue[TaskEvent]" = queue.Queue()
+    def subscribe(self, *types: str, maxsize: int = 0) -> Subscription:
+        """Subscribe to events of ``types`` (all types when none are given).
+
+        ``maxsize`` bounds the subscriber's queue; 0, the default, means no
+        bound. A bounded subscriber catches up on at most ``maxsize`` of the
+        newest events, and once its queue is full further events are dropped
+        and :attr:`Subscription.overflowed` becomes True.
+        """
+        q: "queue.Queue[TaskEvent]" = queue.Queue(maxsize=maxsize)
         with self._lock:
             # Catch up on recent history first (newest last).
-            for event in list(self._ring):
-                if not types or event.type in types:
-                    q.put(event)
+            backlog = [event for event in self._ring if not types or event.type in types]
+            if maxsize:
+                backlog = backlog[-maxsize:]
+            for event in backlog:
+                q.put(event)
             self._subs.append((q, types))
         return Subscription(self, q, types)
 

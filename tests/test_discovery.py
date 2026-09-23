@@ -220,6 +220,7 @@ def test_daemon_starts_presence_and_writes_peers(tmp_path, monkeypatch):
     monkeypatch.setenv("MAESTRO_HOME", str(home))
     port = _ephemeral_udp_port()
     monkeypatch.setenv("MAESTRO_DISCOVERY_PORT", str(port))
+    monkeypatch.setenv("MAESTRO_DISCOVERY", "1")  # a loopback daemon announces only when asked to
     d = MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
     try:
         assert d._presence is not None and d._presence.port == port
@@ -302,7 +303,7 @@ def test_presence_bind_falls_back_to_ephemeral(tmp_path, monkeypatch):
     real_bind = _socket.socket.bind
 
     def busy(self, addr):
-        if addr == ("", 12345):
+        if addr == (MULTICAST_GROUP, 12345):
             raise OSError("address in use")
         return real_bind(self, addr)
 
@@ -354,19 +355,20 @@ class _FakePresenceSocket:
 
 def test_presence_loop_send_failure_and_recv_error(tmp_path):
     table = PeerTable(tmp_path / "peers.json")
-    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="127.0.0.1", ttl=0)
+    # A LAN listener (not loopback), because the scripted announcement comes from 10.0.0.9.
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=0)
 
     # sendto fails (no route) but the loop keeps running and records the peer
     sock = _FakePresenceSocket(recv_results=[((b'{"kind": "maestro-presence", "name": "remote", "http_port": 9001, "pid": 42, "nonce": "abc"}', ("10.0.0.9", 9)))])
     sock.send_error = OSError("no route to host")
-    server._sock = sock
+    server._sock = server._send_sock = sock
     server._loop()  # runs one tick: recv ok, send fails silently, then stops on the next recv error
     assert table.load().get("10.0.0.9:9001", {}).get("name") == "remote"
 
     # recvfrom raises OSError: the loop breaks cleanly
     server2 = PresenceServer(8001, PeerTable(tmp_path / "p.json"), name="node-a", port=1, multicast_if="127.0.0.1", ttl=0)
     sock2 = _FakePresenceSocket(recv_results=[OSError("socket closed")])
-    server2._sock = sock2
+    server2._sock = server2._send_sock = sock2
     server2._loop()  # must return without raising
 
 
@@ -401,6 +403,7 @@ def test_daemon_presence_start_failure_is_nonfatal(tmp_path, monkeypatch):
         return False
 
     monkeypatch.setattr(disc.PresenceServer, "start", no_start)
+    monkeypatch.setenv("MAESTRO_DISCOVERY", "1")  # so the start attempt really happens
     d = MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
     try:
         assert d._presence is None  # daemon still fully functional without presence
@@ -429,7 +432,8 @@ def test_announcement_carries_http_host(tmp_path):
 
 def test_handle_uses_advertised_host_with_source_fallback(tmp_path):
     table = PeerTable(tmp_path / "peers.json")
-    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="127.0.0.1", ttl=0)
+    # A LAN listener (not loopback), because the announcements come from 10.0.0.9.
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
     # newer nodes advertise the host they are reachable on (LAN IP for 0.0.0.0 binds)
     server._handle(json.dumps({"kind": "maestro-presence", "name": "b", "http_port": 8790, "http_host": "192.0.2.44"}).encode(), ("10.0.0.9", 9))
     peer = table.load()["10.0.0.9:8790"]
@@ -472,3 +476,216 @@ def test_pick_lan_ip_success_path(monkeypatch):
 
     monkeypatch.setattr(disc.socket, "socket", _FakeProbe)
     assert disc.pick_lan_ip() == "192.0.2.77"
+
+
+# ----------------------------------------------- hardening: binding, validation, limits
+
+def test_presence_receives_only_group_traffic_not_unicast(tmp_path):
+    """The receive socket is bound to the multicast group, so a unicast packet
+    sent straight to the port is never read, and the send socket is bound to
+    the discovery interface."""
+    port = _ephemeral_udp_port()
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=port, multicast_if="127.0.0.1", ttl=0, interval_s=60)
+    assert server.start()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        assert server._sock.getsockname()[0] == MULTICAST_GROUP
+        assert server._send_sock.getsockname()[0] == "127.0.0.1"
+        announcement = {"kind": "maestro-presence", "name": "injected", "http_port": 9001, "nonce": "zzz"}
+        sock.sendto(json.dumps(announcement).encode(), ("127.0.0.1", port))
+        time.sleep(0.5)
+        assert table.load() == {}
+    finally:
+        sock.close()
+        server.stop()
+
+
+def test_presence_send_socket_is_unbound_for_the_default_interface(tmp_path):
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), name="node-a", port=_ephemeral_udp_port(), multicast_if="0.0.0.0", ttl=0)
+    try:
+        assert server._bind() is True
+        assert server._send_sock.getsockname()[0] == "0.0.0.0"
+    finally:
+        server.stop()
+
+
+def test_presence_send_socket_failure_closes_the_receive_socket(tmp_path, monkeypatch):
+    import socket as _socket
+
+    real_bind = _socket.socket.bind
+
+    def refuse_send_bind(self, addr):
+        if addr == ("127.0.0.1", 0):
+            raise OSError("cannot bind the send socket")
+        return real_bind(self, addr)
+
+    monkeypatch.setattr(_socket.socket, "bind", refuse_send_bind)
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), name="node-a", port=_ephemeral_udp_port(), multicast_if="127.0.0.1", ttl=0)
+    assert server.start() is False
+    assert server._sock is None and server._send_sock is None
+
+
+def test_presence_with_an_invalid_interface_does_not_start(tmp_path):
+    """A MAESTRO_DISCOVERY_IF that is not an address fails the group join; both sockets are closed."""
+    server = PresenceServer(8001, PeerTable(tmp_path / "peers.json"), name="node-a", port=_ephemeral_udp_port(), multicast_if="not-an-address", ttl=0)
+    assert server.start() is False
+    assert server._sock is None and server._send_sock is None
+
+
+def test_loopback_listener_ignores_announcements_from_other_hosts(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="127.0.0.1", ttl=0)
+    announcement = json.dumps({"kind": "maestro-presence", "name": "lan", "http_port": 8790}).encode()
+    server._handle(announcement, ("192.0.2.9", 9))
+    assert table.load() == {}
+    server._handle(announcement, ("127.0.0.1", 9))
+    assert set(table.load()) == {"127.0.0.1:8790"}
+    # A listener on a real interface accepts peers from the network.
+    lan = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    lan._handle(announcement, ("192.0.2.9", 9))
+    assert "192.0.2.9:8790" in table.load()
+
+
+@pytest.mark.parametrize("http_host", ["169.254.169.254/latest/meta-data#", "evil.example", "224.0.0.1", "0.0.0.0", "127.0.0.1:1@x"])
+def test_handle_rejects_an_http_host_that_is_not_a_usable_ip(tmp_path, http_host):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "b", "http_port": 8790, "http_host": http_host}).encode(), ("10.0.0.9", 9))
+    assert table.load() == {}
+
+
+def test_handle_formats_an_ipv6_http_host(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "b", "http_port": 8790, "http_host": "fd00::5"}).encode(), ("10.0.0.9", 9))
+    assert table.load()["10.0.0.9:8790"]["url"] == "http://[fd00::5]:8790"
+
+
+@pytest.mark.parametrize("http_port", [True, 0, -1, 70000, "8790"])
+def test_handle_rejects_an_invalid_http_port(tmp_path, http_port):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "b", "http_port": http_port}).encode(), ("10.0.0.9", 9))
+    assert table.load() == {}
+
+
+def test_handle_strips_control_characters_from_names(tmp_path):
+    table = PeerTable(tmp_path / "peers.json")
+    server = PresenceServer(8001, table, name="node-a", port=1, multicast_if="0.0.0.0", ttl=1)
+    evil = "\x1b]0;owned\x07\x1b[31mnode\u009b2J\r\n" + "x" * 200
+    server._handle(json.dumps({"kind": "maestro-presence", "name": evil, "http_port": 8790}).encode(), ("10.0.0.9", 9))
+    name = table.load()["10.0.0.9:8790"]["name"]
+    assert name.startswith("]0;owned[31mnode2J") and len(name) == 64
+    assert not any(ord(ch) < 32 or 127 <= ord(ch) < 160 for ch in name)
+    # A name that is empty after cleaning, or not a string, falls back to the address.
+    server._handle(json.dumps({"kind": "maestro-presence", "name": "\x1b\x07", "http_port": 8791}).encode(), ("10.0.0.9", 9))
+    server._handle(json.dumps({"kind": "maestro-presence", "name": ["x"], "http_port": 8792}).encode(), ("10.0.0.9", 9))
+    peers = table.load()
+    assert peers["10.0.0.9:8791"]["name"] == "node-10.0.0.9:8791"
+    assert peers["10.0.0.9:8792"]["name"] == "node-10.0.0.9:8792"
+
+
+def test_peer_table_is_capped_and_drops_the_oldest_discovered_peers(tmp_path, monkeypatch):
+    import maestro.discovery as disc
+
+    table = PeerTable(tmp_path / "peers.json")
+    table.add_static("lab", "http://10.0.0.9:8790")
+    clock = [1000.0]
+    monkeypatch.setattr(disc.time, "time", lambda: clock[0])
+    for i in range(disc.MAX_PEERS + 20):
+        clock[0] += 1
+        table.upsert({"key": f"10.1.{i // 250}.{i % 250}:8790", "name": f"n{i}", "port": 8790, "address": "10.1.0.1"})
+    peers = table.load()
+    assert len(peers) == disc.MAX_PEERS
+    assert "static:lab" in peers  # a manually added peer is never evicted
+    assert "10.1.0.0:8790" not in peers  # the oldest discovered peers went first
+    last = disc.MAX_PEERS + 19
+    assert f"10.1.{last // 250}.{last % 250}:8790" in peers
+
+
+def test_peer_table_prunes_peers_unseen_for_an_hour(tmp_path, monkeypatch):
+    import maestro.discovery as disc
+
+    path = tmp_path / "peers.json"
+    now = time.time()
+    path.write_text(json.dumps({
+        "10.0.0.1:8790": {"name": "old", "port": 8790, "last_seen": now - disc.PRUNE_AFTER_S - 1},
+        "static:lab": {"name": "lab", "url": "static:http://10.0.0.9:8790", "manual": True, "last_seen": now - 10 * disc.PRUNE_AFTER_S},
+    }), encoding="utf-8")
+    table = PeerTable(path)
+    table.upsert({"key": "10.0.0.2:8790", "name": "new", "port": 8790, "address": "10.0.0.2"})
+    assert set(table.load()) == {"static:lab", "10.0.0.2:8790"}
+
+
+def test_peer_table_writes_only_when_something_changed(tmp_path, monkeypatch):
+    import maestro.discovery as disc
+
+    table = PeerTable(tmp_path / "peers.json")
+    writes = []
+    real_save = table.save
+    monkeypatch.setattr(table, "save", lambda peers: writes.append(1) or real_save(peers))
+    clock = [1000.0]
+    monkeypatch.setattr(disc.time, "time", lambda: clock[0])
+    peer = {"key": "10.0.0.2:8790", "name": "b", "port": 8790, "address": "10.0.0.2", "url": "http://10.0.0.2:8790"}
+    table.upsert(dict(peer))
+    clock[0] += 1
+    table.upsert(dict(peer))  # the same announcement a second later: nothing to write
+    assert len(writes) == 1
+    clock[0] += disc.LAST_SEEN_REFRESH_S
+    table.upsert(dict(peer))  # the stored last_seen is getting old: refresh it
+    assert len(writes) == 2
+    table.upsert({**peer, "name": "renamed"})  # a real change is written at once
+    assert len(writes) == 3 and table.load()["10.0.0.2:8790"]["name"] == "renamed"
+
+
+def test_peer_table_load_cleans_entries_written_by_older_versions(tmp_path):
+    path = tmp_path / "peers.json"
+    path.write_text(json.dumps({
+        "10.0.0.1:8790": {"name": "\x1b[2Jevil\x07", "url": "http://10.0.0.1:8790\x1b[0m", "port": 8790, "last_seen": 1.0},
+        "junk": "not a peer",
+    }), encoding="utf-8")
+    peers = PeerTable(path).load()
+    assert peers == {"10.0.0.1:8790": {"name": "[2Jevil", "url": "http://10.0.0.1:8790[0m", "port": 8790, "last_seen": 1.0}}
+
+
+def test_peers_cli_list_prints_no_control_characters(tmp_path, monkeypatch, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "peers.json").write_text(json.dumps({
+        "10.0.0.1:8790": {"name": "\x1b]0;owned\x07evil", "url": "http://10.0.0.1:8790", "port": 8790, "last_seen": time.time()},
+    }), encoding="utf-8")
+    assert _peers_cli(tmp_path, monkeypatch, "peers", "list") == 0
+    out = capsys.readouterr().out
+    assert "]0;ownedevil" in out and "\x1b" not in out and "\x07" not in out
+
+
+def test_discovery_is_off_for_a_loopback_daemon_unless_switched_on(monkeypatch):
+    monkeypatch.delenv("MAESTRO_DISCOVERY", raising=False)
+    assert discovery_enabled(loopback_only=True) is False
+    assert discovery_enabled(loopback_only=False) is True
+    for value in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("MAESTRO_DISCOVERY", value)
+        assert discovery_enabled(loopback_only=True) is True
+    monkeypatch.setenv("MAESTRO_DISCOVERY", "0")
+    assert discovery_enabled(loopback_only=False) is False
+
+
+def test_loopback_daemon_does_not_announce_by_default(tmp_path, monkeypatch):
+    from maestro.daemon import MaestroDaemon
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.delenv("MAESTRO_DISCOVERY", raising=False)
+    monkeypatch.setenv("MAESTRO_DISCOVERY_PORT", str(_ephemeral_udp_port()))
+    d = MaestroDaemon(state_dir=home, start_http=True, port=0, max_retries=0, backoff_s=0)
+    try:
+        assert d._presence is None
+    finally:
+        d.stop()
+
+
+def test_peer_table_load_ignores_a_file_that_is_not_an_object(tmp_path):
+    path = tmp_path / "peers.json"
+    path.write_text("[1, 2]", encoding="utf-8")
+    assert PeerTable(path).load() == {}
