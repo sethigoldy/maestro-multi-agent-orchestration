@@ -24,7 +24,7 @@ def utcnow_iso() -> str:
 @dataclass
 class TaskEvent:
     task_id: str
-    type: str  # "state" | "output" | "question" | "usage" | "verify" | "artifact"
+    type: str  # "state" | "output" | "question" | "usage" | "verify" | "artifact" | "branch"
     data: dict[str, Any] = field(default_factory=dict)
     ts: str = field(default_factory=utcnow_iso)
     seq: int = 0
@@ -43,6 +43,11 @@ class Subscription:
         # The highest seq published before this subscription began. Events
         # with a higher seq are live; the rest were replayed from the ring.
         self.start_seq = start_seq
+
+    @property
+    def overflowed(self) -> bool:
+        """True when this subscriber fell ``maxsize`` events behind and events were dropped."""
+        return bool(getattr(self._q, "overflowed", False))
 
     def get(self, timeout: float | None = None) -> TaskEvent | None:
         try:
@@ -93,16 +98,28 @@ class EventBus:
                 del self._ring[: len(self._ring) - self._ring_size]
             targets = [q for q, types in self._subs if not types or event.type in types]
         for q in targets:
-            q.put(event)
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                q.overflowed = True  # type: ignore[attr-defined]  # read by Subscription.overflowed
         return event
 
-    def subscribe(self, *types: str) -> Subscription:
-        q: "queue.Queue[TaskEvent]" = queue.Queue()
+    def subscribe(self, *types: str, maxsize: int = 0) -> Subscription:
+        """Subscribe to events of ``types`` (all types when none are given).
+
+        ``maxsize`` bounds the subscriber's queue; 0, the default, means no
+        bound. A bounded subscriber catches up on at most ``maxsize`` of the
+        newest events, and once its queue is full further events are dropped
+        and :attr:`Subscription.overflowed` becomes True.
+        """
+        q: "queue.Queue[TaskEvent]" = queue.Queue(maxsize=maxsize)
         with self._lock:
             # Catch up on recent history first (newest last).
-            for event in list(self._ring):
-                if not types or event.type in types:
-                    q.put(event)
+            backlog = [event for event in self._ring if not types or event.type in types]
+            if maxsize:
+                backlog = backlog[-maxsize:]
+            for event in backlog:
+                q.put(event)
             self._subs.append((q, types))
             start_seq = self._ring[-1].seq if self._ring else 0
         return Subscription(self, q, types, start_seq)

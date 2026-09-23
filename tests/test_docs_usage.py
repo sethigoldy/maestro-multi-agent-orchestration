@@ -32,6 +32,7 @@ MCP_TOOLS = (
     "cancel_task",
     "answer_task_question",
     "followup",
+    "rename_task_branch",
 )
 
 CLI_COMMANDS = (
@@ -42,6 +43,7 @@ CLI_COMMANDS = (
     "task tail",
     "task audit",
     "task continue",
+    "task rename-branch",
     "dashboard",
     "agents add",
     "agents discover",
@@ -65,6 +67,7 @@ HANDOFF_FIELDS = (
     "verification",
     "verification_command",
     "commit_policy",
+    "branch",
     "budget_hint",
     "sensitive",
     "max_depth_remaining",

@@ -656,7 +656,8 @@ def test_prepare_branch_existing_and_forced_failure(daemon, tmp_path, monkeypatc
         return _Fail()
 
     monkeypatch.setattr(dm.subprocess, "run", _fake_run)
-    assert daemon._prepare_branch(ws, "task-y", "branch") is None
+    with pytest.raises(RuntimeError, match="could not check out the task branch 'maestro/task-y': forced"):
+        daemon._prepare_branch(ws, "task-y", "branch")
 
 
 def test_verification_command_mode_failed(daemon, tmp_path, binpath):
@@ -1590,14 +1591,15 @@ def test_mcp_tools_keep_stable_signatures():
     from maestro import mcp_server
 
     expected = {
-        "delegate": ["workspace", "handoff_file"],
+        "delegate": ["workspace", "handoff_file", "branch"],
         "task_status": ["workspace", "task_id"],
         "list_tasks": ["workspace"],
         "task_wait": ["workspace", "task_id", "timeout"],
         "agents_list": [],
         "cancel_task": ["workspace", "task_id", "reason"],
         "answer_task_question": ["workspace", "task_id", "answer"],
-        "followup": ["workspace", "task_id", "instruction", "context_mode"],
+        "followup": ["workspace", "task_id", "instruction", "context_mode", "branch"],
+        "rename_task_branch": ["workspace", "task_id", "branch"],
     }
     for name, params in expected.items():
         sig = list(inspect.signature(getattr(mcp_server, name)).parameters)
