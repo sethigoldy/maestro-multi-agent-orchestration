@@ -610,7 +610,7 @@ backend = "filesystem"    # filesystem (default) | memvara
 
 **Routing defaults:** when a handoff names no target agent, `[defaults].agent`
 becomes the target and `[defaults].model`/`effort` fill in what the handoff left
-unset. If neither the handoff nor `[defaults]` names an agent, Maestro does not
+unset, unless the target agent's registry entry sets its own value. If neither the handoff nor `[defaults]` names an agent, Maestro does not
 guess: the task parks in state `input-required` with a question listing every
 available agent, and resumes via MCP `answer_task_question` (a bare agent name,
 `agent=… model=…` pairs, or JSON). Set `[defaults]` to stop being asked.

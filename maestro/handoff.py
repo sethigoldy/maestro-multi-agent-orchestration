@@ -204,11 +204,11 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
     budget_hint = expectations.get("budget_hint")
     if budget_hint is not None and (isinstance(budget_hint, bool) or not isinstance(budget_hint, (int, float))):
         raise ValueError(f"budget_hint must be a number when set, got {type(budget_hint).__name__}")
-    raw_depth = constraints.get("max_depth_remaining", 3)
-    try:
-        max_depth_remaining = int(raw_depth)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"max_depth_remaining must be an integer, got {raw_depth!r}") from exc
+    # Checked like max_bounces: a real integer only. int() would quietly turn
+    # 0.5 into 0, true into 1 and "2" into 2.
+    max_depth_remaining = constraints.get("max_depth_remaining", 3)
+    if isinstance(max_depth_remaining, bool) or not isinstance(max_depth_remaining, int):
+        raise ValueError(f"max_depth_remaining must be an integer, got {max_depth_remaining!r}")
     doc = HandoffDoc(
         title=_text(handoff, "title"),
         request=_text(handoff, "request"),

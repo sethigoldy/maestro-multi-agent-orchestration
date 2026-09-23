@@ -618,3 +618,302 @@ def test_fixer_defaults_to_the_explicit_target_not_the_preset_implementer():
     doc = HandoffDoc(title="t", request="r", target_agent="claude", explicit_target=True)
     expand(preset, doc)
     assert doc.target_agent == "claude" and doc.fix_agent == "claude"
+
+
+# ---------------------------------------------------------------------------
+# Review finding 1: a placeholder inside a shell's -c script is shell-quoted.
+# A template such as ``sh -c "mytool {prompt}"`` hands the script to a shell,
+# so a raw prompt would run its backticks, $(...) and ; as commands. Every
+# other argument still receives the value raw, as a single argument.
+# ---------------------------------------------------------------------------
+
+_HOSTILE_PROMPT = "fix it; touch pwned $(touch pwned2) `touch pwned3` 'single' \"double\" \\ end"
+
+
+@pytest.mark.parametrize(
+    "template,script_index",
+    [
+        ('sh -c "mytool --msg {prompt}"', 2),
+        ('/bin/bash -lc "mytool --msg {prompt}"', 2),
+        ('bash -eo pipefail -c "mytool --msg {prompt}"', 4),
+        ('zsh -c -- "mytool --msg {prompt}"', 3),
+        ('dash -c -e "mytool --msg {prompt}"', 3),
+        ('ksh +x -c "mytool --msg {prompt}"', 3),
+        ('bash --rcfile /tmp/rc -c "mytool --msg {prompt}"', 4),
+        ('bash --login -c "mytool --msg {prompt}"', 3),
+        ('bash -O extglob -c "mytool --msg {prompt}"', 4),
+    ],
+)
+def test_generic_shell_script_placeholder_is_quoted(template, script_index):
+    import shlex
+
+    cmd = _generic(template).build_command(_HOSTILE_PROMPT, Path("/w"), "t1", {})
+    assert cmd[script_index] == "mytool --msg " + shlex.quote(_HOSTILE_PROMPT)
+    assert shlex.split(cmd[script_index]) == ["mytool", "--msg", _HOSTILE_PROMPT]
+
+
+def test_generic_shell_script_quotes_workspace_and_task_id():
+    cmd = _generic('sh -c "cd {workspace} && mytool --id {task_id}"', input_mode="stdin").build_command(
+        "ignored", Path("/a b/it's"), "t1", {}
+    )
+    assert cmd == ["sh", "-c", "cd '/a b/it'\"'\"'s' && mytool --id t1"]
+
+
+def test_generic_shell_positional_arguments_stay_raw():
+    # Words after the script are the script's $0, $1, ...; they are not parsed
+    # by the shell, so the value is passed raw as one argument.
+    cmd = _generic("""sh -c 'mytool --msg "$1"' sh {prompt}""").build_command(_HOSTILE_PROMPT, Path("/w"), "t1", {})
+    assert cmd == ["sh", "-c", 'mytool --msg "$1"', "sh", _HOSTILE_PROMPT]
+
+
+def test_generic_shell_without_c_flag_passes_values_raw():
+    cmd = _generic("bash ./run.sh --msg={prompt} {workspace}").build_command(_HOSTILE_PROMPT, Path("/a b"), "t1", {})
+    assert cmd == ["bash", "./run.sh", f"--msg={_HOSTILE_PROMPT}", "/a b"]
+
+
+def test_generic_non_shell_program_passes_values_raw():
+    cmd = _generic("mytool -c {prompt} --msg={prompt}").build_command(_HOSTILE_PROMPT, Path("/w"), "t1", {})
+    assert cmd == ["mytool", "-c", _HOSTILE_PROMPT, f"--msg={_HOSTILE_PROMPT}"]
+
+
+def test_generic_shell_with_c_flag_but_no_script_word():
+    assert _generic("sh -c").build_command("p", Path("/w"), "t1", {}) == ["sh", "-c"]
+    assert _generic("sh -c --").build_command("p", Path("/w"), "t1", {}) == ["sh", "-c", "--"]
+
+
+def test_generic_shell_arguments_after_double_dash_without_c_stay_raw():
+    cmd = _generic("bash -- ./run.sh {prompt}").build_command(_HOSTILE_PROMPT, Path("/w"), "t1", {})
+    assert cmd == ["bash", "--", "./run.sh", _HOSTILE_PROMPT]
+
+
+def test_generic_fish_script_uses_fish_quoting():
+    prompt = "a\\'; touch pwned; echo 'b"
+    cmd = _generic('fish -c "mytool {prompt}"').build_command(prompt, Path("/w"), "t1", {})
+    assert cmd == ["fish", "-c", "mytool 'a\\\\\\'; touch pwned; echo \\'b'"]
+    long_form = _generic('fish --command="mytool {prompt}"').build_command("x y", Path("/w"), "t1", {})
+    assert long_form == ["fish", "--command=mytool 'x y'"]
+    separate = _generic('fish --login --command "mytool {prompt}"').build_command("x y", Path("/w"), "t1", {})
+    assert separate == ["fish", "--login", "--command", "mytool 'x y'"]
+    init = _generic('fish -C "set x 1" -c "mytool {prompt}"').build_command("x y", Path("/w"), "t1", {})
+    assert init == ["fish", "-C", "set x 1", "-c", "mytool 'x y'"]
+
+
+@pytest.mark.parametrize("shell", ["sh", "bash", "zsh", "dash", "ksh"])
+def test_generic_shell_script_runs_without_injection(tmp_path, shell):
+    """End to end: the shell receives the prompt as text and runs nothing from it."""
+    import shutil as _shutil
+
+    if _shutil.which(shell) is None:
+        pytest.skip(f"{shell} is not installed")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    out = tmp_path / "out.txt"
+    adapter = _generic(f"{shell} -c \"printf '%s' {{prompt}} > '{out}'\"")
+    result = adapter.run(_HOSTILE_PROMPT, workspace, "t1", settings={}, timeout=30, log_dir=tmp_path / "logs")
+    assert result.ok, result.error
+    assert out.read_text(encoding="utf-8") == _HOSTILE_PROMPT
+    assert sorted(p.name for p in workspace.iterdir()) == []
+
+
+# ---------------------------------------------------------------------------
+# Review finding 2: per-task model and effort reach only the task's target.
+# Fallback agents, gate agents and a separate fixer run with their own
+# registry settings, and [defaults] never overrides a registry value.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def maestro_daemon(tmp_path, monkeypatch):
+    from maestro.daemon import MaestroDaemon
+
+    home = tmp_path / "maestro-home"
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    d = MaestroDaemon(state_dir=home, start_http=False, max_retries=0, backoff_s=0)
+    yield d
+    d.stop()
+
+
+def _task_doc(**kw):
+    from maestro.handoff import HandoffDoc
+
+    base = dict(title="t", request="r", verification="none", commit_policy="no-commit", target_agent="codex", explicit_target=True)
+    base.update(kw)
+    return HandoffDoc(**base)
+
+
+def test_turn_settings_give_other_agents_their_registry_model_and_effort():
+    from maestro.daemon import MaestroDaemon
+
+    doc = _task_doc(agent_settings={"model": "gpt-task", "effort": "max", "extra": 1})
+    cursor = AgentSpec(name="cursor", kind="cursor", model="sonnet-4")
+    settings = MaestroDaemon._turn_settings(cursor, doc)
+    assert settings["model"] == "sonnet-4" and "effort" not in settings
+    assert settings["extra"] == 1  # other per-task keys still reach every agent
+    cline = AgentSpec(name="cline", kind="cline", effort="high")
+    cmd = ClineAdapter(cline).build_command("p", Path("/w"), "t1", MaestroDaemon._turn_settings(cline, doc))
+    assert cmd[cmd.index("--thinking") + 1] == "high"
+
+
+def test_turn_settings_let_the_task_override_win_for_the_target():
+    from maestro.daemon import MaestroDaemon
+
+    doc = _task_doc(agent_settings={"model": "gpt-task", "effort": "max"})
+    codex = AgentSpec(name="codex", kind="codex", model="gpt-registry", effort="low")
+    settings = MaestroDaemon._turn_settings(codex, doc)
+    assert settings["model"] == "gpt-task" and settings["effort"] == "max"
+
+
+def test_cline_unknown_task_effort_falls_back_to_registry_effort():
+    adapter = ClineAdapter(AgentSpec(name="cline", kind="cline", effort="medium"))
+    cmd = adapter.build_command("p", Path("/w"), "t1", {"effort": "max"})
+    assert cmd[cmd.index("--thinking") + 1] == "medium"
+    bare = ClineAdapter(AgentSpec(name="cline", kind="cline"))
+    assert "--thinking" not in bare.build_command("p", Path("/w"), "t1", {"effort": "max"})
+    assert "--thinking" not in ClineAdapter(None).build_command("p", Path("/w"), "t1", {"effort": "max"})
+
+
+def test_defaults_do_not_override_the_target_registry_model_or_effort(maestro_daemon):
+    maestro_daemon.registry.save(AgentSpec(name="codex", kind="codex", model="gpt-registry", effort="low"))
+    maestro_daemon.maestro.config["defaults"] = {"agent": "codex", "model": "gpt-default", "effort": "max"}
+    doc = _task_doc(target_agent="codex", explicit_target=False)
+    assert maestro_daemon._apply_defaults(doc) is True
+    assert doc.agent_settings == {}
+    settings = maestro_daemon._turn_settings(maestro_daemon.registry.get("codex"), doc)
+    assert settings["model"] == "gpt-registry" and settings["effort"] == "low"
+
+
+def test_defaults_fill_the_target_when_its_registry_sets_nothing(maestro_daemon):
+    maestro_daemon.maestro.config["defaults"] = {"agent": "codex", "model": "gpt-default", "effort": "max"}
+    doc = _task_doc(target_agent="codex", explicit_target=False)
+    maestro_daemon._apply_defaults(doc)
+    assert doc.agent_settings == {"model": "gpt-default", "effort": "max"}
+
+
+def test_fallback_agent_runs_with_its_own_registry_model(maestro_daemon, tmp_path, monkeypatch):
+    """End to end: the target fails, and the Cursor fallback keeps its model."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    args_file = tmp_path / "cursor-args.txt"
+    for name, body in (
+        ("codex", "cat > /dev/null\nexit 1"),
+        ("cursor-agent", f'printf "%s\\n" "$@" > "{args_file}"\ncat > /dev/null\necho "{{}}"\nexit 0'),
+    ):
+        path = bindir / name
+        path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+        path.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    maestro_daemon.registry.save(AgentSpec(name="cursor", kind="cursor", model="sonnet-4"))
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    doc = _task_doc(fallback=["cursor"], agent_settings={"model": "gpt-task"})
+    started = maestro_daemon.delegate(doc, workspace)
+    maestro_daemon.wait(started["task_id"], timeout=30)
+    args = args_file.read_text(encoding="utf-8").splitlines()
+    assert args[args.index("--model") + 1] == "sonnet-4"
+
+
+# ---------------------------------------------------------------------------
+# Review finding 3: the daemon checks skill paths against the task workspace.
+# ---------------------------------------------------------------------------
+
+def test_delegate_resolves_relative_skill_paths_against_the_workspace(maestro_daemon, tmp_path, monkeypatch):
+    workspace = tmp_path / "ws"
+    _skill_dir(workspace / "skills" / "pdf")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    doc = _task_doc(target_agent="nobody-installed", context_entries=[{"label": "pdf", "kind": "skill", "path": "skills/pdf"}])
+    started = maestro_daemon.delegate(doc, workspace)
+    maestro_daemon.wait(started["task_id"], timeout=30)
+    # A skill that exists only relative to the daemon's working directory is refused.
+    _skill_dir(cwd / "skills" / "other")
+    other = _task_doc(context_entries=[{"label": "other", "kind": "skill", "path": "skills/other"}])
+    with pytest.raises(ValueError, match="directory not found"):
+        maestro_daemon.delegate(other, workspace)
+
+
+# ---------------------------------------------------------------------------
+# Review finding 4: an instructions file that is not UTF-8 is never
+# overwritten, is reported by status, and does not break other integrations.
+# ---------------------------------------------------------------------------
+
+def test_block_integration_refuses_a_file_that_is_not_utf8(fake_home):
+    from maestro.integrations import INTEGRATIONS
+
+    path = fake_home / ".codex" / "AGENTS.md"
+    path.parent.mkdir()
+    original = b"caf\xe9 notes written in Latin-1\n"
+    path.write_bytes(original)
+    integration = INTEGRATIONS["codex"]()
+    state = integration.status(fake_home)
+    assert state["installed"] is False and "not valid UTF-8" in state["error"]
+    installed = integration.install_skill(fake_home, "skill text")
+    assert installed.ok is False and installed.action == "error" and "not valid UTF-8" in installed.detail
+    removed = integration.uninstall_skill(fake_home)
+    assert removed.ok is False and removed.action == "error" and "not valid UTF-8" in removed.detail
+    assert path.read_bytes() == original
+
+
+def test_status_reports_an_unreadable_instructions_file(fake_home, monkeypatch):
+    from maestro.integrations import INTEGRATIONS
+
+    path = fake_home / ".copilot" / "instructions.md"
+    path.parent.mkdir()
+    path.write_text("mine", encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def guarded_read_text(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError("no access")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", guarded_read_text)
+    state = INTEGRATIONS["copilot"]().status(fake_home)
+    assert state["installed"] is False and "no access" in state["error"]
+
+
+def test_manager_uninstall_survives_a_file_that_is_not_utf8(fake_home):
+    from maestro.integrations import INTEGRATIONS, SkillManager
+
+    INTEGRATIONS["claude_code"]().install_skill(fake_home, "skill text")
+    path = fake_home / ".codex" / "AGENTS.md"
+    path.parent.mkdir()
+    path.write_bytes(b"\xff\xfe not utf-8")
+    manager = SkillManager(home=fake_home)
+    assert "error" in {entry["kind"]: entry for entry in manager.status()}["codex"]
+    results = {r.kind: r for r in manager.uninstall()}
+    assert results["claude_code"].ok and results["claude_code"].action == "uninstalled"
+    assert results["codex"].ok is False and "not valid UTF-8" in results["codex"].detail
+    assert path.read_bytes() == b"\xff\xfe not utf-8"
+
+
+# ---------------------------------------------------------------------------
+# Review finding 5: max_depth_remaining must be a real integer.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", [0.5, 2.0, True, "2", [3]])
+def test_from_dict_rejects_a_max_depth_that_is_not_an_integer(value):
+    from maestro.handoff import from_dict
+
+    with pytest.raises(ValueError, match="max_depth_remaining must be an integer"):
+        from_dict(_payload(constraints={"max_depth_remaining": value}))
+
+
+def test_handoff_documents_written_by_maestro_still_load():
+    from maestro.handoff import from_dict, from_toml, to_toml
+
+    doc = _task_doc(max_depth_remaining=2)
+    assert from_dict(json.loads(json.dumps(doc.to_dict()))).max_depth_remaining == 2
+    assert from_toml(to_toml(doc)).max_depth_remaining == 2
+    assert from_dict(_payload()).max_depth_remaining == 3
+
+
+# ---------------------------------------------------------------------------
+# Review finding 6: save() removes its temporary file on any failure.
+# ---------------------------------------------------------------------------
+
+def test_registry_save_cleans_up_when_the_text_cannot_be_encoded(tmp_path):
+    registry = AgentRegistry(tmp_path)
+    with pytest.raises(UnicodeEncodeError):
+        registry.save(AgentSpec(name="x", kind="codex", token="secret\ud800token"))
+    assert list(registry.dir.iterdir()) == []

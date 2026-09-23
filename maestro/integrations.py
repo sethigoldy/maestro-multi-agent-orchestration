@@ -125,6 +125,21 @@ class AgentIntegration:
         raise NotImplementedError
 
 
+def _read_instructions(path: Path) -> tuple[str | None, str | None]:
+    """Read an instructions file as UTF-8 text; return (text, None) or (None, error).
+
+    A file that cannot be read, or whose bytes are not valid UTF-8, gives an
+    error text instead of raising. Callers must then leave the file alone,
+    because writing it back would destroy text that the user wrote.
+    """
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except UnicodeDecodeError as exc:
+        return None, f"cannot read {path}: the file is not valid UTF-8 text ({exc}); Maestro left it unchanged"
+    except OSError as exc:
+        return None, f"cannot read {path}: {exc}"
+
+
 class _BlockIntegration(AgentIntegration):
     """Agents whose global instructions live in one markdown file."""
 
@@ -133,10 +148,9 @@ class _BlockIntegration(AgentIntegration):
 
     def install_skill(self, home: Path, content: str) -> IntegrationResult:
         path = self.instructions_path(home)
-        try:
-            existing = path.read_text(encoding="utf-8") if path.is_file() else ""
-        except OSError as exc:
-            return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot read {path}: {exc}", str(path))
+        existing, error = _read_instructions(path) if path.is_file() else ("", None)
+        if existing is None:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error or f"cannot read {path}", str(path))
         new_text, present = _replace_block(existing, _managed_block(content))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -150,10 +164,9 @@ class _BlockIntegration(AgentIntegration):
         path = self.instructions_path(home)
         if not path.is_file():
             return IntegrationResult(self.kind, self.display_name, True, "skipped", "nothing installed", str(path))
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            return IntegrationResult(self.kind, self.display_name, False, "error", f"cannot read {path}: {exc}", str(path))
+        text, error = _read_instructions(path)
+        if text is None:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error or f"cannot read {path}", str(path))
         new_text, removed = _remove_block(text)
         if not removed:
             return IntegrationResult(self.kind, self.display_name, True, "skipped", "not installed", str(path))
@@ -167,14 +180,19 @@ class _BlockIntegration(AgentIntegration):
         return IntegrationResult(self.kind, self.display_name, True, "uninstalled", f"{self.mechanism} removed", str(path))
 
     def status(self, home: Path) -> dict[str, Any]:
+        """Report whether the managed block is present.
+
+        When the file exists but cannot be read (including a file that is not
+        UTF-8), ``installed`` is False and an ``error`` key says why, because
+        Maestro cannot tell whether its block is there.
+        """
         path = self.instructions_path(home)
         installed = False
+        error = None
         if path.is_file():
-            try:
-                installed = _BEGIN in path.read_text(encoding="utf-8")
-            except OSError:
-                installed = False
-        return {
+            text, error = _read_instructions(path)
+            installed = text is not None and _BEGIN in text
+        info = {
             "kind": self.kind,
             "display_name": self.display_name,
             "mechanism": self.mechanism,
@@ -182,6 +200,9 @@ class _BlockIntegration(AgentIntegration):
             "detected": self.detect(),
             "installed": installed,
         }
+        if error is not None:
+            info["error"] = error
+        return info
 
 
 class CodexIntegration(_BlockIntegration):
@@ -572,7 +593,9 @@ class SkillManager:
         results: list[IntegrationResult] = []
         for integration in self.integrations():
             state = integration.status(self.home)
-            if state["installed"] or state.get("legacy_installed"):
+            # A file that cannot be read may still hold the block, so it is
+            # included; its uninstall reports the problem and leaves it alone.
+            if state["installed"] or state.get("legacy_installed") or state.get("error"):
                 results.append(integration.uninstall_skill(self.home))
         return results
 

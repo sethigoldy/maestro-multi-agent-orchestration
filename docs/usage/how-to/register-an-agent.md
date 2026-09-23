@@ -86,9 +86,33 @@ maestro agents add --name mytool --kind generic \
   arguments with shell quoting rules, and then replaces each placeholder inside
   the one argument that holds it. A value that contains spaces or quotes, such
   as `/Users/me/My Projects/app`, therefore stays a single argument, and text
-  inside the prompt is never treated as a placeholder. No shell runs the
-  command. If your prompt is long, pipe it instead: `--input-mode stdin` and
-  drop `{prompt}` from the command.
+  inside the prompt is never treated as a placeholder. Maestro starts the
+  program directly, without a shell, so in an ordinary argument the value is
+  passed exactly as it is, with no quoting added. This holds for an argument
+  that is only the placeholder (`{prompt}`) and for one that has text around
+  it (`--msg={prompt}`). If your prompt is long, pipe it instead:
+  `--input-mode stdin` and drop `{prompt}` from the command.
+- If the command itself starts a shell with a script, as in
+  `sh -c "mytool --msg {prompt}"`, that shell reads the script again and would
+  run any `$(...)`, backticks or `;` in the prompt as commands. For this case
+  Maestro shell-quotes each value that it places inside the script argument.
+  The rule applies when the program's file name is `sh`, `bash`, `zsh`, `dash`,
+  `ksh` or `fish` and the argument is the script that follows `-c`, including
+  combined options such as `-lc` or `-ec`. The script is the first word after
+  `-c` that is not an option; Maestro skips options such as `-e`,
+  `-o pipefail` and `--` on the way. For fish it also recognises
+  `--command SCRIPT` and `--command=SCRIPT`. fish gets its own quoting style,
+  because its single quotes treat a backslash differently; the other shells
+  get POSIX single quotes. Write the placeholder bare inside the script
+  (`mytool --msg {prompt}`), not wrapped in quotes of your own, because the
+  added quotes would then cancel yours. Only the script after `-c` is quoted,
+  so do not put a placeholder in any other argument that the shell runs as
+  code, such as the value of fish's `-C`. Words after the script are the
+  script's `$0`, `$1` and so on, and receive the value raw, so
+  `sh -c 'mytool --msg "$1"' sh {prompt}` is a safe alternative. The rule
+  looks only at the program named first in the command, so a shell started
+  through another program, such as `env sh -c "..."`, is not recognised and
+  gets raw values. Start the shell directly in that case.
 - `--output-format jsonl` makes Maestro parse `cost_usd` / usage hints from JSON
   lines automatically — this is how budget caps see costs for that agent.
   Other formats: `text` (default), `rpc`.

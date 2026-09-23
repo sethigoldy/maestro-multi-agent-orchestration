@@ -14,6 +14,51 @@ from .base import AdapterPreflight, BaseAdapter
 #: The placeholders a generic command template may use.
 _PLACEHOLDER_RE = re.compile(r"\{(prompt|workspace|task_id)\}")
 
+#: Programs whose ``-c`` argument is a script that the shell parses again.
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish"})
+
+
+def _fish_quote(value: str) -> str:
+    """Quote ``value`` for fish, whose single quotes treat \\ and \\' as escapes."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _shell_script_index(words: list[str]) -> int | None:
+    """Index of the script word when the template runs a shell with ``-c``.
+
+    Returns None when the program (the file name of the first word) is not one
+    of :data:`_SHELLS`, or when no ``-c`` option is given. Short options are
+    read the way the shells read them: ``-c`` may be combined with other
+    letters (``-lc``, ``-ec``), and an option cluster that ends in ``o`` or
+    ``O`` takes the next word as its value (``-o pipefail``). fish also accepts
+    ``--command SCRIPT`` and ``--command=SCRIPT``. The script is the first word
+    after the ``-c`` option that is not itself an option; ``--`` ends the
+    options. Words before ``-c`` that are not options (for example the value
+    of ``--rcfile FILE``) are skipped, so the search errs towards quoting.
+    """
+    if not words or Path(words[0]).name not in _SHELLS:
+        return None
+    has_command_flag = False
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word == "--":
+            index += 1
+            return index if has_command_flag and index < len(words) else None
+        if word.startswith("--command="):
+            return index
+        if word == "--command":
+            has_command_flag = True
+        elif len(word) > 1 and word[0] in "-+" and not word.startswith("--"):
+            if word[0] == "-" and "c" in word[1:]:
+                has_command_flag = True
+            if word[-1] in "oO":
+                index += 1  # the option's value, such as "pipefail"
+        elif has_command_flag and not word.startswith("--"):
+            return index  # the first word after -c that is not an option
+        index += 1
+    return None
+
 
 class GenericAdapter(BaseAdapter):
     """Runs a user-declared command template.
@@ -64,6 +109,12 @@ class GenericAdapter(BaseAdapter):
         an apostrophe stays one argument, and a prompt that happens to contain
         the text ``{workspace}`` is passed through unchanged. In ``stdin`` mode
         the prompt is piped, so ``{prompt}`` is left as written.
+
+        One argument is treated differently: when the template starts a shell
+        with ``-c`` (for example ``sh -c "mytool {prompt}"``), that shell parses
+        its script argument again, so a raw prompt could run commands. Values
+        placed in that script argument are shell-quoted; every other argument
+        receives the value raw.
         """
         assert self.spec is not None and self.spec.command
         try:
@@ -73,7 +124,17 @@ class GenericAdapter(BaseAdapter):
         values = {"workspace": str(workspace), "task_id": task_id}
         if self.input_mode() != "stdin":
             values["prompt"] = prompt
-        return [_PLACEHOLDER_RE.sub(lambda match: values.get(match.group(1), match.group(0)), word) for word in words]
+        script_index = _shell_script_index(words)
+        quote = _fish_quote if script_index is not None and Path(words[0]).name == "fish" else shlex.quote
+
+        def raw(match: re.Match[str]) -> str:
+            return values.get(match.group(1), match.group(0))
+
+        def quoted(match: re.Match[str]) -> str:
+            name = match.group(1)
+            return quote(values[name]) if name in values else match.group(0)
+
+        return [_PLACEHOLDER_RE.sub(quoted if index == script_index else raw, word) for index, word in enumerate(words)]
 
     def parse_line(self, line: str) -> dict[str, Any] | None:
         if self.spec is None or self.spec.output_format != "jsonl":

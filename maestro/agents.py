@@ -294,7 +294,9 @@ class AgentRegistry:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(text)
             os.replace(temp, path)
-        except OSError:
+        except BaseException:
+            # Any failure, including a UnicodeEncodeError from a lone surrogate,
+            # must not leave a temporary file behind: it can hold a token.
             temp.unlink(missing_ok=True)
             raise
         return spec

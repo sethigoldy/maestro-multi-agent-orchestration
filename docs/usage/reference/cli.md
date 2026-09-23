@@ -93,9 +93,9 @@ inside `custom_instructions` of `~/.openhands/agent_settings.json`.
 | Subcommand | Behavior |
 |---|---|
 | `list` | JSON: the managed skill, its source path, and every supported agent |
-| `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed` |
+| `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed`. Codex also reports `legacy_installed`, which is true when an old block is still in `~/.codex/instructions.md`. For agents whose instructions live in one markdown file, an `error` key appears when that file exists but cannot be read, for example because it is not valid UTF-8 text; `installed` is then false because Maestro cannot tell whether its block is there |
 | `install` | Installs the skill for every **detected** agent by default. `--agent NAME` targets one agent (adapter kind, binary name, or display name; installed even if not yet detected). `--all` installs for every supported agent regardless of detection. Updates are delete-then-reinstall: the existing skill is removed before the new one is written, so stale files from a previous Maestro version never survive |
-| `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed |
+| `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed. An instructions file that cannot be read or is not valid UTF-8 is never rewritten: `install` and `uninstall` report an error for that agent and leave the file as it is, and the other agents are handled normally |
 
 ## delegate
 

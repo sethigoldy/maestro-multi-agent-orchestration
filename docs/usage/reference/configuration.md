@@ -29,7 +29,10 @@ effort   = "max"            # optional: low | medium | high | xhigh | max
 Consulted at delegate time when a handoff names no target agent: `agent`
 becomes the task's target (as if explicitly chosen), `fallback` fills an empty
 fallback chain, and `model`/`effort` are applied to the chosen agent only when
-the handoff does not set them. An explicit handoff target always wins over
+neither the handoff nor that agent's registry entry sets them. A value in the
+agent's registry entry therefore beats `[defaults]`, and a value in the handoff
+beats both. Fallback agents never receive `[defaults].model` or `effort`; they
+run with their own registry settings. An explicit handoff target always wins over
 `[defaults].agent`. If neither the handoff nor `[defaults]` names an agent,
 the task parks in state `input-required` with a question listing every
 available agent; answer it via MCP `answer_task_question` (a bare agent name,

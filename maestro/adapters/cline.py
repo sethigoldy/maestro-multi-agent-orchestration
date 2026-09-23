@@ -36,7 +36,11 @@ class ClineAdapter(BaseAdapter):
         model = settings.get("model") or (self.spec.model if self.spec is not None else None)
         if model:
             command += ["--model", str(model)]
-        effort = settings.get("effort") or (self.spec.effort if self.spec is not None else None)
+        # A task effort cline does not understand (such as "max") falls back to
+        # the registry effort, so --thinking is not silently dropped.
+        effort = settings.get("effort")
+        if effort not in _CLINE_THINKING:
+            effort = self.spec.effort if self.spec is not None else None
         if effort in _CLINE_THINKING:
             command += ["--thinking", str(effort)]
         return command

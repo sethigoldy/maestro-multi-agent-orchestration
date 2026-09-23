@@ -62,7 +62,7 @@ gate fields behaves exactly as before (deterministic verification only). See
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `sensitive` | boolean | `false` | no | When true, the task pauses in `input-required` with an approval question before any agent runs |
-| `max_depth_remaining` | integer | `3` | no | Must be ≥ 0. Refuses nesting at/below 0; each follow-up decrements by one |
+| `max_depth_remaining` | integer | `3` | no | Must be an integer ≥ 0 (booleans, decimals such as `0.5` and strings such as `"2"` are rejected). Refuses nesting at/below 0; each follow-up decrements by one |
 
 ### `[[context]]` (array of tables)
 
@@ -90,7 +90,10 @@ directory or `SKILL.md` fails delegation before any agent runs.
 | *(any other key)* | — | Passed through to the adapter as a run setting; reserved key `maestro_handoff` (the full document) is added automatically for remote hops |
 
 Precedence for settings: `agent_settings` (this task) overrides the agent's
-registry entry, which overrides adapter defaults.
+registry entry, which overrides adapter defaults. `model` and `effort` apply to
+the target agent only. Fallback agents, gate agents and a fixer that is a
+different agent run with their own registry `model` and `effort`. Every other
+key reaches all of them.
 
 ## Validation rules
 
