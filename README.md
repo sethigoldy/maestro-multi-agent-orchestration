@@ -561,7 +561,8 @@ location (default: `$MAESTRO_WORKSPACE` or the current directory).
 | `maestro dashboard` | Terminal full-screen dashboard (SSE-driven) |
 | `maestro task list [--project DIR]` | List tasks (number or id) |
 | `maestro task status <id\|n>` | Show one task's current state (`task show`, `status`, and bare `task <n>` are aliases) |
-| `maestro task tail <id> [--all]` | Live-tail a task's event stream |
+| `maestro task tail <id\|n>` | Live-tail one task's event stream. Accepts a full task id or a task number; an unknown reference exits 2 |
+| `maestro task tail --all` | Live-tail the events of every task. Takes no task reference; giving both a reference and `--all` exits 2 |
 | `maestro task audit <id>` | Durable record: attempts, usage, errors, result files |
 | `maestro task receipt <id\|n> [--json]` | Execution receipt: state, per-attempt phase/duration/cost, verification result, gate verdicts, totals. Works while running and after restart; `--json` for stable machine-readable output |
 | `maestro agents list \| add \| remove \| discover \| register-discovered [--dry-run] \| status <name>` | Manage registered agents. `register-discovered` turns every discovered CLI into a registration, preserving existing ones (idempotent) |

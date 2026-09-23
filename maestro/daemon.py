@@ -1595,6 +1595,11 @@ class MaestroDaemon:
             return ref
         return self.maestro.resolve_task(ref)
 
+    def _registry_workspace(self, task_id: str) -> str | None:
+        """Return the workspace in the task's registry record, or None when there is no record."""
+        record = next((item for item in self.maestro._registry_records() if str(item.get("task_id")) == task_id), None)
+        return (record or {}).get("workspace")
+
     def status_a2a(self, task_id: str) -> dict[str, Any]:
         record = self._tasks.get(task_id)
         if record is not None:
@@ -1616,7 +1621,10 @@ class MaestroDaemon:
             # a missing/unknown status means the task's process is gone and it
             # can never finish on its own — report FAILED, not WORKING.
             state = _durable_state(claims, runtime)
-            workspace = claims.get("task_workspace")
+            # A task migrated from the legacy journal can lack the workspace
+            # claim; its registry record still names the workspace. This is
+            # the same fallback Maestro.status uses.
+            workspace = claims.get("task_workspace") or self._registry_workspace(task_id)
             branch = claims.get("task_branch")
             origin = claims.get("task_origin_agent")
             target = claims.get("task_target_agent")

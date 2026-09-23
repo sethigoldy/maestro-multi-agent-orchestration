@@ -255,6 +255,26 @@ def test_task_tail_unknown_task_id_exits_2(live_daemon, capsys):
     assert "Unknown task reference 'task-20260101-000000-abcdef'" in capsys.readouterr().err
 
 
+def test_task_tail_follows_a_migrated_task_without_a_workspace_claim(live_daemon, monkeypatch):
+    """A task migrated from the legacy journal is followed, not refused as unknown.
+
+    The legacy migration writes a ``task_workspace`` claim only when the old
+    journal had one, but it always puts the workspace in the registry record.
+    ``Maestro.status`` falls back to that record, and so must the daemon's
+    ``tasks/get`` answer that ``task tail`` checks.
+    """
+    tid = "task-20250101-000000-1e9ac1"
+    live_daemon.maestro._register_task(tid, "Legacy task", 1)
+    live_daemon.maestro._write_claim(tid, "task_status", "REVIEWING")
+    assert "task_workspace" not in live_daemon.maestro._claims(tid)
+    calls: list[str | None] = []
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: calls.append(task_id) or 0)
+    assert _run_main_with_timeout(["task", "tail", "1"]) == 0
+    assert calls == [tid]
+    record_workspace = live_daemon.maestro.status(tid)["workspace"]
+    assert live_daemon.status_a2a(tid)["metadata"]["workspace"] == record_workspace
+
+
 def test_task_tail_all_needs_no_reference(monkeypatch):
     monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
     calls: list[tuple[str, str | None]] = []

@@ -207,7 +207,9 @@ def _resolve_task_on_daemon(url: str, ref: str, token: str | None) -> str:
     does, and it refuses an unknown number with an error, which reaches the
     caller as a ValueError. The daemon accepts any well-formed task id without
     checking it, so a task that has no recorded workspace is treated as
-    unknown here. Every real task records the workspace it runs in.
+    unknown here. Every real task has a workspace: the daemon reports the
+    task's workspace claim, or for a task migrated from the legacy journal
+    without that claim, the workspace in its registry record.
     """
     result = _post_jsonrpc(url, "tasks/get", {"id": ref}, token=token)
     task = (result or {}).get("task") or {}

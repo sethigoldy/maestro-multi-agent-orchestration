@@ -182,29 +182,64 @@ def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, 
 
 _ARROW_UP = b"\x1b[A"
 _ARROW_DOWN = b"\x1b[B"
+# In application cursor mode a terminal sends the arrow keys as ESC O A and
+# ESC O B instead. The reader turns those into the usual ESC [ forms.
+_APP_ARROWS = {b"\x1bOA": _ARROW_UP, b"\x1bOB": _ARROW_DOWN}
 # How long to wait for the rest of an escape sequence after an ESC byte. A
 # terminal sends an arrow key's three bytes together; a lone ESC is the Esc key.
 _ESCAPE_WAIT_S = 0.05
 
 
-def _read_key(fd: int) -> bytes:
-    """Read one key press from ``fd``.
+class _KeyReader:
+    """Read key presses from ``fd``, one key per ``read`` call.
 
-    Most keys are one byte. The arrow keys arrive as ESC [ A and ESC [ B; if
-    only the ESC byte were read, the dashboard would take it as the Esc key
-    and quit. So after an ESC byte this reads the rest of the sequence when
-    it follows at once, and returns it whole. Returns b"" at end of input.
+    Most keys are one byte. The arrow keys arrive as ESC [ A and ESC [ B (or
+    ESC O A and ESC O B). If only the ESC byte were read, the dashboard would
+    take it as the Esc key and quit. So after an ESC byte the reader waits a
+    short time for each further byte of the sequence, and never waits longer
+    than that: a sequence that stops early is returned as it is, and the loop
+    ignores it.
+
+    When the byte after ESC does not start a sequence (Esc pressed twice, or
+    Alt plus a key), the reader returns a lone ESC and keeps that byte for the
+    next ``read`` call, so the byte is not lost.
     """
-    key = os.read(fd, 1)
-    if key != b"\x1b":
-        return key
-    ready, _, _ = select.select([fd], [], [], _ESCAPE_WAIT_S)
-    if not ready:
-        return key  # the Esc key on its own
-    second = os.read(fd, 1)
-    if second != b"[":
-        return key + second
-    return key + second + os.read(fd, 1)
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self._kept = b""
+
+    @property
+    def pending(self) -> bool:
+        """True when a kept byte is waiting; stdin will not report it as ready."""
+        return bool(self._kept)
+
+    def _next_byte(self) -> bytes:
+        if self._kept:
+            byte, self._kept = self._kept, b""
+            return byte
+        return os.read(self.fd, 1)
+
+    def _next_byte_soon(self) -> bytes:
+        """Return the next byte if it arrives within the escape wait, else b"".
+
+        Only called after ``_next_byte`` in the same ``read``, which has
+        already used up any kept byte, so this reads from ``fd`` directly.
+        """
+        ready, _, _ = select.select([self.fd], [], [], _ESCAPE_WAIT_S)
+        return os.read(self.fd, 1) if ready else b""
+
+    def read(self) -> bytes:
+        """Return the next key. Returns b"" at end of input."""
+        key = self._next_byte()
+        if key != b"\x1b":
+            return key
+        second = self._next_byte_soon()
+        if second not in (b"[", b"O"):
+            self._kept = second  # b"" when nothing followed: the Esc key on its own
+            return key
+        sequence = key + second + self._next_byte_soon()
+        return _APP_ARROWS.get(sequence, sequence)
 
 
 class _State:
@@ -347,6 +382,7 @@ def run(
         reader.start()
 
         stdin_fd = stdin.fileno()
+        keys = _KeyReader(stdin_fd)
         # Put the terminal in raw mode: canonical (line-buffered) input would
         # swallow single keystrokes, and ECHO would paint them over the frame.
         old_termios = None
@@ -360,12 +396,17 @@ def run(
         exit_code = 0
         try:
             while True:
-                try:
-                    ready, _, _ = select.select([stdin_fd, read_fd], [], [])
-                except KeyboardInterrupt:
-                    break  # Ctrl-C (raw mode passes ^C through as a byte too)
+                if keys.pending:
+                    # A byte kept back by the key reader is already read from
+                    # stdin, so select() would not report it. Handle it first.
+                    ready = [stdin_fd]
+                else:
+                    try:
+                        ready, _, _ = select.select([stdin_fd, read_fd], [], [])
+                    except KeyboardInterrupt:
+                        break  # Ctrl-C (raw mode passes ^C through as a byte too)
                 if stdin_fd in ready:
-                    key = _read_key(stdin_fd)
+                    key = keys.read()
                     if not key:
                         exit_code = 1  # stdin EOF (terminal closed)
                         break
