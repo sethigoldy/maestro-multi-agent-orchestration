@@ -296,9 +296,13 @@ changes `PATH`. The report covers:
   the configuration is invalid, the directory is unusable, or the configured
   storage backend cannot be loaded (for example `[storage] backend = "memvara"`
   when the `memvara` package is not installed).
-- **Daemon** — reachability resolved like the CLI (env URL or liveness-checked
-  `daemon.json` marker), with auth status (`none`, `token`, or `missing` on a
-  401). A missing daemon is reported, not failed.
+- **Daemon** — reachability resolved like the CLI (env URL, or the
+  `daemon.json` marker checked as `maestro daemon status` checks it: the
+  marker's process must be alive and confirmed to be the daemon that wrote
+  it), with auth status (`none`, `token`, or `missing` on a 401). A stale
+  marker (dead process, or a pid now used by another program) is reported
+  like no daemon, with `stale_marker: true` and a `detail` saying why. A
+  missing daemon is reported, not failed.
 - **Git** — installed and versioned.
 - **Agents** — every known CLI kind (found/version/status) plus registered
   agents; missing optional agents are reported, never treated as failures.
