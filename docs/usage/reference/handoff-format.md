@@ -39,7 +39,7 @@ with the task.
 | `mode` | string | `null` | no | Name of a `[modes.NAME]` work-mode preset. Expanded at delegate time: the preset's `implementer` becomes `target_agent` (unless one was set explicitly), and its optional slots fill in the fields below where they are absent |
 | `review_agent` | string | `null` | no | Agent for the LLM review gate turn after verification. Must differ from `target_agent` (self-review is refused) |
 | `verify_agent` | string | `null` | no | Agent for the optional LLM verification gate turn; runs in addition to, never instead of, the deterministic check |
-| `fix_agent` | string | `null` | no | Agent for auto-fix bounces after a failed gate. Defaults to the implementer (`target_agent`) when omitted |
+| `fix_agent` | string | `null` | no | Agent for auto-fix bounces after a failed gate. Defaults to the implementer (`target_agent`) when omitted, also when a `mode` preset without a `fixer` is applied to a handoff that names its own target |
 | `max_bounces` | integer | `2` (preset default) | no | Cap on auto-fix bounces; must be an integer ≥ 0 when set. `0` = park on the first issue |
 
 Work-mode precedence: explicit fields on the handoff beat the preset for that
@@ -64,7 +64,7 @@ gate fields behaves exactly as before (deterministic verification only). See
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `sensitive` | boolean | `false` | no | When true, the task pauses in `input-required` with an approval question before any agent runs |
-| `max_depth_remaining` | integer | `3` | no | Must be ≥ 0. Refuses nesting at/below 0; each follow-up decrements by one |
+| `max_depth_remaining` | integer | `3` | no | Must be an integer ≥ 0 (booleans, decimals such as `0.5` and strings such as `"2"` are rejected). Refuses nesting at/below 0; each follow-up decrements by one |
 
 ### `[[context]]` (array of tables)
 
@@ -92,7 +92,10 @@ directory or `SKILL.md` fails delegation before any agent runs.
 | *(any other key)* | — | Passed through to the adapter as a run setting; reserved key `maestro_handoff` (the full document) is added automatically for remote hops |
 
 Precedence for settings: `agent_settings` (this task) overrides the agent's
-registry entry, which overrides adapter defaults.
+registry entry, which overrides adapter defaults. `model` and `effort` apply to
+the target agent only. Fallback agents, gate agents and a fixer that is a
+different agent run with their own registry `model` and `effort`. Every other
+key reaches all of them.
 
 ## Validation rules
 
@@ -108,6 +111,7 @@ A handoff is rejected with a `ValueError` when any of these holds:
 - any `fallback` entry is empty
 - `max_bounces` is set but not an integer ≥ 0 (booleans are rejected)
 - a `[[context]]` entry is not a table, has no non-empty `label`, sets both or neither of `text`/`path`, names an unknown `kind`, or carries a `phases` list with unknown/empty values
+- a field has the wrong type. A list field (`context_files`, `fallback`, `artifacts`) must be a list of strings; a single string such as `fallback = "claude"` is rejected rather than read as a list of letters. Text fields (`title`, `request`, `design`, `target_agent`, `mode`, the gate agent fields and so on) must be strings, `max_depth_remaining` must be an integer, `budget_hint` must be a number, `[[context]]` must be a list of tables and `agent_settings` must be a table. A null `title` or `request` counts as missing, and a null optional field takes its default.
 
 Additional refusals happen at delegation time (see
 [Delegate a task — rules](../how-to/delegate-a-task.md#rules-that-will-refuse-your-delegation)):

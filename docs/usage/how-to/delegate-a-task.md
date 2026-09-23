@@ -96,7 +96,13 @@ first:
 
 1. `agent_settings` in this handoff (per task)
 2. the agent's registry entry (per agent, set at registration)
-3. the agent adapter's own defaults
+3. `[defaults].model` and `[defaults].effort` from the config
+4. the agent adapter's own defaults
+
+The per-task `model` and `effort` apply only to the task's target agent. A
+fallback agent, a gate agent (verifier or reviewer) and a fixer that is a
+different agent from the target all run with their own registry settings,
+because a model name chosen for one CLI usually means nothing to another.
 
 `effort` accepts `low`, `medium`, `high`, `xhigh`, `max`.
 

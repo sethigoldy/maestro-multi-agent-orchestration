@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orch
 4. **installs the global `maestro-driven-development` skill** into every
    detected agent, using each agent's own global instruction/skill mechanism
    (e.g. `~/.claude/skills/…` for Claude Code, a managed block in
-   `~/.codex/instructions.md` for Codex, a global rule for Cursor).
+   `~/.codex/AGENTS.md` for Codex, a global rule for Cursor).
 5. **starts the daemon in the background** (`maestro daemon start`) and
    verifies it is healthy before printing a summary of what it did.
 
@@ -642,7 +642,7 @@ backend = "filesystem"    # filesystem (default) | memvara
 
 **Routing defaults:** when a handoff names no target agent, `[defaults].agent`
 becomes the target and `[defaults].model`/`effort` fill in what the handoff left
-unset. If neither the handoff nor `[defaults]` names an agent, Maestro does not
+unset, unless the target agent's registry entry sets its own value. If neither the handoff nor `[defaults]` names an agent, Maestro does not
 guess: the task parks in state `input-required` with a question listing every
 available agent, and resumes via MCP `answer_task_question` (a bare agent name,
 `agent=… model=…` pairs, or JSON). Set `[defaults]` to stop being asked.

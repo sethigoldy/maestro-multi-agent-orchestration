@@ -41,7 +41,7 @@ from . import daemonctl
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
 from .branches import branch_exists, branch_name_clash, find_renamed_branches, rename_task_branch
-from .context import RenderedContext, compose_context, entry_from_dict, render_context
+from .context import RenderedContext, check_skill_entries, compose_context, entry_from_dict, render_context
 from .core import Maestro, maestro_user_dir
 from .events import EventBus, TaskEvent, utcnow_iso
 from .handoff import HandoffDoc
@@ -566,23 +566,18 @@ class MaestroDaemon:
                 raise ValueError(f"Unknown {role} agent {name!r}. Registered agents: {registered}")
         return doc
 
-    def _apply_context(self, doc: HandoffDoc) -> HandoffDoc:
+    def _apply_context(self, doc: HandoffDoc, workspace: Path) -> HandoffDoc:
         """Compose standing + handoff context entries and validate skill paths.
 
         The composed list replaces ``doc.context_entries`` so the stored task record
         is self-contained (invariant C2). Skill entries must exist on disk now (C4):
         a missing directory or SKILL.md fails delegation before any agent runs.
+        A relative skill path is checked against the task workspace, the same
+        directory that ``render_context`` later copies the skill from.
         """
         config_entries = self.maestro.config.get("context") or {}
         composed = compose_context(config_entries, doc.context_entries)
-        for entry in composed:
-            if entry.kind != "skill":
-                continue
-            path = Path(os.path.expanduser(entry.path or ""))
-            if not path.is_dir():
-                raise ValueError(f"Skill context {entry.label!r}: directory not found: {path}")
-            if not (path / "SKILL.md").is_file():
-                raise ValueError(f"Skill context {entry.label!r}: no SKILL.md in {path}")
+        check_skill_entries(composed, workspace)
         doc.context_entries = [e.to_dict() for e in composed]
         return doc
 
@@ -596,8 +591,9 @@ class MaestroDaemon:
         ask the user which agent/model to use instead of guessing.
 
         ``[defaults].fallback`` fills an empty fallback chain, and
-        ``[defaults].model``/``effort`` are applied to the chosen agent when the
-        handoff does not set them (explicit handoff values always win).
+        ``[defaults].model``/``effort`` are applied to the chosen agent when
+        neither the handoff nor that agent's registry entry sets them. Explicit
+        handoff values always win, and a registry value beats the default.
         """
         defaults = self.maestro.config.get("defaults") or {}
         if not doc.explicit_target:
@@ -611,12 +607,14 @@ class MaestroDaemon:
             doc.explicit_target = True
         if not doc.fallback and defaults.get("fallback"):
             doc.fallback = list(defaults["fallback"])
-        model = defaults.get("model")
-        if model and not doc.agent_settings.get("model"):
-            doc.agent_settings["model"] = str(model)
-        effort = defaults.get("effort")
-        if effort and not doc.agent_settings.get("effort"):
-            doc.agent_settings["effort"] = str(effort)
+        target_spec = self.registry.get(doc.target_agent)
+        for key in ("model", "effort"):
+            value = defaults.get(key)
+            if not value or doc.agent_settings.get(key):
+                continue
+            if target_spec is not None and getattr(target_spec, key):
+                continue  # the agent's own registry value beats the config default
+            doc.agent_settings[key] = str(value)
         return True
 
     def _routing_question(self) -> str:
@@ -708,7 +706,7 @@ class MaestroDaemon:
 
         doc = validate_handoff(doc)
         doc = self._apply_work_mode(doc)
-        doc = self._apply_context(doc)
+        doc = self._apply_context(doc, Path(workspace).expanduser().resolve())
         routing_resolved = self._apply_defaults(doc)
         if routing_resolved and doc.target_agent == doc.origin_agent:
             raise ValueError(
@@ -1127,10 +1125,21 @@ class MaestroDaemon:
 
     @staticmethod
     def _turn_settings(spec: AgentSpec, doc: HandoffDoc) -> dict[str, Any]:
-        """Adapter settings for one turn: registry defaults, per-task overrides, handoff."""
+        """Adapter settings for one turn: registry defaults, per-task overrides, handoff.
+
+        The handoff's ``model`` and ``effort`` were chosen for the task's target
+        agent, so only that agent gets them. A fallback agent, a gate agent or a
+        fixer that is a different agent runs with its own registry model and
+        effort, because a model name for one CLI means nothing to another.
+        Other ``agent_settings`` keys still reach every agent.
+        """
+        overrides = dict(doc.agent_settings)
+        if spec.name != doc.target_agent:
+            overrides.pop("model", None)
+            overrides.pop("effort", None)
         return {
             **{k: v for k, v in spec.to_dict().items() if v is not None and k in {"model", "effort", "token"}},
-            **doc.agent_settings,
+            **overrides,
             # Reserved key for api-mode adapters (e.g. a2a_remote) so
             # the full handoff survives daemon-to-daemon hops.
             "maestro_handoff": _forwarded_handoff(doc),

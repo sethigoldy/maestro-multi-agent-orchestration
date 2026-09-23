@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -142,7 +143,13 @@ class BaseAdapter:
     # -- identity ---------------------------------------------------------
     def binary(self) -> str | None:
         if self.spec is not None and self.spec.kind == "generic" and self.spec.command:
-            return self.spec.command.split()[0]
+            # Split the template the same way build_command does, so a quoted
+            # executable path that contains spaces is found as one word.
+            try:
+                words = shlex.split(self.spec.command)
+            except ValueError:
+                return None  # unbalanced quotes: no executable can be named
+            return words[0] if words else None
         return DEFAULT_BINARIES.get(self.kind)
 
     def preflight(self) -> AdapterPreflight:
