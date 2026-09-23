@@ -2,7 +2,8 @@
 
 The daemon may be started from a context (GUI app, launchd, an old terminal)
 that lacks variables the user's shell profile exports — API keys above all.
-capture_login_env() snapshots ``$SHELL -lc env`` once per process and
+capture_login_env() snapshots the login shell's environment once per process
+(a marker, then ``env -0``, with plain ``env`` as the fallback) and
 worker_environment() layers it under the daemon's own environment so agents
 see the same defaults as an interactive session.
 """
