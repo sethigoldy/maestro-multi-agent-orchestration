@@ -1370,7 +1370,7 @@ class MaestroDaemon:
                 parsed = None
             if isinstance(parsed, dict):
                 runtime = parsed
-        workspace_raw = claims.get("task_workspace")
+        workspace_raw = claims.get("task_workspace") or self._registry_workspace(task_id)
         knowledge = project_knowledge(task_id, claims, runtime, workspace=Path(workspace_raw) if workspace_raw else None)
         self.maestro._write_claim(task_id, "task_knowledge", knowledge.serialize())
         return knowledge
@@ -1378,13 +1378,16 @@ class MaestroDaemon:
     def _durable_record(self, task_id: str) -> dict[str, Any] | None:
         """Rebuild the in-memory record from durable claims after a restart.
 
-        Returns None when the task has no durable workspace claim (unknown
+        The workspace comes from the task_workspace claim or, for a task
+        migrated from the legacy journal without that claim, from the task's
+        registry record. Returns None when neither names a workspace (unknown
         task). The Q&A transcript is intentionally not reconstructed — it was
         never persisted (pre-existing behavior); continuations rely on task
         knowledge instead of the transcript.
         """
         claims = self.maestro._claims(task_id)
-        if not claims.get("task_workspace"):
+        workspace = claims.get("task_workspace") or self._registry_workspace(task_id)
+        if not workspace:
             return None
         runtime = _runtime_from_claims(claims)
         doc = runtime.get("doc") if isinstance(runtime.get("doc"), dict) else None
@@ -1396,7 +1399,7 @@ class MaestroDaemon:
             "origin_agent": claims.get("task_origin_agent"),
             "target_agent": claims.get("task_target_agent") or (doc or {}).get("routing", {}).get("target_agent"),
             "agent": runtime.get("agent"),
-            "workspace": claims["task_workspace"],
+            "workspace": workspace,
             "branch": claims.get("task_branch") or runtime.get("branch"),
             "title": claims.get("task_title"),
             "doc": doc,
@@ -1599,6 +1602,32 @@ class MaestroDaemon:
         """Return the workspace in the task's registry record, or None when there is no record."""
         record = next((item for item in self.maestro._registry_records() if str(item.get("task_id")) == task_id), None)
         return (record or {}).get("workspace")
+
+    def final_state_event(self, task_id: str) -> TaskEvent | None:
+        """Return a state event for a task that has already finished, or None.
+
+        A task-scoped event stream only carries events that this daemon
+        process published and still holds in its replay buffer. A task that
+        finished in an earlier daemon run, or whose events have left the
+        buffer, would never send its final state, so the stream would wait
+        forever. The stream sends this event instead and ends. Returns None
+        for a task that is still running or parked, and for an unknown task.
+        """
+        record = self._tasks.get(task_id)
+        if record is not None:
+            state, error = record["state"], record.get("error")
+        else:
+            claims = self.maestro._claims(task_id)
+            if not claims:
+                return None
+            runtime = _runtime_from_claims(claims)
+            state, error = _durable_state(claims, runtime), runtime.get("error")
+        if state not in TERMINAL_STATES:
+            return None
+        data: dict[str, Any] = {"state": state}
+        if error:
+            data["error"] = error
+        return TaskEvent(task_id=task_id, type="state", data=data)
 
     def status_a2a(self, task_id: str) -> dict[str, Any]:
         record = self._tasks.get(task_id)
@@ -1811,6 +1840,18 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             sub = daemon.bus.subscribe()
             try:
+                if task_id is not None:
+                    # The subscription replays the buffer, so a final state
+                    # event still in it ends the loop below. When it is not
+                    # there, send the task's final state now and end, or the
+                    # stream would wait for an event that never comes.
+                    replayed = daemon.bus.history(task_id, ("state",))
+                    if not (replayed and replayed[-1].data.get("state") in TERMINAL_STATES):
+                        final = daemon.final_state_event(task_id)
+                        if final is not None:
+                            self.wfile.write(sse_encode(final.type, final.to_dict()).encode("utf-8"))
+                            self.wfile.flush()
+                            return
                 while True:
                     event = sub.get(timeout=daemon.sse_heartbeat_s)
                     if event is None:

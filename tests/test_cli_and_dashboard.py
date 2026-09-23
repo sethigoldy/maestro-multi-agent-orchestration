@@ -275,6 +275,56 @@ def test_task_tail_follows_a_migrated_task_without_a_workspace_claim(live_daemon
     assert live_daemon.status_a2a(tid)["metadata"]["workspace"] == record_workspace
 
 
+def _durable_task(daemon: MaestroDaemon, tid: str, number: int, runtime: dict) -> None:
+    """Record a task the way an earlier daemon run leaves it: claims only, no live record."""
+    daemon.maestro._register_task(tid, "Earlier run", number)
+    daemon.maestro._write_claim(tid, "task_workspace", "/old/ws")
+    daemon.maestro._write_claim(tid, "task_status", "REVIEWING")
+    daemon.maestro._write_claim(tid, "task_runtime", json.dumps(runtime))
+    assert tid not in daemon._tasks
+
+
+def test_task_tail_prints_the_result_of_a_task_from_an_earlier_daemon_run(live_daemon, capsys):
+    """Tail of a task that finished before this daemon started prints its final state and exits.
+
+    Before the fix the stream only carried events published by this daemon
+    process, so no final state ever arrived and tail waited forever.
+    """
+    _durable_task(live_daemon, "task-20250101-000000-0ab1e5", 1, {"state": "completed"})
+    rc = _run_main_with_timeout(["task", "tail", "1"], timeout=10)
+    assert rc == 0
+    assert "[state] completed" in capsys.readouterr().out
+
+
+def test_task_tail_of_an_earlier_failed_task_prints_its_error(live_daemon, capsys):
+    _durable_task(live_daemon, "task-20250101-000000-fa11ed", 1, {"state": "failed", "error": "agent crashed"})
+    rc = _run_main_with_timeout(["task", "tail", "1"], timeout=10)
+    assert rc == 1
+    assert "[state] failed — agent crashed" in capsys.readouterr().out
+
+
+def test_task_tail_of_a_finished_task_whose_events_left_the_buffer(finished_task, live_daemon, capsys):
+    """A finished task whose events are no longer in the replay buffer still ends the tail.
+
+    The buffer keeps only recent events, so on a busy daemon a finished
+    task's final state event can be gone while its live record remains.
+    """
+    with live_daemon.bus._lock:
+        live_daemon.bus._ring.clear()
+    rc = _run_main_with_timeout(["task", "tail", finished_task], timeout=10)
+    assert rc == 0
+    assert "[state] completed" in capsys.readouterr().out
+
+
+def test_final_state_event_only_for_finished_tasks(live_daemon):
+    assert live_daemon.final_state_event("task-20250101-000000-0000aa") is None  # no such task
+    _durable_task(live_daemon, "task-20250101-000000-9a4ced", 1, {"state": "input-required"})
+    assert live_daemon.final_state_event("task-20250101-000000-9a4ced") is None  # parked, not finished
+    _durable_task(live_daemon, "task-20250101-000000-d0e5ed", 2, {"state": "canceled"})
+    event = live_daemon.final_state_event("task-20250101-000000-d0e5ed")
+    assert event is not None and event.type == "state" and event.data == {"state": "canceled"}
+
+
 def test_task_tail_all_needs_no_reference(monkeypatch):
     monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
     calls: list[tuple[str, str | None]] = []
