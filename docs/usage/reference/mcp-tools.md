@@ -133,7 +133,9 @@ old name there.
 Errors, each returned as `{"error": …}`: unknown task; the task is still
 running (`submitted` or `working`); the task has no branch (it has not started,
 or it uses `commit_policy = "no-commit"`); an invalid branch name; the new
-branch already exists; neither the old nor the new branch exists.
+branch already exists; neither the old nor the new branch exists; the old
+branch is gone and git's reflog shows no rename from it to the new branch (the
+new branch may be unrelated to the task).
 
 ## task_wait
 

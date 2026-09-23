@@ -656,7 +656,8 @@ def test_prepare_branch_existing_and_forced_failure(daemon, tmp_path, monkeypatc
         return _Fail()
 
     monkeypatch.setattr(dm.subprocess, "run", _fake_run)
-    assert daemon._prepare_branch(ws, "task-y", "branch") is None
+    with pytest.raises(RuntimeError, match="could not check out the task branch 'maestro/task-y': forced"):
+        daemon._prepare_branch(ws, "task-y", "branch")
 
 
 def test_verification_command_mode_failed(daemon, tmp_path, binpath):

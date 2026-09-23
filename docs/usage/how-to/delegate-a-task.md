@@ -190,7 +190,8 @@ If a task has already run under the default name, rename its branch with
 `maestro task rename-branch <task> <new-name>` (or the `rename_task_branch`
 MCP tool). This renames the git branch and updates the task's record in one
 step. If you already renamed the branch with `git branch -m`, the same command
-only updates the record, so `maestro task list` stops showing the old name.
+checks git's reflog for that rename and then only updates the record, so
+`maestro task list` stops showing the old name.
 
 ## Budgets and launch-time refusal
 

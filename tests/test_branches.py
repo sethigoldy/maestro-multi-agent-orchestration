@@ -222,6 +222,48 @@ def test_rename_branch_records_a_rename_already_done_by_hand(daemon, tmp_path, b
     assert daemon.maestro.status(task_id)["branch"] == "feat/by-hand"
 
 
+def test_rename_branch_follows_a_chain_of_hand_renames(daemon, tmp_path, binpath):
+    _fake_codex(binpath)
+    ws = _git_repo(tmp_path)
+    task_id = _finished_task(daemon, ws)
+    _git(ws, "branch", "-m", f"maestro/{task_id}", "feat/first")
+    _git(ws, "branch", "-m", "feat/first", "feat/second")
+    assert daemon.rename_branch(task_id, "feat/second")["git_renamed"] is False
+    assert daemon.maestro.status(task_id)["branch"] == "feat/second"
+
+
+def test_rename_branch_refuses_an_unrelated_existing_branch(daemon, tmp_path, binpath):
+    _fake_codex(binpath)
+    ws = _git_repo(tmp_path)
+    task_id = _finished_task(daemon, ws)
+    old = f"maestro/{task_id}"
+    _git(ws, "checkout", "-q", "-b", "release/2.0")
+    _git(ws, "branch", "-D", old)  # the task branch was merged and deleted
+    with pytest.raises(ValueError, match="no record that 'release/2.0' was renamed from it"):
+        daemon.rename_branch(task_id, "release/2.0")
+    assert daemon.maestro._claims(task_id)["task_branch"] == old
+    assert daemon._tasks[task_id]["branch"] == old
+
+
+def test_followup_fails_instead_of_working_on_the_wrong_branch(daemon, tmp_path, binpath):
+    _fake_codex(binpath)
+    ws = _git_repo(tmp_path)
+    task_id = _finished_task(daemon, ws, branch="feat/login")
+    (ws / "README.md").write_text("# changed on the task branch\n", encoding="utf-8")
+    _git(ws, "commit", "-qam", "task work")
+    _git(ws, "checkout", "-q", "-")
+    main = _current_branch(ws)
+    (ws / "README.md").write_text("# uncommitted edit that blocks the checkout\n", encoding="utf-8")
+    attempts_before = len(daemon._tasks[task_id]["attempts"])
+
+    daemon.followup(task_id, "one more change")
+    final = daemon.wait(task_id, timeout=60)
+    assert final["status"]["state"] == "failed"
+    assert "could not check out the task branch 'feat/login'" in final["metadata"]["error"]
+    assert _current_branch(ws) == main
+    assert len(daemon._tasks[task_id]["attempts"]) == attempts_before  # no agent ran on the wrong branch
+
+
 def test_rename_branch_same_name_is_a_no_op(daemon, tmp_path, binpath):
     _fake_codex(binpath)
     ws = _git_repo(tmp_path)
@@ -309,8 +351,9 @@ def test_rename_task_branch_tolerates_missing_or_bad_runtime(tmp_path, monkeypat
                 m._write_claim(tid, "task_runtime", runtime)
         assert rename_task_branch(m, "task-a", "feat/a")["git_renamed"] is True
         assert "task_runtime" not in m._claims("task-a")
-        _git(ws, "branch", "feat/b")
-        _git(ws, "branch", "feat/c")
+        for tid in ("task-b", "task-c"):  # renamed by hand, so the reflog records it
+            _git(ws, "branch", f"maestro/{tid}")
+            _git(ws, "branch", "-m", f"maestro/{tid}", f"feat/{tid[-1]}")
         assert rename_task_branch(m, "task-b", "feat/b")["git_renamed"] is False
         assert m._claims("task-b")["task_runtime"] == "not json"  # left as it was
         assert rename_task_branch(m, "task-c", "feat/c")["git_renamed"] is False

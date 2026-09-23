@@ -9,7 +9,9 @@ A branch that was created under the default name can be renamed later with
 :func:`rename_task_branch`. It renames the git branch and updates the task's
 durable record in the same step, so ``maestro task list``, ``task status``,
 receipts and follow-up turns all use the new name. If the branch was already
-renamed by hand with ``git branch -m``, the same call only updates the record.
+renamed by hand with ``git branch -m``, the same call only updates the record,
+after checking git's reflog to confirm that the new branch really is the
+task's branch under a new name.
 """
 
 from __future__ import annotations
@@ -64,6 +66,20 @@ def branch_exists(workspace: Path, name: str) -> bool:
     return probe.returncode == 0
 
 
+def was_renamed_from(workspace: Path, name: str, old_name: str) -> bool:
+    """True when git's reflog for ``name`` records a rename from ``old_name``.
+
+    ``git branch -m`` writes "Branch: renamed refs/heads/<old> to
+    refs/heads/<new>" and carries the reflog over to the new name, so the
+    entry survives a chain of renames (old -> a -> b).
+    """
+    log = subprocess.run(
+        ["git", "-C", str(workspace), "reflog", "show", "--format=%gs", f"refs/heads/{name}", "--"],
+        text=True, capture_output=True,
+    )
+    return log.returncode == 0 and f"renamed refs/heads/{old_name} to " in log.stdout
+
+
 def rename_task_branch(maestro: "Maestro", task_id: str, new_branch: str) -> dict[str, Any]:
     """Rename a task's branch in git and in the task's durable record.
 
@@ -71,8 +87,11 @@ def rename_task_branch(maestro: "Maestro", task_id: str, new_branch: str) -> dic
 
     * The recorded branch exists and ``new_branch`` does not: the git branch is
       renamed with ``git branch -m`` and the record is updated.
-    * The recorded branch is gone and ``new_branch`` exists: someone already
-      renamed it by hand, so only the record is updated.
+    * The recorded branch is gone and ``new_branch`` exists, and git's reflog
+      for ``new_branch`` shows it was renamed from the recorded branch: it was
+      renamed by hand, so only the record is updated. Without that reflog
+      entry the call is refused, because an unrelated branch that happens to
+      exist must never become the task's branch.
     * Anything else is refused with a ValueError that says which branch is
       missing or already taken. Nothing is changed in that case.
 
@@ -112,6 +131,12 @@ def rename_task_branch(maestro: "Maestro", task_id: str, new_branch: str) -> dic
         raise ValueError(
             f"Neither the task's branch {old_branch!r} nor {new_branch!r} exists in {workspace}; "
             "nothing to rename and nothing to record"
+        )
+    if not old_exists and not was_renamed_from(workspace, new_branch, old_branch):
+        raise ValueError(
+            f"The task's branch {old_branch!r} no longer exists, and git has no record that {new_branch!r} "
+            f"was renamed from it, so {new_branch!r} may be an unrelated branch. If it is the task's branch, "
+            f"rename it back with 'git branch -m {new_branch} {old_branch}' and run this command again"
         )
     git_renamed = False
     if old_exists:

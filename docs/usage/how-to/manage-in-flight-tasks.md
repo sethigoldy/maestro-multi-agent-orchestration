@@ -106,12 +106,16 @@ rename_task_branch(workspace="/path/to/repo", task_id="3", branch="feat/login-fo
 This renames the git branch and updates the task's record, so `task list`,
 `task status`, receipts and the next follow-up all use the new name. If you
 already ran `git branch -m` yourself, the command sees that the old branch is
-gone and the new one exists, and only updates the record.
+gone and the new one exists. It checks git's reflog to confirm the new branch
+was renamed from the task's branch, and then only updates the record. If git
+has no record of that rename, the command refuses, because the new branch may
+be unrelated to the task.
 
 Rules:
 
 - The task must not be running. Wait for it to finish or park first.
-- The new name must not already exist.
+- The new name must not already exist, unless it is the task's branch that
+  you renamed by hand.
 - Only the local branch is renamed. If you pushed the old branch, rename or
   delete it on the remote yourself.
 

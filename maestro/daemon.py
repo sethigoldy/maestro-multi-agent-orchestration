@@ -1319,8 +1319,9 @@ class MaestroDaemon:
         The name is, in order: the branch already recorded for this task (a
         later turn, possibly after a rename), the name the handoff asked for,
         or the default ``maestro/<task_id>``. A branch the handoff asked for
-        must be created fresh; if git cannot create it, the turn fails rather
-        than letting the agent work on whatever branch is checked out.
+        must be created fresh. If git cannot create or check out the task
+        branch, the turn fails rather than letting the agent work on whatever
+        branch is checked out while the record names the task branch.
         """
         if commit_policy == "no-commit":
             return None
@@ -1336,7 +1337,9 @@ class MaestroDaemon:
                 )
             existing = subprocess.run(["git", "-C", str(workspace), "checkout", branch], text=True, capture_output=True)
             if existing.returncode != 0:
-                return None
+                raise RuntimeError(
+                    f"could not check out the task branch {branch!r}: {(existing.stderr or existing.stdout).strip()}"
+                )
         return branch
 
     # ------------------------------------------------------------ interactions
