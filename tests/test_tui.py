@@ -746,7 +746,10 @@ def test_run_uses_detected_terminal_width(tmp_path, monkeypatch):
         rc = tui.run(url, stdin=_PipeStdin(b"q", delay_s=0.5), stdout=out, is_tty=lambda: True)
         assert rc == 0
         text = out.getvalue()
-        assert "X" * 14 in text and "X" * 40 not in text  # title truncated for width 60
+        # The list row truncates the title to width - 46 = 14 characters. The
+        # detail pane below may show all 40, because it allows width - 12.
+        rows = [ln for ln in _plain_lines(text) if "task-1" in ln]
+        assert rows and all("X" * 14 in ln and "X" * 15 not in ln for ln in rows)
         nonempty = [ln for ln in _plain_lines(text) if ln.strip()]
         assert all(len(ln) <= 60 for ln in nonempty)
     finally:

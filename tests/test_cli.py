@@ -18,7 +18,9 @@ def test_cli_env_and_raw_argv_paths(monkeypatch):
     monkeypatch.setenv("MAESTRO_WORKSPACE", "   ")
     assert cli._workspace(None) == Path.home().resolve()
     assert cli._workspace("") == Path.home().resolve()
-    assert cli._normalize_argv(["prog", "task", "abc"]) == ["prog", "task", "status", "abc"]
+    # argv never includes the program name, so "task" in the second position
+    # is an argument of another command and is not rewritten.
+    assert cli._normalize_argv(["prog", "task", "abc"]) == ["prog", "task", "abc"]
 
 
 def test_cli_scope_empty_env(monkeypatch, tmp_path):
@@ -41,11 +43,12 @@ def test_task_lookup_is_global(monkeypatch, tmp_path):
     # Then invoke lookup from a different workspace and assert
     # the task is still resolvable.
 
-def test_normalize_argv_with_program_name():
+def test_normalize_argv_after_top_level_option():
     assert cli._normalize_argv(
-        ["maestro", "task", "task-123"]
+        ["--workspace", "/repo", "task", "task-123"]
     ) == [
-        "maestro",
+        "--workspace",
+        "/repo",
         "task",
         "status",
         "task-123",
@@ -53,8 +56,8 @@ def test_normalize_argv_with_program_name():
 
 def test_normalize_argv_named_task_commands_unchanged():
     assert cli._normalize_argv(
-        ["maestro", "task", "status", "task-123"]
-    ) == ["maestro", "task", "status", "task-123"]
+        ["--workspace", "/repo", "task", "status", "task-123"]
+    ) == ["--workspace", "/repo", "task", "status", "task-123"]
 
     assert cli._normalize_argv(
         ["task", "list"]

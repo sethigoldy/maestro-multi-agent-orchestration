@@ -40,17 +40,43 @@ def _add_target_args(parser: argparse.ArgumentParser) -> None:
                        help="Project root to scope tasks to.")
 
 
+# Top-level options that take a separate value (``--workspace DIR``). They must
+# match the options that ``main`` adds to the top-level parser.
+_TOP_LEVEL_VALUE_OPTIONS = ("--workspace", "--project")
+
+
+def _takes_separate_value(token: str) -> bool:
+    """Return True when ``token`` is a top-level option whose value is the next token.
+
+    argparse also accepts unambiguous prefixes such as ``--work``, so a prefix
+    of a value option counts too. The ``--workspace=DIR`` form carries its
+    value in the same token, so it does not take the next one.
+    """
+    if not token.startswith("--") or len(token) < 3 or "=" in token:
+        return False
+    return any(option.startswith(token) for option in _TOP_LEVEL_VALUE_OPTIONS)
+
+
 def _normalize_argv(argv: list[str]) -> list[str]:
+    """Rewrite the shorthand ``maestro task <ref>`` to ``maestro task status <ref>``.
+
+    ``argv`` does not include the program name. The shorthand applies only
+    when the command itself is ``task``. To find the command, this skips the
+    top-level options and the values that belong to them, so
+    ``maestro --workspace /repo task 1`` works the same as ``maestro task 1``.
+    A ``task`` token that appears later, as an argument of another command or
+    as an option value, is left alone.
+    """
     known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue"}
-    if len(argv) >= 2 and argv[0] == "task":
-        subcommand = argv[1]
-        if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
-            return ["task", "status", *argv[1:]]
-    if len(argv) >= 3 and argv[1] == "task":
-        subcommand = argv[2]
-        if not subcommand.startswith("-") and subcommand not in known_task_cmds:  # pragma: no branch
-            return [argv[0], "task", "status", *argv[2:]]
-    return argv
+    index = 0
+    while index < len(argv) and argv[index].startswith("-"):
+        index += 2 if _takes_separate_value(argv[index]) else 1
+    if index + 1 >= len(argv) or argv[index] != "task":
+        return argv
+    subcommand = argv[index + 1]
+    if subcommand.startswith("-") or subcommand in known_task_cmds:
+        return argv
+    return [*argv[: index + 1], "status", *argv[index + 1 :]]
 
 
 def _add_skill_target_args(parser: argparse.ArgumentParser) -> None:
@@ -171,6 +197,40 @@ def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int
     if task_id is not None and final_state is not None:
         return 0 if final_state == "completed" else 1
     return 0
+
+
+def _resolve_task_on_daemon(url: str, ref: str, token: str | None) -> str:
+    """Ask the daemon which task ``ref`` names and return that task's id.
+
+    ``ref`` is a task number such as ``1`` or a full task id. The daemon's
+    ``tasks/get`` method resolves numbers the same way ``maestro task status``
+    does, and it refuses an unknown number with an error, which reaches the
+    caller as a ValueError. The daemon accepts any well-formed task id without
+    checking it, so a task that has no recorded workspace is treated as
+    unknown here. Every real task records the workspace it runs in.
+    """
+    result = _post_jsonrpc(url, "tasks/get", {"id": ref}, token=token)
+    task = (result or {}).get("task") or {}
+    task_id = task.get("id")
+    if not task_id or not (task.get("metadata") or {}).get("workspace"):
+        raise ValueError(f"Unknown task reference {ref!r}. Run `maestro list` to see available tasks.")
+    return str(task_id)
+
+
+def _cmd_task_tail(args: argparse.Namespace) -> int:
+    """Follow one task's event stream, or every task's events with ``--all``."""
+    if args.all and args.task_id is not None:
+        raise ValueError("task tail: give a task number or id, or --all, not both")
+    if not args.all and args.task_id is None:
+        raise ValueError("task tail: give a task number or id, or --all to follow every task")
+    url, token = _daemon_endpoint()
+    if args.all:
+        return _stream_task(url, None, token=token)
+    # The event stream only matches full task ids, so a number such as "1"
+    # has to be resolved first. Without this the stream waits forever for
+    # events that carry the task id "1".
+    task_id = _resolve_task_on_daemon(url, args.task_id, token)
+    return _stream_task(url, task_id, token=token)
 
 
 def _cmd_delegate(args: argparse.Namespace) -> int:
@@ -556,8 +616,9 @@ def main(argv: list[str] | None = None) -> int:
     task_show.add_argument("task_id")
     _add_target_args(task_show)
     task_tail = task_sub.add_parser("tail", help="Live-tail a task's event stream (SSE, no polling)")
-    task_tail.add_argument("task_id")
-    task_tail.add_argument("--all", action="store_true", help="Follow the global stream instead of one task")
+    task_tail.add_argument("task_id", nargs="?", default=None,
+                           help="Task number or task id to follow. Leave it out when you pass --all.")
+    task_tail.add_argument("--all", action="store_true", help="Follow the global stream of every task instead of one task")
     task_audit = task_sub.add_parser("audit", help="Show the durable audit record (attempts, usage, errors)")
     task_audit.add_argument("task_id")
     task_receipt = task_sub.add_parser("receipt", help="Show the execution receipt (attempts, verification, gates, totals)")
@@ -684,9 +745,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "budgets":
             return _cmd_budgets()
         if args.cmd == "task" and args.task_cmd == "tail":
-            url = _daemon_url()
-            target_id = None if args.all else args.task_id
-            return _stream_task(url, target_id, token=_daemon_token())
+            return _cmd_task_tail(args)
         if args.cmd == "task" and args.task_cmd == "audit":
             return _cmd_task_audit(args)
         if args.cmd == "task" and args.task_cmd == "receipt":

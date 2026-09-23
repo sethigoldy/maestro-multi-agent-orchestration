@@ -190,6 +190,16 @@ class _State:
         self.live = False
         self.lost = False
 
+    def set_tasks(self, tasks: list[dict[str, Any]]) -> None:
+        """Replace the task table and rebuild the index that events use to find rows.
+
+        Events are matched to rows through ``by_id``. If the index were not
+        rebuilt here, an event for a task loaded from ``GET /tasks`` would add
+        a second, untitled row, and the loaded row would never change again.
+        """
+        self.tasks = tasks
+        self.by_id = {str(task["task_id"]): task for task in tasks if task.get("task_id")}
+
     def apply_event(self, task_id: str, type_: str, data: dict[str, Any]) -> None:
         if not task_id:
             return
@@ -283,7 +293,7 @@ def run(
     stdin = stdin or sys.stdin.buffer
     state = _State()
     try:
-        state.tasks = load_tasks(url, token=token)
+        state.set_tasks(load_tasks(url, token=token))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         print(f"cannot reach the daemon at {url}: {exc}", file=sys.stderr)
         return 1
@@ -353,7 +363,7 @@ def run(
                         break
         finally:
             done.set()
-            stdout.write("\x1b[?25l\x1b[?1049l")  # show cursor, leave alt screen
+            stdout.write("\x1b[?25h\x1b[?1049l")  # show cursor, leave alt screen
             stdout.flush()
             if old_termios is not None:
                 try:
