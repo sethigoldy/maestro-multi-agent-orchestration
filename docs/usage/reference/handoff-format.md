@@ -23,7 +23,7 @@ with the task.
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `title` | string | — | yes | Short, non-empty summary of the work |
-| `request` | string | — | yes | The work order in prose. With `verification = "command"`, this field is instead interpreted as a shell command line (see below) |
+| `request` | string | — | yes | The work order in prose. With `verification = "command"` and no `verification_command`, this field is instead interpreted as a shell command line (see below) |
 | `design` | string | `""` | no | Authoritative design; multi-line text. Absent means the agent uses judgment within the request's scope |
 | `context_files` | list of strings | `[]` | no | Paths the agent should read for context |
 | `context_notes` | string | `""` | no | Free-form guidance about the context |
@@ -53,7 +53,8 @@ gate fields behaves exactly as before (deterministic verification only). See
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `artifacts` | list of strings | `["code"]` | no | What the work should produce (e.g. `"code"`, `"tests"`, `"docs"`) — guidance, not enforced |
-| `verification` | string | `"auto"` | no | One of: `auto`, `command`, `none`. `auto`: deterministic auto-detected check after the agent finishes. `command`: the `request` field is shlex-split and run as the check command. `none`: skipped |
+| `verification` | string | `"auto"` | no | One of: `auto`, `command`, `none`. `auto`: deterministic auto-detected check after the agent finishes. `command`: `verification_command` (or, when that is not set, the `request` field) is shlex-split and run as the check command. `none`: skipped |
+| `verification_command` | string or null | `null` | no | The check command for `verification = "command"`, for example `"pytest -q"`. Setting it lets `request` stay a prose work order. It must be a non-empty string and requires `verification = "command"`. Follow-ups keep running this command: when it is not set, the original `request` is carried forward as the command, so a follow-up's instruction is never run as a shell command |
 | `commit_policy` | string | `"branch"` | no | One of: `no-commit`, `branch`, `pr`. `branch`/`pr` create branch `maestro/<task-id>` and require a git workspace; `no-commit` works in place |
 | `budget_hint` | number or null | `null` | no | Must be positive when set. Recorded on the task for visibility; enforcement is via the `MAESTRO_BUDGET_*_USD` environment caps, not this field |
 
@@ -99,6 +100,7 @@ A handoff is rejected with a `ValueError` when any of these holds:
 - `title`, `request`, or `target_agent` is empty/whitespace
 - `commit_policy` is not one of `no-commit`, `branch`, `pr`
 - `verification` is not one of `auto`, `command`, `none`
+- `verification_command` is set but empty, or set without `verification = "command"`
 - `max_depth_remaining` < 0
 - `budget_hint` is set and ≤ 0
 - any `fallback` entry is empty

@@ -265,17 +265,15 @@ class BaseAdapter:
             lines: list[str] = []
             line_question: str | None = None
             while True:
-                remaining = (deadline - time.monotonic()) if deadline is not None else None
-                try:
-                    line = line_q.get(timeout=remaining)
-                except _queue.Empty:
+                outcome, line = _next_line(line_q, deadline, should_cancel)
+                if outcome == "timeout":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} timed out after {timeout}s", duration_s=time.monotonic() - started)
-                if line is None:
-                    break
-                if should_cancel is not None and should_cancel():
+                if outcome == "cancel":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} was canceled", duration_s=time.monotonic() - started)
+                if line is None:
+                    break
                 lines.append(line.rstrip("\n"))
                 if log_path is not None:
                     with log_path.open("a", encoding="utf-8") as fh:
@@ -525,25 +523,24 @@ class BaseAdapter:
         try:
             lines: list[str] = []
             while True:
-                remaining = (deadline - time.monotonic()) if deadline is not None else None
-                if cancel_grace_until is not None:
-                    grace_left = cancel_grace_until - time.monotonic()
-                    remaining = grace_left if remaining is None else min(remaining, grace_left)
-                try:
-                    line = line_q.get(timeout=remaining)
-                except _queue.Empty:
-                    if cancel_grace_until is not None:
+                if cancel_grace_until is None:
+                    outcome, line = _next_line(line_q, deadline, should_cancel)
+                else:  # already aborting: only the grace period (or the deadline) is left
+                    grace_deadline = cancel_grace_until if deadline is None else min(deadline, cancel_grace_until)
+                    outcome, line = _next_line(line_q, grace_deadline, None)
+                    if outcome == "timeout":
                         break  # abort grace expired; fall through to the kill path
+                if outcome == "timeout":
                     _kill_group(process)
                     return AdapterResult(ok=False, error=f"Agent {self.kind!r} timed out after {timeout}s", duration_s=time.monotonic() - started)
-                if line is None:
-                    break  # stream closed before the agent settled
-                if should_cancel is not None and should_cancel() and cancel_grace_until is None:
+                if outcome == "cancel":
                     abort = self.rpc_abort_command()
                     if abort is not None:
                         _send(abort)
                     cancel_grace_until = time.monotonic() + 5
                     continue
+                if line is None:
+                    break  # stream closed before the agent settled
                 lines.append(line.rstrip("\n"))
                 if log_path is not None:
                     with log_path.open("a", encoding="utf-8") as fh:
@@ -587,6 +584,37 @@ class BaseAdapter:
             ok=False, exit_code=exit_code, output_path=str(log_path) if log_path else None,
             usage=usage, error=error, duration_s=time.monotonic() - started,
         )
+
+
+# How often a run checks for cancellation while the agent prints nothing.
+_CANCEL_POLL_S = 0.5
+
+
+def _next_line(line_q: Any, deadline: float | None, should_cancel: Callable[[], bool] | None) -> tuple[str, str | None]:
+    """Wait for the agent's next output line.
+
+    Returns ("line", text) with text None once the output has closed,
+    ("timeout", None) when the deadline passes, or ("cancel", None) when
+    ``should_cancel`` reports a cancel. Cancellation is checked at least every
+    _CANCEL_POLL_S seconds, so an agent that is silent for a long time (for
+    example while it runs a test suite) is still stopped promptly.
+    """
+    import queue as _queue
+    import time
+
+    while True:
+        if should_cancel is not None and should_cancel():
+            return "cancel", None
+        remaining = None if deadline is None else deadline - time.monotonic()
+        if remaining is not None and remaining <= 0:
+            return "timeout", None
+        wait = remaining
+        if should_cancel is not None:
+            wait = _CANCEL_POLL_S if wait is None else min(wait, _CANCEL_POLL_S)
+        try:
+            return "line", line_q.get(timeout=wait)
+        except _queue.Empty:
+            continue
 
 
 def _kill_group(process: subprocess.Popen) -> None:

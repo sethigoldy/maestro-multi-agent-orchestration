@@ -6,6 +6,18 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Queued tasks after the second were lost.** With three or more tasks queued for one workspace, freeing the workspace promoted the next task and also removed every later task for that workspace from the queue; those tasks stayed `submitted` forever. The promoted task now takes the workspace slot at the moment it leaves the queue.
+- **A follow-up ran its instruction as a shell command.** On a task with `verification = "command"`, the follow-up's instruction replaced the verification command, so "touch X" was executed. The original command is now carried into every follow-up. A new optional `[expectations] verification_command` field also lets a handoff keep `request` as prose.
+- **Two tasks could work in the same working tree.** Follow-ups, and answers given after a daemon restart, started without taking the workspace slot. They now take it, or wait in the queue behind the task that holds it.
+- **Cancel was not noticed while an agent printed nothing.** The run checked for a cancel only when a line of output arrived, so a quiet agent kept editing files after its workspace was handed to the next task. The check now happens at least every half second, in both the spawn and the RPC run loops.
+- **A canceled task could come back.** A cancel set a flag that was never cleared, so every follow-up on a canceled task failed at once. A cancel during a review or verification turn was overwritten and the task carried on to fixes and reviews. Follow-ups now start with a clear flag, the gate cycle stops after a canceled gate turn, and a canceled task only leaves `canceled` through a new turn.
+- **Answers to parked tasks were lost.** An answer to a task parked by a gate, or waiting for approval, never reached the agent's next prompt. The question and the answer are now recorded together. After a daemon restart, a task parked on the routing question also forgot that it was waiting for routing and asked again; the rebuilt task now keeps what it was waiting for and its gate and verification details.
+- **Waiting could miss the finishing event.** `wait()` (used by the MCP `delegate`, `followup` and `task_wait` tools) checked the state before subscribing, so a task that finished in between left the caller blocked for the full timeout. It now subscribes first.
+- **`task continue` and `task tail` stopped at the previous turn.** A task's event stream replayed earlier turns and ended at the first "completed" it saw, while the new turn was still running. The stream now starts at the task's current turn.
+- **A completed task could say verification `FAILED` after a fix made it pass.** The label now uses the final verification result.
+
 ## [0.12.0] — 2026-09-22
 
 ### Fixed

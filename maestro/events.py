@@ -36,10 +36,13 @@ class TaskEvent:
 class Subscription:
     """A consumer view of the bus with blocking waits (no polling)."""
 
-    def __init__(self, bus: "EventBus", q: "queue.Queue[TaskEvent]", types: tuple[str, ...]) -> None:
+    def __init__(self, bus: "EventBus", q: "queue.Queue[TaskEvent]", types: tuple[str, ...], start_seq: int = 0) -> None:
         self._bus = bus
         self._q = q
         self.types = types
+        # The highest seq published before this subscription began. Events
+        # with a higher seq are live; the rest were replayed from the ring.
+        self.start_seq = start_seq
 
     def get(self, timeout: float | None = None) -> TaskEvent | None:
         try:
@@ -101,7 +104,8 @@ class EventBus:
                 if not types or event.type in types:
                     q.put(event)
             self._subs.append((q, types))
-        return Subscription(self, q, types)
+            start_seq = self._ring[-1].seq if self._ring else 0
+        return Subscription(self, q, types, start_seq)
 
     def _unsubscribe(self, sub: Subscription) -> None:
         with self._lock:

@@ -63,6 +63,7 @@ HANDOFF_FIELDS = (
     "origin_agent",
     "artifacts",
     "verification",
+    "verification_command",
     "commit_policy",
     "budget_hint",
     "sensitive",

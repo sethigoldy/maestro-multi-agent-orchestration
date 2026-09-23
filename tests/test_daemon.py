@@ -1140,8 +1140,10 @@ def test_record_transcript_helpers():
     record_transcript_append(rec, "q2")
     record_transcript_answer(rec, "a2")
     record_transcript_answer(rec, "a1")
-    record_transcript_answer(rec, "ignored")  # everything answered: loop exits without a break
-    assert [entry["answer"] for entry in rec["transcript"]] == ["a1", "a2"]
+    # Everything answered: the answer (to a park with no open entry) is added with its question.
+    record_transcript_answer(rec, "a3", question="q3")
+    record_transcript_answer(rec, "a4")
+    assert [(entry["question"], entry["answer"]) for entry in rec["transcript"]] == [("q1", "a1"), ("q2", "a2"), ("q3", "a3"), ("", "a4")]
     assert record_transcript(rec) == rec["transcript"]
 
 
@@ -1193,7 +1195,9 @@ def test_release_skips_busy_workspace_then_continues(daemon, tmp_path):
     daemon._release(a_id)  # frees ws1
     with daemon._lock:
         assert daemon._queue == [d_id, e_id]  # c promoted; d,e still queued (ws2 busy)
-        assert str(ws1) not in daemon._active  # _start_queued was stubbed: slot stays free
+        # The promoted task holds the slot from the moment it leaves the queue,
+        # so a rescan cannot promote a second task for the same workspace.
+        assert daemon._active[str(ws1)] == c_id
 
 
 # ------------------------------------------------------------------ M3: followup + guards

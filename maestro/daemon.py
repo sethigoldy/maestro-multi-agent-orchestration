@@ -653,6 +653,9 @@ class MaestroDaemon:
         key = str(ws)
         self._enforce_budgets(doc.target_agent)
         task_id, record = self._make_record(doc, key)
+        # Register first: once the task is queued, _release may start it at any
+        # moment from another thread, and it must already have its claims.
+        self._register_and_claims(task_id, doc, key)
         queued = False
         with self._lock:
             if key in self._active and self._active[key] is not None:
@@ -660,8 +663,9 @@ class MaestroDaemon:
                 self._queue.append(task_id)  # FIFO per workspace; starts when the slot frees
             else:
                 self._active[key] = task_id
-        record["queued"] = queued
-        self._register_and_claims(task_id, doc, key)
+            # Set under the lock: _start_queued clears it under the same lock.
+            record["queued"] = queued
+        self._persist(task_id)
         if queued:
             return {"task_id": task_id, "queued": True, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
         self._set_state(task_id, STATE_SUBMITTED)
@@ -732,6 +736,12 @@ class MaestroDaemon:
             record["queued"] = False
         doc = from_dict(record["doc"])
         ws = Path(key)
+        if record.pop("continuation", False):
+            # A follow-up or answer that waited for the workspace: its approval
+            # and routing were settled before it queued, so it just runs.
+            thread = threading.Thread(target=self._run_task, args=(task_id, doc, ws), daemon=True)
+            thread.start()
+            return
         self._set_state(task_id, STATE_SUBMITTED)
         if doc.sensitive:
             self._set_state(task_id, STATE_INPUT_REQUIRED, question="Approval required: this task targets a sensitive workspace.")
@@ -756,6 +766,11 @@ class MaestroDaemon:
 
     def _set_state(self, task_id: str, state: str, **data: Any) -> None:
         record = self._tasks.get(task_id)
+        if record is not None and record.get("state") == STATE_CANCELED and state not in (STATE_CANCELED, STATE_SUBMITTED):
+            # A turn that was canceled may still be finishing in its thread.
+            # Nothing it reports may bring the task back; only a new turn
+            # (follow-up), which starts at SUBMITTED, moves it on.
+            return
         if record is not None:
             record["state"] = state
             for key, value in data.items():
@@ -908,6 +923,11 @@ class MaestroDaemon:
                         break
                     if qrec["workspace"] not in self._active:
                         self._queue.remove(queued_id)
+                        # Take the slot now, under the lock. Otherwise the
+                        # rescan below still sees the workspace as free and
+                        # removes the next queued task for it too, and that
+                        # task is never started.
+                        self._active[qrec["workspace"]] = queued_id
                         started.append(queued_id)
                         changed = True
                         break  # the slot just filled: re-scan from the front (FIFO fairness)
@@ -987,7 +1007,7 @@ class MaestroDaemon:
             record["agent"] = agent_name
             # usage was already accumulated per attempt in _run_task
         self.maestro._write_claim(task_id, "task_result", str(result.output_path or ""))
-        parked = self._gate_cycle(task_id, doc, workspace, verification_ok)
+        parked, verification_ok = self._gate_cycle(task_id, doc, workspace, verification_ok)
         record = self._tasks.get(task_id)
         if parked or (record is not None and record.get("state") == STATE_CANCELED):
             return  # a parked task keeps its workspace slot; a canceled one already released it
@@ -1016,18 +1036,20 @@ class MaestroDaemon:
         lines.append("Answer with fix instructions to resume on the task branch, or cancel.")
         return "\n".join(lines)
 
-    def _gate_cycle(self, task_id: str, doc: HandoffDoc, workspace: Path, verification_ok: bool | None) -> bool:
+    def _gate_cycle(self, task_id: str, doc: HandoffDoc, workspace: Path, verification_ok: bool | None) -> tuple[bool, bool | None]:
         """Run work-mode gates (LLM verify/review) plus capped auto-fix bounces.
 
-        Returns True when the task was parked in input-required (the caller must not
-        mark it completed and must keep the workspace slot). With no gate agents
+        Returns ``(parked, verification_ok)``. ``parked`` is True when the task was
+        parked in input-required (the caller must not mark it completed and must
+        keep the workspace slot). ``verification_ok`` is the latest deterministic
+        result, which changes when a fix bounce re-runs verification. With no gate agents
         configured it returns False immediately — legacy behavior, where completion
         proceeds regardless of the deterministic outcome. A failed deterministic
         check joins the bounce loop only when at least one gate agent is set; an LLM
         verdict can add failures but never override the deterministic result (I1).
         """
         if not doc.verify_agent and not doc.review_agent:
-            return False
+            return False, verification_ok
         record = self._tasks.get(task_id) or {}
         turn = int(record.get("turn") or 1)
         report_path = self.state_dir / "tasks" / task_id / "verification.txt"
@@ -1038,19 +1060,23 @@ class MaestroDaemon:
         if doc.verify_agent and doc.verification != "none":
             v = self._gate_turn(task_id, doc, workspace, agent_name=doc.verify_agent, role="verifier", verification_ok=verification_ok, report_path=report_path)
             verdicts["verify"] = {"agent": doc.verify_agent, "ok": v["ok"], "issues": list(v["issues"])}
+            if self._canceled(task_id):
+                return False, verification_ok
             if v["parked"]:
                 self._write_gates_claim(task_id, verdicts, 0)
                 self._set_state(task_id, STATE_INPUT_REQUIRED, question=v["reason"])
-                return True
+                return True, verification_ok
             issues.extend(v["issues"])
 
         if doc.review_agent:
             r = self._gate_turn(task_id, doc, workspace, agent_name=doc.review_agent, role="reviewer", verification_ok=verification_ok, report_path=report_path, prior_issues=issues)
             verdicts["review"] = {"agent": doc.review_agent, "ok": r["ok"], "issues": list(r["issues"])}
+            if self._canceled(task_id):
+                return False, verification_ok
             if r["parked"]:
                 self._write_gates_claim(task_id, verdicts, 0)
                 self._set_state(task_id, STATE_INPUT_REQUIRED, question=r["reason"])
-                return True
+                return True, verification_ok
             issues.extend(r["issues"])
 
         max_bounces = doc.max_bounces if doc.max_bounces is not None else DEFAULT_MAX_BOUNCES
@@ -1061,11 +1087,11 @@ class MaestroDaemon:
             fix_agent = doc.fix_agent or doc.target_agent
             fix_status, fix_error = self._fix_turn(task_id, doc, workspace, fix_agent, issues, det_failed, turn=turn)
             if fix_status == "canceled":
-                return False
+                return False, verification_ok
             if fix_status == "parked":
                 self._write_gates_claim(task_id, verdicts, bounces)
                 self._set_state(task_id, STATE_INPUT_REQUIRED, question=fix_error or "fixer could not run")
-                return True
+                return True, verification_ok
             verification_ok = self._verify(workspace, task_id, doc) if doc.verification != "none" else None
             det_failed = verification_ok is False
             issues = []
@@ -1075,17 +1101,17 @@ class MaestroDaemon:
                 r = self._gate_turn(task_id, doc, workspace, agent_name=doc.review_agent, role="reviewer", verification_ok=verification_ok, report_path=report_path, prior_issues=issues)
                 verdicts["review"] = {"agent": doc.review_agent, "ok": r["ok"], "issues": list(r["issues"])}
                 if self._canceled(task_id):
-                    return False
+                    return False, verification_ok
                 if r["parked"]:
                     self._write_gates_claim(task_id, verdicts, bounces)
                     self._set_state(task_id, STATE_INPUT_REQUIRED, question=r["reason"])
-                    return True
+                    return True, verification_ok
                 issues.extend(r["issues"])
         self._write_gates_claim(task_id, verdicts, bounces)
         if det_failed or issues:
             self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._park_question(issues, det_failed, bounces))
-            return True
-        return False
+            return True, verification_ok
+        return False, verification_ok
 
     def _gate_park(self, agent_name: str, role: str, reason: str) -> dict[str, Any]:
         """Build a park result because a gate turn produced no verdict.
@@ -1253,7 +1279,9 @@ class MaestroDaemon:
 
         configured = None
         if doc.verification == "command":
-            configured = shlex.split(doc.request)  # explicit command mode carries the command in request (M2 simplification)
+            # The command is verification_command when set; otherwise the
+            # original handoff carried it in request (M2 simplification).
+            configured = shlex.split(doc.verification_command or doc.request)
         test_cmd, note = _verification_command(workspace, configured)
         # The auto-detected fallback is `git diff --check` plus a note. It passes
         # trivially on an untouched workspace, so it must never certify a turn
@@ -1328,7 +1356,8 @@ class MaestroDaemon:
         if not str(answer).strip():
             raise ValueError("Answer cannot be empty")
         doc = self._doc_from_record(record)
-        if record.get("awaiting") == "routing":
+        routing_answer = record.get("awaiting") == "routing"
+        if routing_answer:
             # The task is parked on the routing question: the answer selects the
             # agent/model, then the task starts. A bad answer raises and leaves
             # the task input-required for another attempt.
@@ -1345,10 +1374,39 @@ class MaestroDaemon:
             self._set_state(task_id, STATE_INPUT_REQUIRED, question=self._routing_question())
             return {"task_id": task_id, "state": STATE_INPUT_REQUIRED}
         workspace = Path(record["workspace"])
-        record_transcript_answer(self._tasks.get(task_id), answer)
+        if not routing_answer:
+            # The answer must reach the agent's next prompt. An agent question
+            # already has an open transcript entry; a park by a gate or an
+            # approval does not, so the question is recorded with the answer.
+            record_transcript_answer(record, answer, question=record.get("question"))
+        record["doc"] = doc.to_dict()
+        if not self._acquire_or_queue(task_id):
+            # Parked tasks keep their slot, but not across a daemon restart;
+            # another task may hold the workspace now.
+            self._set_state(task_id, STATE_SUBMITTED)  # answered; waiting for the workspace
+            return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True}
         thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace), daemon=True)
         thread.start()
         return {"task_id": task_id, "state": STATE_WORKING}
+
+    def _acquire_or_queue(self, task_id: str) -> bool:
+        """Take the task's workspace slot for a follow-up or an answer.
+
+        Returns True when the task now holds the slot. When another task holds
+        it, the continuation is queued behind that task (FIFO, like a queued
+        delegation) and False is returned; it starts when the slot frees.
+        """
+        record = self._tasks[task_id]
+        key = record["workspace"]
+        with self._lock:
+            if self._active.get(key) in (None, task_id):
+                self._active[key] = task_id
+                record["queued"] = False
+                return True
+            self._queue.append(task_id)
+            record["queued"] = True
+            record["continuation"] = True
+            return False
 
     # ------------------------------------------------------------ task knowledge
     def _refresh_knowledge(self, task_id: str) -> TaskKnowledge | None:
@@ -1408,6 +1466,11 @@ class MaestroDaemon:
             "turn": runtime.get("turn") or 0,
             "transcript": [],
         }
+        # What a parked task was waiting for (routing vs. a question), and the
+        # gate and verification details the status views show.
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "verification"):
+            if runtime.get(key) is not None:
+                record[key] = runtime[key]
         with self._lock:
             self._tasks[task_id] = record
             self._cancel_flags.setdefault(task_id, threading.Event())
@@ -1482,6 +1545,10 @@ class MaestroDaemon:
             artifacts=list(doc.artifacts),
             verification=doc.verification,
             commit_policy=doc.commit_policy,
+            # In command mode the original request was the verification
+            # command; the follow-up's request is an instruction and must
+            # never be run as a command.
+            verification_command=doc.verification_command or (doc.request if doc.verification == "command" else None),
             budget_hint=doc.budget_hint,
             sensitive=doc.sensitive,
             max_depth_remaining=max(0, doc.max_depth_remaining - 1),
@@ -1516,7 +1583,12 @@ class MaestroDaemon:
         record["target_agent"] = followup_doc.target_agent  # a pinned fixer becomes the task's current target
         self._persist(task_id, followup_doc)
         workspace = Path(record["workspace"])
+        # A cancel sets the task's flag for good; the new turn needs a clear one.
+        self._cancel_flags[task_id] = threading.Event()
         self._set_state(task_id, STATE_SUBMITTED)
+        if not self._acquire_or_queue(task_id):
+            self._persist(task_id)
+            return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True, "ts": utcnow_iso()}
         thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace), daemon=True)
         thread.start()
         return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
@@ -1552,6 +1624,7 @@ class MaestroDaemon:
                     self._queue.remove(task_id)
                 except ValueError:
                     pass
+                record.pop("continuation", None)
         self._set_state(task_id, STATE_CANCELED, reason=reason or "canceled by user")
         if not record.get("queued"):
             self._release(task_id)
@@ -1563,23 +1636,26 @@ class MaestroDaemon:
         timeout: float | None = None,
         stop_states: tuple[str, ...] = TERMINAL_STATES + (STATE_INPUT_REQUIRED,),
     ) -> dict[str, Any]:
-        record = self._tasks.get(task_id)
-        if record is not None:
-            if record["state"] in stop_states:
-                return self.status_a2a(task_id)  # already stopped: no waiting needed
-        else:
-            claims = self.maestro._claims(task_id)
-            if not claims and not (self.state_dir / "tasks" / task_id).is_dir():
-                raise KeyError(f"Unknown task reference {task_id!r}")
-            # A task without a live record belongs to a dead process and can
-            # never emit events, so an unresolved state must not block waiters
-            # for the full timeout: _durable_state resolves it (unknown → failed).
-            state = _durable_state(claims, _runtime_from_claims(claims))
-            if state in stop_states:
-                return self.status_a2a(task_id)  # durable terminal from an earlier run
-        threshold = max((e.seq for e in self.bus.history(task_id=task_id)), default=0)
+        # Subscribe before looking at the state. A transition after the check
+        # is then always delivered (its seq is above start_seq), and one before
+        # it is seen by the check; no transition can fall between the two.
         sub = self.bus.subscribe()
         try:
+            record = self._tasks.get(task_id)
+            if record is not None:
+                if record["state"] in stop_states:
+                    return self.status_a2a(task_id)  # already stopped: no waiting needed
+            else:
+                claims = self.maestro._claims(task_id)
+                if not claims and not (self.state_dir / "tasks" / task_id).is_dir():
+                    raise KeyError(f"Unknown task reference {task_id!r}")
+                # A task without a live record belongs to a dead process and can
+                # never emit events, so an unresolved state must not block waiters
+                # for the full timeout: _durable_state resolves it (unknown → failed).
+                state = _durable_state(claims, _runtime_from_claims(claims))
+                if state in stop_states:
+                    return self.status_a2a(task_id)  # durable terminal from an earlier run
+            threshold = sub.start_seq
             sub.wait(
                 predicate=lambda e: e.task_id == task_id and e.type == "state" and e.data.get("state") in stop_states and e.seq > threshold,
                 timeout=timeout,
@@ -1685,14 +1761,22 @@ def record_transcript_append(record: dict[str, Any] | None, question: str) -> No
         record.setdefault("transcript", []).append({"question": question, "answer": ""})
 
 
-def record_transcript_answer(record: dict[str, Any] | None, answer: str) -> None:
+def record_transcript_answer(record: dict[str, Any] | None, answer: str, question: str | None = None) -> None:
+    """Record ``answer`` against the open question in the transcript.
+
+    When no entry is waiting for an answer (the task was parked by a gate or
+    for approval, or its transcript was lost in a restart), a new entry holding
+    ``question`` and the answer is added, so the answer still reaches the
+    agent's next prompt.
+    """
     if record is None:
         return
-    transcript = record.get("transcript") or []
+    transcript = record.setdefault("transcript", [])
     for entry in reversed(transcript):
         if not entry.get("answer"):
             entry["answer"] = answer
-            break
+            return
+    transcript.append({"question": question or "", "answer": answer})
 
 
 def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
@@ -1802,6 +1886,16 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             sub = daemon.bus.subscribe()
+            # A task stream starts at the task's latest turn (its most recent
+            # "submitted" event). Replaying earlier turns would end the stream
+            # at the previous turn's terminal event while the new turn runs.
+            turn_start = 0
+            if task_id is not None:
+                submitted = [
+                    e.seq for e in daemon.bus.history(task_id=task_id, types=("state",))
+                    if e.seq <= sub.start_seq and e.data.get("state") == STATE_SUBMITTED
+                ]
+                turn_start = submitted[-1] if submitted else 0
             try:
                 while True:
                     event = sub.get(timeout=daemon.sse_heartbeat_s)
@@ -1809,7 +1903,7 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                         self.wfile.write(b": keepalive\n\n")
                         self.wfile.flush()
                         continue
-                    if task_id is not None and event.task_id != task_id:
+                    if task_id is not None and (event.task_id != task_id or event.seq < turn_start):
                         continue
                     self.wfile.write(sse_encode(event.type, event.to_dict()).encode("utf-8"))
                     self.wfile.flush()
