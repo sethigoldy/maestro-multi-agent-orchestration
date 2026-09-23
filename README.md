@@ -822,7 +822,7 @@ by hand.
 
 The MCP surface is task-oriented: `delegate`, `followup`, `task_wait`,
 `task_status`, `list_tasks`, `agents_list`, `cancel_task`,
-`answer_task_question` — exact signatures and return shapes in the
+`answer_task_question`, `rename_task_branch` — exact signatures and return shapes in the
 [MCP tools reference](docs/usage/reference/mcp-tools.md).
 
 ---

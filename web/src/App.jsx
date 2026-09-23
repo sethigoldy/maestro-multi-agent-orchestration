@@ -21,6 +21,8 @@ function applyEvent(state, taskId, type, data) {
     next.transcript = [...(next.transcript || []), line].slice(-TRANSCRIPT_CAP);
   } else if (type === "usage") {
     next.usage = { ...(next.usage || {}), ...data };
+  } else if (type === "branch") {
+    if (data.branch) next.branch = data.branch;
   }
   const order = state.order.includes(taskId) ? state.order : [taskId, ...state.order];
   return { ...state, tasks: { ...state.tasks, [taskId]: next }, order };
@@ -57,6 +59,7 @@ export default function App() {
       state: (taskId, data) => dispatch({ kind: "event", taskId, type: "state", data }),
       output: (taskId, data) => dispatch({ kind: "event", taskId, type: "output", data }),
       usage: (taskId, data) => dispatch({ kind: "event", taskId, type: "usage", data }),
+      branch: (taskId, data) => dispatch({ kind: "event", taskId, type: "branch", data }),
       open: () => dispatch({ type: "live", live: true }),
       error: () => dispatch({ type: "live", live: false }),
     });
