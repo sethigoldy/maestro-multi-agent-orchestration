@@ -26,8 +26,9 @@ Commands that talk to the daemon (`delegate`, `task tail`, `dashboard`) resolve
 the endpoint in this order:
 
 1. `MAESTRO_DAEMON_URL` (optionally with `MAESTRO_DAEMON_TOKEN`).
-2. The `daemon.json` marker written by whichever broker started last. The
-   marker's process is liveness-checked; a stale marker yields the error
+2. The `daemon.json` marker written by the daemon that owns the state
+   directory (only one daemon can own it at a time). The marker's process is
+   liveness-checked and confirmed to be that daemon; a stale marker yields the error
    `no daemon reachable — start one with 'maestro daemon start' (or run 'maestro-daemon' in the foreground) or set MAESTRO_DAEMON_URL`.
 
 Non-loopback daemons record their auth token in the marker, so local CLI calls
@@ -36,18 +37,25 @@ are authorized automatically.
 ## maestro-daemon
 
 ```text
-maestro-daemon [--port N] [--bind IF] [--state-dir DIR]
+maestro-daemon [--port N] [--bind IF] [--state-dir DIR] [--allow-origin ORIGIN ...]
 ```
 
 Starts the broker daemon and blocks until SIGINT/SIGTERM. Prints one JSON line
 on startup: `pid`, `port`, `bind`, `advertised_host`, `state_dir`, and `token`
 when authentication is enabled.
 
+Only one daemon can own a state directory. If a live daemon already owns it,
+`maestro-daemon` prints an error to stderr that names the running daemon's pid
+and URL, and exits with status `1`. It does not touch that daemon's marker or
+its tasks. Stop the running daemon with `maestro daemon stop`, or pass a
+different `--state-dir`.
+
 | Option | Default | Meaning |
 |---|---|---|
 | `--port N` | `0` | Port to bind; `0` picks a free port |
 | `--bind IF` | `127.0.0.1` | Listen interface. `127.0.0.1` (loopback, no token), `0.0.0.0`/`::` (all interfaces — token auth enabled, primary LAN IP advertised), or an explicit IP (advertised and dialed as-is; token auth enabled) |
 | `--state-dir DIR` | `~/.maestro` or `$MAESTRO_HOME` | State directory for this daemon |
+| `--allow-origin ORIGIN` | `$MAESTRO_DAEMON_ALLOWED_ORIGINS` | A browser origin, written `scheme://host[:port]`, that may POST to the daemon besides the daemon's own address. Use it for the public address of a reverse proxy. Repeat the option for more than one origin. When given, it replaces the environment variable's list. An invalid origin stops the daemon from starting |
 
 ## maestro daemon
 
@@ -64,8 +72,8 @@ The lifecycle manager for the background daemon. It drives the same broker as
 | Subcommand | Behavior |
 |---|---|
 | `start` | Starts the daemon in a detached session (survives shell exit) and returns immediately. Output goes to `<state-dir>/daemon.log`. **Idempotent**: if a live, answering daemon already exists for this state directory it is reused — never duplicated (an advisory lock serializes concurrent starts). If a process exists but does not answer HTTP, `start` refuses rather than stacking a second daemon |
-| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. **Idempotent**: stopping when nothing is running is not an error |
-| `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
+| `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. A process is signalled only when it is confirmed to be the daemon that wrote the marker (it holds `daemon.owner.lock`, or, for a marker from an older version, its endpoint answers with a Maestro agent card). If the daemon crashed and its pid now belongs to an unrelated process, `stop` removes the stale marker, does not signal that process, and says so. **Idempotent**: stopping when nothing is running is not an error |
+| `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), *a live process that is not the daemon* (stale: the pid was reused), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
 | `restart` | `stop` + `start` with error handling |
 
 The `daemon.json` marker (written by the daemon itself) is the single source of
@@ -93,15 +101,15 @@ inside `custom_instructions` of `~/.openhands/agent_settings.json`.
 | Subcommand | Behavior |
 |---|---|
 | `list` | JSON: the managed skill, its source path, and every supported agent |
-| `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed` |
+| `status` | JSON array per agent: `kind`, `display_name`, `mechanism`, `path`, `binary`, `detected` (CLI on PATH), `installed`. Codex also reports `legacy_installed`, which is true when an old block is still in `~/.codex/instructions.md`. For agents whose instructions live in one markdown file, an `error` key appears when that file exists but cannot be read, for example because it is not valid UTF-8 text; `installed` is then false because Maestro cannot tell whether its block is there |
 | `install` | Installs the skill for every **detected** agent by default. `--agent NAME` targets one agent (adapter kind, binary name, or display name; installed even if not yet detected). `--all` installs for every supported agent regardless of detection. Updates are delete-then-reinstall: the existing skill is removed before the new one is written, so stale files from a previous Maestro version never survive |
-| `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed |
+| `uninstall` | Removes the skill from every agent where it is installed, or one `--agent NAME`. User-written content around a managed block is preserved; files that only ever contained the managed block are removed. An instructions file that cannot be read or is not valid UTF-8 is never rewritten: `install` and `uninstall` report an error for that agent and leave the file as it is, and the other agents are handled normally |
 
 ## delegate
 
 ```text
 maestro delegate (--file FILE | --title T --request R [--target A | --mode NAME])
-                 [--fallback A …] [--design-file FILE]
+                 [--fallback A …] [--design-file FILE] [--branch NAME]
                  [--context TEXT …] [--context-file PATH …] [--skill DIR …]
                  [--no-wait] [--workspace DIR | --project DIR]
 ```
@@ -116,6 +124,7 @@ task's event stream.
 | `--mode NAME` | Apply the work-mode preset of that name (a `[modes.NAME]` config table) — it pins the implementer/verifier/reviewer/fixer agents for this task. With `--file`, a flag value overrides the file's `[routing] mode` |
 | `--fallback A` | Fallback agent, tried in order after the target fails or is unavailable. Repeatable |
 | `--design-file FILE` | File whose text becomes the handoff's authoritative design |
+| `--branch NAME` | Name for the task's git branch, for example `feat/login-form`. Without it the branch is `maestro/<task-id>`. With `--file`, the flag value overrides the file's `[expectations] branch`. The branch must not exist yet, and its name must not clash with an existing branch as a folder (with a branch `feat` present, `feat/login` cannot be created, and with `feat/x` present, `feat` cannot be created). An invalid, existing or clashing name exits 2 before any agent runs |
 | `--context TEXT` | Add a `text` context entry to the handoff. Repeatable; labels are auto-numbered (`context-1`, …) |
 | `--context-file PATH` | Add a `file` context entry for that path (inlined when ≤8KB, otherwise artifact-referenced). Repeatable; label = file stem |
 | `--skill DIR` | Add a `skill` context entry: an [Agent Skills](https://agentskills.io/) directory containing a `SKILL.md`, staged for the task. Repeatable; label = directory name |
@@ -139,7 +148,8 @@ maestro task show <task-id|number>        # alias of status
 maestro task tail <task-id> [--all]
 maestro task audit <task-id>
 maestro task receipt <task-id|number> [--json]
-maestro task continue <task-id> --request "new instruction" [--context reuse|fresh] [--no-wait]
+maestro task continue <task-id> --request "new instruction" [--context reuse|fresh] [--no-wait] [--branch NAME]
+maestro task rename-branch <task-id|number> <new-branch>
 ```
 
 Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
@@ -152,7 +162,8 @@ Bare `maestro task <n>` is normalized to `task status`. Top-level aliases:
 | `tail` | Live-follows one task's event stream over SSE (no polling). `--all` follows the global stream instead of one task; with `--all` the exit code is always 0 (absent Ctrl-C) |
 | `audit` | Prints the durable record as JSON: title, state, workspace, branch, origin/target agents, attempts (agent, ok, exit code, duration, usage, error), the composed context entries (`context`, with their sources), accumulated usage, error, and parsed result files. Works after daemon restarts |
 | `receipt` | Prints the **execution receipt** — a human-readable summary (or stable JSON with `--json`) of what happened on one task: final state; per-attempt phase, agent, duration, cost, and ok/error; the deterministic verification result and command; work-mode gate verdicts and bounce count; totals (wall-clock or attempt-sum duration, aggregated cost when any attempt reported one), plus turn count, task-knowledge schema metadata, and continuation context stats for continued tasks. The receipt is a projection of the durable task state — it works for running, completed, failed, and canceled tasks alike, and after daemon restarts. If a daemon is reachable the receipt is served over its API (`GET /tasks/<id>/receipt`); otherwise it is built locally from the state directory. Unknown references exit 2 when no daemon can answer |
-| `continue` | Continues a finished task (completed/failed/canceled) with a new instruction: the same task id, workspace, branch, and routing resume — the follow-up turn runs under the handoff's fixer agent when one is pinned. `--context reuse` (default) injects the compact [task-knowledge snapshot](../reference/configuration.md#continuation--task-continuation-context); `--context fresh` starts a clean reasoning context. Blocks and streams the turn like `delegate` unless `--no-wait` prints the submission JSON and returns immediately. Requires a reachable daemon; unknown tasks or exhausted delegation depth exit 2 |
+| `continue` | Continues a finished task (completed/failed/canceled) with a new instruction: the same task id, workspace, branch, and routing resume — the follow-up turn runs under the handoff's fixer agent when one is pinned. `--context reuse` (default) injects the compact [task-knowledge snapshot](../reference/configuration.md#continuation--task-continuation-context); `--context fresh` starts a clean reasoning context. Blocks and streams the turn like `delegate` unless `--no-wait` prints the submission JSON and returns immediately. `--branch NAME` first renames the task's branch to NAME, with the same rules and refusals as `rename-branch`, and then runs the turn on it; for a task whose first turn could not create its branch, it sets the name this turn creates. Requires a reachable daemon; unknown tasks, exhausted delegation depth and a refused `--branch` exit 2 |
+| `rename-branch` | Renames a task's git branch and updates the task's record, so `task list`, `task status`, receipts and later `task continue` turns all use the new name. If you already renamed the branch yourself with `git branch -m`, the command only updates the record; it first checks git's reflog for that rename, and refuses if the new branch was not renamed from the task's branch, so an unrelated branch that happens to exist never becomes the task's branch. Only the local branch is renamed; a copy already pushed to a remote keeps its old name there. If the task has no branch yet, because it has not started or its first turn could not create the branch it asked for, the command changes the name that the next turn will create and prints `has no branch yet; its next turn will create <name>`. The new name must then be one that can be created, as at delegation. The command is refused while an agent is working on the task or a turn is starting, when the task uses `commit_policy = "no-commit"` (it never has a branch), when the new name already exists or clashes with an existing branch as a folder, and when neither the old nor the new branch exists. A `task continue` sent while a rename is under way waits for it to finish. It goes through the daemon when one is reachable and writes the state directory directly otherwise. Refusals and unknown tasks exit 2 |
 
 ## dashboard
 
@@ -180,7 +191,7 @@ maestro agents status <name>
 
 | Subcommand | Behavior |
 |---|---|
-| `list` | JSON array of registered agent specs (user-level, `~/.maestro/registry.json`) |
+| `list` | JSON array of registered agent specs (user-level, `~/.maestro/agents/<name>.toml`) |
 | `add` | Registers an agent. `--kind` must be one of: `codex`, `claude_code`, `hermes`, `pi`, `cline`, `openhands`, `cursor`, `copilot`, `opencode`, `a2a_remote`, or `generic`. `--skill` is repeatable. For `generic`: `--command` is required in practice (supports `{prompt}` substitution); `--input-mode stdin` pipes the prompt instead; `--output-format jsonl` enables usage/cost parsing from JSON lines. For `a2a_remote`: `--command` is the daemon URL and `--token` its bearer token |
 | `remove` | Unregisters by name; exits 2 if not registered |
 | `discover` | Scans `PATH` for known agent CLIs and reports findings (does not register) |
@@ -247,6 +258,22 @@ Deletes terminal tasks (phases `COMPLETE`/`FAILED`; canceled tasks land in
 directory or registry record. `--dry-run` lists what would be deleted without
 deleting. Prints a JSON summary (`removed`, `kept`). Manual only — never runs
 automatically.
+
+It is safe to run while the daemon is working: gc removes each task under the
+same locks the daemon uses to register tasks and append claims, so nothing the
+daemon writes at that moment is lost. Before it removes a task, gc checks again
+under those locks that the task is still finished and still older than `N`
+days. If the task changed in the meantime (for example a follow-up started
+and set its status back to working), gc keeps it and counts it in `kept`. Removed task
+numbers are never given out again. gc is refused on the `memvara` storage
+backend, which keeps claims as history and cannot drop them yet; nothing is
+deleted in that case and the command exits 2.
+
+This safety depends on file locking. On Windows, where Python has no `fcntl`
+module, and on file systems that refuse `flock` (some NFS and SMB mounts),
+Maestro cannot take the locks. It then prints a warning once that names the
+lock file and carries on without the lock. In that case, stop the daemon
+before you run `maestro gc`.
 
 ## doctor
 

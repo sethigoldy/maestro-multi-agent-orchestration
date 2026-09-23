@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..agents import AgentSpec
-from .base import AdapterPreflight, AdapterResult, BaseAdapter
+from .base import _CANCEL_POLL_S, AdapterPreflight, AdapterResult, BaseAdapter, _next_line
 
 
 class A2ARemoteAdapter(BaseAdapter):
@@ -123,32 +123,36 @@ class A2ARemoteAdapter(BaseAdapter):
         reader = _threading.Thread(target=_reader, daemon=True)
         reader.start()
         deadline = started + timeout if timeout else None
+        # A failed cancel request is tried again after this moment.
+        cancel_retry_at = 0.0
+        cancel_due: Callable[[], bool] | None = None
+        if should_cancel is not None:
+            asked = should_cancel
+            cancel_due = lambda: not cancel_sent and time.monotonic() >= cancel_retry_at and asked()  # noqa: E731
+
         try:
             while True:
-                # Clamp to zero: get(timeout=<negative>) raises ValueError
-                # instead of Empty, so an already-expired deadline must not be
-                # passed through. A single Empty exit covers both "deadline
-                # expired at the top of the loop" and "queue read timed out" —
-                # two branches here made 100% branch coverage depend on event
-                # timing (which exit fired first), flaking the CI gate.
-                remaining = (deadline - time.monotonic()) if deadline is not None else None
-                wait = None if remaining is None else max(remaining, 0)
-                try:
-                    item = event_q.get(timeout=wait)
-                except _queue.Empty:
+                # The events are read on a thread into a queue, so the wait for
+                # the next one checks for a cancel at least every _CANCEL_POLL_S
+                # seconds even while the remote agent sends nothing.
+                outcome, item = _next_line(event_q, deadline, cancel_due)
+                if outcome == "timeout":
                     return AdapterResult(ok=False, error=f"A2A remote task timed out after {timeout}s", usage=usage, duration_s=time.monotonic() - started)
+                if outcome == "cancel":
+                    try:
+                        post_jsonrpc(base_url, "tasks/cancel", {"id": remote_id, "reason": "canceled by orchestrator"}, token=token)
+                        cancel_sent = True
+                    except ValueError:
+                        # Best effort: try again shortly; meanwhile the stream
+                        # still reports the outcome.
+                        cancel_retry_at = time.monotonic() + _CANCEL_POLL_S
+                    continue  # keep reading until the remote task reports how it ended
                 if item is None:
                     break  # stream closed without a terminal state
                 if isinstance(item, BaseException):
                     return AdapterResult(ok=False, error=f"A2A event stream failed: {item}", usage=usage, duration_s=time.monotonic() - started)
                 event, envelope = item
                 data = envelope.get("data") or {}  # TaskEvent.to_dict nests the payload under "data"
-                if should_cancel is not None and should_cancel() and not cancel_sent:
-                    try:
-                        post_jsonrpc(base_url, "tasks/cancel", {"id": remote_id, "reason": "canceled by orchestrator"}, token=token)
-                        cancel_sent = True
-                    except ValueError:
-                        pass  # best effort; the stream still reports the outcome
                 if event == "output":
                     line = data.get("line")
                     if isinstance(line, str) and on_line is not None:

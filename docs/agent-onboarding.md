@@ -38,7 +38,11 @@ Field notes:
 
 - **`command`** — how to launch the CLI for one task. Use `{prompt}` to insert
   the work order as an argument, or leave it out and set `input_mode = "stdin"`
-  to pipe the prompt (better for long prompts; avoids ARG_MAX limits).
+  to pipe the prompt (better for long prompts; avoids ARG_MAX limits). The
+  command runs without a shell. If it starts one itself (`sh -c "..."`),
+  Maestro quotes the values it places inside the script; see
+  [Register an agent](usage/how-to/register-an-agent.md#onboard-any-cli-generic-spec)
+  for the exact rule.
 - **`output_format`** — `jsonl` makes Maestro parse JSON lines from stdout and
   pick up `cost_usd` / usage hints automatically. Use `text` when the CLI just
   prints prose.

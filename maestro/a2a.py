@@ -9,6 +9,8 @@ published field shapes in tests; no framework dependency is pulled in.
 from __future__ import annotations
 
 import json
+import sys
+import traceback
 import uuid
 from typing import Any
 
@@ -48,12 +50,15 @@ def jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
 
 ERR_METHOD_NOT_FOUND = -32601
 ERR_INVALID_PARAMS = -32602
+ERR_INTERNAL = -32603
 ERR_TASK_NOT_FOUND = -32004
 
 
 def _extract_handoff(message: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     """Pull the handoff document (or a text request) out of an A2A message."""
     parts = message.get("parts") or []
+    if not isinstance(parts, list):
+        parts = []  # a malformed parts value carries no usable content
     for part in parts:
         if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
             data = part["data"]
@@ -77,11 +82,30 @@ class A2ADispatcher:
         self.daemon = daemon
 
     def handle(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Answer one JSON-RPC request; never raises.
+
+        An unexpected exception becomes a -32603 "Internal error" response, so
+        the HTTP caller always gets a reply instead of a dropped connection.
+        The traceback goes to stderr for the operator; the response names only
+        the exception type.
+        """
+        try:
+            return self._dispatch(body)
+        except Exception as exc:
+            traceback.print_exc(file=sys.stderr)
+            request_id = body.get("id") if isinstance(body, dict) else None
+            return jsonrpc_error(request_id, ERR_INTERNAL, f"Internal error: {type(exc).__name__}")
+
+    def _dispatch(self, body: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
             return jsonrpc_error(body.get("id") if isinstance(body, dict) else None, ERR_INVALID_PARAMS, "Expected a JSON-RPC 2.0 request")
         request_id = body.get("id")
         method = str(body["method"])
-        params = body.get("params") or {}
+        params = body.get("params")
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params must be an object")
         if method == "message/send":
             return self._send(request_id, params)
         if method == "tasks/get":
@@ -90,6 +114,8 @@ class A2ADispatcher:
             return self._cancel(request_id, params)
         if method == "tasks/followup":
             return self._followup(request_id, params)
+        if method == "tasks/renameBranch":
+            return self._rename_branch(request_id, params)
         return jsonrpc_error(request_id, ERR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
     def _send(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -170,13 +196,31 @@ class A2ADispatcher:
         context_mode = params.get("context_mode", "reuse")
         if context_mode not in ("reuse", "fresh"):
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.context_mode must be 'reuse' or 'fresh'")
+        branch = params.get("branch")
+        if branch is not None and (not isinstance(branch, str) or not branch.strip()):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.branch must be a non-empty string when given")
         try:
-            result = self.daemon.followup(self.daemon.resolve(task_ref), instruction, context_mode=context_mode)
+            result = self.daemon.followup(self.daemon.resolve(task_ref), instruction, context_mode=context_mode, branch=branch)
         except KeyError as exc:
             return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         return jsonrpc_ok(request_id, {"task": self.daemon.status_a2a(result["task_id"])})
+
+    def _rename_branch(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        branch = params.get("branch")
+        if not isinstance(branch, str) or not branch.strip():
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.branch is required (non-empty string)")
+        try:
+            result = self.daemon.rename_branch(self.daemon.resolve(task_ref), branch)
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        except ValueError as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
+        return jsonrpc_ok(request_id, {"rename": result, "task": self.daemon.status_a2a(result["task_id"])})
 
 
 def new_message_id() -> str:

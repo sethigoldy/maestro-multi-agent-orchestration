@@ -127,3 +127,35 @@ console.log("ok");
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0 and "ok" in result.stdout, result.stderr
+
+
+def test_connect_events_forwards_branch_renames():
+    """A task-branch rename reaches the console live, as a 'branch' event."""
+    node = _node()
+    if node is None:
+        import pytest
+
+        pytest.skip("node not available; JS event wiring not tested")
+    # A browser-free stand-in: Node before 22 has no sessionStorage, and the
+    # console reads its token from there (none is stored here).
+    script = f"""
+globalThis.sessionStorage = {{ getItem: () => null, setItem: () => {{}} }};
+const listeners = {{}};
+globalThis.EventSource = class {{
+  constructor(url) {{ this.url = url; }}
+  addEventListener(type, fn) {{ listeners[type] = fn; }}
+}};
+const {{ connectEvents }} = await import({json.dumps(str(EVENTS_JS))});
+const seen = [];
+connectEvents({{ branch: (taskId, data) => seen.push([taskId, data.branch]) }});
+const assert = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
+assert(typeof listeners.branch === "function", "no listener for branch events");
+listeners.branch({{ data: JSON.stringify({{ task_id: "task-1", type: "branch", data: {{ old_branch: "maestro/task-1", branch: "feat/x" }} }}) }});
+assert(seen.length === 1 && seen[0][0] === "task-1" && seen[0][1] === "feat/x", JSON.stringify(seen));
+console.log("ok");
+"""
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", script],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0 and "ok" in result.stdout, result.stderr

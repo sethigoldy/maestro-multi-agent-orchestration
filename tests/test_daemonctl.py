@@ -51,6 +51,47 @@ def _write_marker(state_dir: Path, **overrides) -> None:
     (state_dir / "daemon.json").write_text(json.dumps(marker), encoding="utf-8")
 
 
+def _hold_owner_lock(state_dir: Path) -> int:
+    """Hold the owner lock in this process, the way a running daemon does."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd = daemonctl.acquire_owner_lock(state_dir)
+    assert fd is not None
+    return fd
+
+
+_LOCK_HOLDER_SCRIPT = """
+import fcntl, os, signal, sys, time
+if sys.argv[2] == "ignore-term":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+os.ftruncate(fd, 0)
+os.pwrite(fd, f"{os.getpid()}\\n".encode(), 0)
+while True:
+    time.sleep(0.1)
+"""
+
+
+def _wait_for_lock_holder(state_dir: Path, pid: int) -> None:
+    deadline = time.monotonic() + 10
+    while daemonctl.owner_lock_holder(state_dir) != pid:
+        assert time.monotonic() < deadline, "the child never took the owner lock"
+        time.sleep(0.05)
+
+
+def _unrelated_sleeper() -> subprocess.Popen:
+    """A process that is alive but is not a Maestro daemon (it stands in for a reused pid)."""
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def _closed_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
 class _ProbeServer:
     """A tiny HTTP server standing in for the daemon's public route."""
 
@@ -138,17 +179,26 @@ def test_status_dead_pid_is_stale(tmp_path):
 
 
 def test_status_alive_but_unreachable(tmp_path, monkeypatch):
-    _write_marker(tmp_path)  # pid = this process (alive)
-    monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: False)
-    info = daemonctl.status(state_dir=tmp_path)
+    # The marker's pid (this process) holds the owner lock, so it is the daemon.
+    _write_marker(tmp_path, owner_lock=True)
+    fd = _hold_owner_lock(tmp_path)
+    try:
+        monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: False)
+        info = daemonctl.status(state_dir=tmp_path)
+    finally:
+        os.close(fd)
     assert info.running is False and info.stale_marker is False
     assert "does not answer" in info.detail
 
 
 def test_status_running(tmp_path, monkeypatch):
-    _write_marker(tmp_path, started_at="2026-01-01T00:00:00+00:00")
-    monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
-    info = daemonctl.status(state_dir=tmp_path)
+    _write_marker(tmp_path, started_at="2026-01-01T00:00:00+00:00", owner_lock=True)
+    fd = _hold_owner_lock(tmp_path)
+    try:
+        monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
+        info = daemonctl.status(state_dir=tmp_path)
+    finally:
+        os.close(fd)
     assert info.running is True and info.pid == os.getpid()
     assert info.url == "http://127.0.0.1:8790"
     assert info.uptime_s is not None and info.uptime_s > 0
@@ -157,9 +207,13 @@ def test_status_running(tmp_path, monkeypatch):
 
 
 def test_status_running_with_token_and_custom_host(tmp_path, monkeypatch):
+    # A marker from an older daemon has no owner_lock field; its agent card confirms it.
     _write_marker(tmp_path, host="10.0.0.5", token="sekrit")
+    seen = []
+    monkeypatch.setattr(daemonctl, "_answers_as_maestro", lambda url, token: seen.append((url, token)) or True)
     monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
     info = daemonctl.status(state_dir=tmp_path)
+    assert info.running is True and seen == [("http://10.0.0.5:8790", "sekrit")]
     assert info.url == "http://10.0.0.5:8790" and info.token == "sekrit"
 
 
@@ -241,9 +295,10 @@ def test_stop_dead_pid_cleans_stale_marker(tmp_path):
 
 def test_stop_sigterm_real_process(tmp_path):
     # Reparented target: init/launchd reaps it, so the pid really disappears.
-    pid = _reparented_pid([sys.executable, "-c", "import time; time.sleep(30)"])
-    time.sleep(0.2)  # give it a moment to start
-    _write_marker(tmp_path, pid=pid)
+    # It holds the owner lock the way a daemon does, so stop() knows it is the daemon.
+    pid = _reparented_pid([sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "default"])
+    _wait_for_lock_holder(tmp_path, pid)
+    _write_marker(tmp_path, pid=pid, owner_lock=True)
     info = daemonctl.stop(state_dir=tmp_path, grace_s=10)
     assert info.running is False and info.detail == "daemon stopped"
     time.sleep(0.2)
@@ -253,12 +308,12 @@ def test_stop_sigterm_real_process(tmp_path):
 
 
 def test_stop_escalates_to_sigkill(tmp_path):
-    # A shell that ignores SIGTERM must be escalated to SIGKILL after the grace.
+    # A daemon that ignores SIGTERM must be escalated to SIGKILL after the grace.
     process = subprocess.Popen(
-        ["sh", "-c", 'trap "" TERM; while :; do sleep 0.1; done'], start_new_session=True
+        [sys.executable, "-c", _LOCK_HOLDER_SCRIPT, str(tmp_path / "daemon.owner.lock"), "ignore-term"], start_new_session=True
     )
-    time.sleep(0.3)  # ensure the trap is armed before stop() sends SIGTERM
-    _write_marker(tmp_path, pid=process.pid)
+    _wait_for_lock_holder(tmp_path, process.pid)  # the handler is installed before the lock is taken
+    _write_marker(tmp_path, pid=process.pid, owner_lock=True)
     info = daemonctl.stop(state_dir=tmp_path, grace_s=1)
     assert info.running is False and info.detail == "daemon stopped"
     assert process.wait(timeout=5) != 0
@@ -281,6 +336,7 @@ def test_stop_signal_delivery_failures(tmp_path, monkeypatch):
         return calls["n"] <= 2  # pre-check and post-grace checks see it alive
 
     monkeypatch.setattr(daemonctl, "_pid_alive", _fake_alive)
+    monkeypatch.setattr(daemonctl, "_identity_confirmed", lambda base, marker, pid, url: True)
     info = daemonctl.stop(state_dir=tmp_path, grace_s=0)
     assert info.running is False and info.detail == "daemon stopped"
     assert not (tmp_path / "daemon.json").exists()
@@ -383,10 +439,15 @@ def test_daemon_start_spawn_failure(state_home, monkeypatch):
 
 
 def test_daemon_start_live_pid_not_answering(state_home, monkeypatch):
-    _write_marker(state_home, pid=os.getpid(), port=1)
-    monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: False)
-    with pytest.raises(RuntimeError, match="exists but is not answering"):
-        daemonctl.start()
+    # A confirmed daemon (it holds the owner lock) that does not answer HTTP.
+    _write_marker(state_home, pid=os.getpid(), port=1, owner_lock=True)
+    fd = _hold_owner_lock(state_home)
+    try:
+        monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: False)
+        with pytest.raises(RuntimeError, match="exists but is not answering"):
+            daemonctl.start()
+    finally:
+        os.close(fd)
 
 
 def test_start_lock_contention_times_out(state_home, monkeypatch):
@@ -548,3 +609,141 @@ def test_cli_daemon_status_running_json(state_home, capsys):
         assert rc == 0 and data["running"] is True and data["pid"] is not None
     finally:
         daemonctl.stop()
+
+
+# ------------------------------------------------ identity before signalling (reused pids)
+
+@pytest.mark.parametrize("owner_lock", [True, False], ids=["current-marker", "older-marker"])
+def test_status_reports_a_reused_pid_as_stale(tmp_path, owner_lock):
+    sleeper = _unrelated_sleeper()
+    try:
+        extra = {"owner_lock": True} if owner_lock else {}
+        _write_marker(tmp_path, pid=sleeper.pid, port=_closed_port(), **extra)
+        info = daemonctl.status(state_dir=tmp_path)
+        assert info.running is False and info.stale_marker is True
+        assert "not the Maestro daemon" in info.detail
+        assert (tmp_path / "daemon.json").exists()  # status is read-only
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+@pytest.mark.parametrize("owner_lock", [True, False], ids=["current-marker", "older-marker"])
+def test_stop_never_signals_a_process_that_reused_the_pid(tmp_path, owner_lock):
+    sleeper = _unrelated_sleeper()
+    try:
+        extra = {"owner_lock": True} if owner_lock else {}
+        _write_marker(tmp_path, pid=sleeper.pid, port=_closed_port(), **extra)
+        info = daemonctl.stop(state_dir=tmp_path, grace_s=1)
+        time.sleep(0.2)
+        assert sleeper.poll() is None, "stop() signalled a process that is not the daemon"
+        assert info.running is False and info.stale_marker is True
+        assert "not signalled" in info.detail and str(sleeper.pid) in info.detail
+        assert not (tmp_path / "daemon.json").exists()
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_start_replaces_a_marker_whose_pid_was_reused(state_home):
+    sleeper = _unrelated_sleeper()
+    try:
+        _write_marker(state_home, pid=sleeper.pid, port=_closed_port())
+        info = daemonctl.start()
+        try:
+            assert info.running is True and info.pid != sleeper.pid
+        finally:
+            daemonctl.stop()
+        assert sleeper.poll() is None
+    finally:
+        sleeper.kill()
+        sleeper.wait()
+
+
+def test_owner_lock_holder_and_acquire(tmp_path):
+    assert daemonctl.owner_lock_holder(tmp_path) is None  # no lock file yet
+    fd = _hold_owner_lock(tmp_path)
+    try:
+        assert daemonctl.owner_lock_holder(tmp_path) == os.getpid()
+        assert daemonctl.acquire_owner_lock(tmp_path, wait_s=0.2) is None  # already held
+        os.pwrite(fd, b"garbage", 0)
+        assert daemonctl.owner_lock_holder(tmp_path) == 0  # held, but the pid is unreadable
+    finally:
+        daemonctl.release_owner_lock(fd)
+    assert daemonctl.owner_lock_holder(tmp_path) is None  # file exists, nobody holds it
+
+
+class _CardHandler(http.server.BaseHTTPRequestHandler):
+    """Answers the agent card only with the right bearer token; other paths return a list."""
+
+    def do_GET(self):  # noqa: N802
+        if self.path != "/.well-known/agent.json":
+            body = b"[]"
+        elif self.headers.get("Authorization") != "Bearer sekrit":
+            self.send_response(401)
+            self.end_headers()
+            return
+        else:
+            body = json.dumps({"name": "maestro-node", "url": "http://x", "capabilities": {}}).encode()
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # silence
+        pass
+
+
+def test_answers_as_maestro_checks_the_agent_card():
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CardHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    plain = _ProbeServer()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        assert daemonctl._answers_as_maestro(url, "sekrit") is True
+        assert daemonctl._answers_as_maestro(url, None) is False  # 401 without the token
+        assert daemonctl._answers_as_maestro(plain.url(), None) is False  # answers, but not JSON
+        assert daemonctl._answers_as_maestro(f"http://127.0.0.1:{_closed_port()}", None) is False
+    finally:
+        server.shutdown()
+        server.server_close()
+        plain.close()
+
+
+def test_answers_as_maestro_rejects_json_that_is_not_a_card(monkeypatch):
+    class _Resp:
+        def __init__(self, body):
+            self.body = body
+
+        def read(self):
+            return self.body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    for body in (b"[1, 2]", b'{"name": "something else"}'):
+        monkeypatch.setattr(daemonctl.urllib.request, "urlopen", lambda request, timeout, body=body: _Resp(body))
+        assert daemonctl._answers_as_maestro("http://127.0.0.1:1", None) is False
+
+
+def test_older_marker_without_port_cannot_be_confirmed(tmp_path):
+    _write_marker(tmp_path, port=0)
+    assert daemonctl._identity_confirmed(tmp_path, daemonctl._read_marker(tmp_path), os.getpid(), None) is False
+
+
+def test_live_owner_variants(tmp_path, monkeypatch):
+    assert daemonctl.live_owner(tmp_path) is None  # no marker at all
+    _write_marker(tmp_path, owner_lock=True)
+    fd = _hold_owner_lock(tmp_path)
+    try:
+        monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: True)
+        assert daemonctl.live_owner(tmp_path).running is True
+        monkeypatch.setattr(daemonctl, "probe", lambda url, timeout=3.0: False)
+        hung = daemonctl.live_owner(tmp_path)  # confirmed but not answering still owns the directory
+        assert hung is not None and hung.running is False and hung.pid == os.getpid()
+    finally:
+        os.close(fd)
+    assert daemonctl.live_owner(tmp_path) is None  # nobody holds the lock: the marker is stale
