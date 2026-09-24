@@ -17,6 +17,8 @@ import pytest
 from maestro.daemon import MaestroDaemon
 from maestro.handoff import HandoffDoc
 
+from config_files import write_config
+
 
 def _fake_bin(dirpath: Path, name: str, body: str) -> None:
     path = dirpath / name
@@ -111,7 +113,7 @@ def test_parked_task_can_be_canceled(daemon, tmp_path):
 
 def test_defaults_resolve_target_fallback_model_effort(daemon, tmp_path, binpath):
     _fake_bin(binpath, "codex", 'cat > /dev/null\necho done\nexit 0')
-    daemon.maestro.config["defaults"] = {"agent": "codex", "fallback": ["opencode"], "model": "gpt-5.6-luna", "effort": "max"}
+    write_config(daemon.state_dir, {"defaults": {"agent": "codex", "fallback": ["opencode"], "model": "gpt-5.6-luna", "effort": "max"}})
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(), ws)
     assert started["state"] == "submitted"  # not parked
@@ -126,7 +128,7 @@ def test_defaults_resolve_target_fallback_model_effort(daemon, tmp_path, binpath
 
 def test_defaults_do_not_override_explicit_handoff(daemon, tmp_path, binpath):
     _fake_bin(binpath, "claude", 'cat > /dev/null\nexit 0')
-    daemon.maestro.config["defaults"] = {"agent": "codex", "model": "default-model"}
+    write_config(daemon.state_dir, {"defaults": {"agent": "codex", "model": "default-model"}})
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(target_agent="claude_code", explicit_target=True), ws)
     assert started["state"] == "submitted"
@@ -143,14 +145,14 @@ def test_defaults_do_not_override_explicit_handoff(daemon, tmp_path, binpath):
 
 
 def test_defaults_unknown_agent_rejected(daemon, tmp_path):
-    daemon.maestro.config["defaults"] = {"agent": "nope"}
+    write_config(daemon.state_dir, {"defaults": {"agent": "nope"}})
     ws = _git_repo(tmp_path)
     with pytest.raises(ValueError, match="Unknown default agent 'nope'"):
         daemon.delegate(_doc(), ws)
 
 
 def test_defaults_self_delegation_rejected(daemon, tmp_path):
-    daemon.maestro.config["defaults"] = {"agent": "codex"}
+    write_config(daemon.state_dir, {"defaults": {"agent": "codex"}})
     ws = _git_repo(tmp_path)
     with pytest.raises(ValueError, match="cannot delegate to itself"):
         daemon.delegate(_doc(origin_agent="codex"), ws)
@@ -165,7 +167,7 @@ def test_defaults_applied_to_queued_task_on_promotion(daemon, tmp_path, binpath)
     time.sleep(0.3)
     second = daemon.delegate(_doc(title="second"), ws)
     assert second["queued"] is True
-    daemon.maestro.config["defaults"] = {"agent": "codex"}
+    write_config(daemon.state_dir, {"defaults": {"agent": "codex"}})
     daemon.cancel(first["task_id"])
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:

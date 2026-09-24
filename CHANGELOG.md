@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The daemon now reads a project's config, and config edits apply without a restart.** The daemon read its config once, when it started, and only from the user file (`~/.maestro/config.toml`). A `[defaults]` table in a project's `.maestro/config.toml` was ignored, although the documentation and the agent skill said it applied. An edit to the user file only took effect after `maestro daemon restart`, while `maestro config` already showed the new value. So a user or an agent that set `[defaults] agent` kept seeing new tasks stop to ask which agent to use. The daemon now reads the user, project and worktree files for each task's workspace whenever it needs them. That covers `[defaults]` (including `max_parallel`), `[modes]`, `[context]`, `[verification] timeout_s` and `[continuation]`. An invalid file refuses the delegation with its reason.
+
 ## [0.15.0] — 2026-09-25
 
 ### Added
