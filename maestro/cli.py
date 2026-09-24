@@ -732,7 +732,8 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         m.close()
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The ``maestro`` command-line parser, with every command and option."""
     p = argparse.ArgumentParser(prog="maestro", description="Multi-agent orchestration broker with durable user-level task state")
     p.add_argument("--version", action="version", version=VERSION)
     _add_target_args(p)
@@ -888,9 +889,15 @@ def main(argv: list[str] | None = None) -> int:
     agents_status = agents_sub.add_parser("status", help="Show registration/availability status for one agent")
     agents_status.add_argument("name")
 
-    args = p.parse_args(_normalize_argv(argv if argv is not None else sys.argv[1:]))
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(_normalize_argv(argv if argv is not None else sys.argv[1:]))
     if args.cmd == "task" and args.task_cmd is None:
-        task.print_help()
+        commands = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+        commands.choices["task"].print_help()
         return 2
     try:
         if args.cmd == "delegate":

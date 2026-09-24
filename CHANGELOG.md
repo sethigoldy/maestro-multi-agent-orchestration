@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The agent skill describes Maestro 0.15.** `maestro skill install` copies the `maestro-driven-development` skill into every agent, for example into `~/.codex/AGENTS.md`, and the skill tells agents it is the complete contract. It still said "there is no CLI answer command", so a Codex session could not answer a parked task and asked the user to find an MCP client. It also lacked `task answer`, `task cancel`, `task cleanup`, `delegate --agent-may-commit`, `daemon start --port`, `[defaults] max_parallel`, `[verification] timeout_s`, `[daemon] port` and `run_dir`. The skill now documents all of them, and says that `[defaults]` in the user or project config applies to the next task without a restart. A new test fails whenever a CLI command, one of the options agents use, an MCP tool or a config key is missing from the skill. Run `maestro skill install` (or the installer) to update the copies agents read.
+
 ## [0.15.0] — 2026-09-25
 
 ### Added

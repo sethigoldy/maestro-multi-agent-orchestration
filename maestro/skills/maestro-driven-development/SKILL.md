@@ -118,15 +118,22 @@ names one. Resolution order when a handoff is submitted:
    guess: the task parks in state `input-required` with a question listing every
    registered agent (name + detected version). Read the question
    (`maestro task status <task-id>` or the MCP return value), then:
-   - **Ask the user** which agent (and model) to use, and answer via MCP
-     `answer_task_question(workspace, task_id, answer)` — there is no CLI answer
-     command, so without MCP tools relay the question to the user instead of
-     guessing. Accepted answer forms: a bare agent name (`codex`), key=value
-     pairs (`agent=codex model=gpt-5.6-luna`), or JSON
+   - **Ask the user** which agent (and model) to use, then answer with the CLI
+     `maestro task answer <task-id> <answer>` or the MCP tool
+     `answer_task_question(workspace, task_id, answer)`. Both do the same thing
+     through the daemon. Accepted answer forms: a bare agent name (`codex`),
+     key=value pairs (`maestro task answer <task-id> agent=codex model=gpt-5.6-luna`;
+     the words are joined with spaces), or JSON
      (`{"agent": "codex", "model": "gpt-5.6-luna"}`). A bad answer leaves the
-     task parked for another attempt.
+     task parked for another attempt. The Maestro web console is read-only; do
+     not look for an answer button there.
    - To stop being asked on future tasks, write a `[defaults]` table into
-     `<project-root>/.maestro/config.toml` (see section 10).
+     `~/.maestro/config.toml` (all projects) or `<project-root>/.maestro/config.toml`
+     (this project only). The daemon reads these files for every task, so the
+     next task uses them; no restart is needed (section 10).
+   - Setting `[defaults]` does not answer a task that is already parked: answer
+     it as above, or cancel it with `maestro task cancel <task-id>` and delegate
+     again.
 
 The same parking happens for **sensitive workspaces** (question: "Approval
 required: this task targets a sensitive workspace.") — confirm with the user,
@@ -186,6 +193,17 @@ Rules:
 
 - While the command streams, watch for the final state: `completed`, `failed`,
   or `input-required`.
+- `maestro task status <task-id>` shows `state`, and for a parked task
+  `awaiting` and the `question` to answer. `phase` is coarser: a parked task
+  and a finished one both show `REVIEWING`, and `VERIFYING` means the agent
+  finished and the project's tests are running.
+- Where the work is: `run_dir` in the status. A task delegated while its
+  workspace was busy runs in a git worktree of its own under
+  `~/.maestro/worktrees/<task-id>`, on its own branch, so its changes are there,
+  not in the workspace. Review them in `run_dir`. After you have committed or
+  discarded them, remove the worktree with `maestro task cleanup <task-id>`
+  (refused while it has uncommitted changes unless `--force`; the branch is
+  kept). While a worktree exists, its branch cannot be checked out elsewhere.
 - After completion, inspect the durable record:
 
 ```bash
@@ -198,8 +216,10 @@ maestro task tail <task-id>       # live event stream (SSE)
 
 You own the final review decision:
 
-1. Read the diff/changes in the workspace yourself (the work lands on a task
-   branch or working tree).
+1. Read the diff/changes yourself, in the task's `run_dir` (the workspace, or
+   the task's worktree). Maestro never commits, and the agent is told not to
+   commit unless the handoff sets `agent_may_commit = true`, so the work is
+   uncommitted on the task branch. You review it and commit it.
 2. Run the verification commands that matter for this repository.
 3. If the result is acceptable, report it to the user (files changed, evidence,
    how to verify).
@@ -234,8 +254,8 @@ project root), `--version`, `-h/--help`.
 
 ```text
 maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode NAME]
-                 [--fallback AGENT ...] [--design-file PATH] [--branch NAME] [--context TEXT ...]
-                 [--context-file PATH ...] [--skill DIR ...] [--no-wait]
+                 [--fallback AGENT ...] [--design-file PATH] [--branch NAME] [--agent-may-commit]
+                 [--context TEXT ...] [--context-file PATH ...] [--skill DIR ...] [--no-wait]
 ```
 
 - `--file`: handoff document (TOML or JSON); `--title`/`--request` build one on
@@ -246,11 +266,16 @@ maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode 
   It must not exist yet and must not clash with an existing branch as a folder
   (`feat` and `feat/login` cannot both exist). Same as `[expectations] branch`
   in a handoff file.
+- `--agent-may-commit`: allow the agent to commit to the task branch (it still
+  may not push or switch branches). Without it the agent is told not to
+  commit. Same as `[expectations] agent_may_commit = true`.
 - `--context TEXT` / `--context-file PATH` / `--skill DIR`: inject standing
   context into the agent turns (text entry, inlined file, or Agent Skills
   directory containing SKILL.md).
 - Blocks until terminal state or `input-required`; prints `[state] …` lines and
-  final task JSON.
+  final task JSON. If the task cannot start yet it prints
+  `{"queued": true, "reason": …}`; the reason says why (the workspace is at its
+  `max_parallel` limit, or the task must wait for the workspace).
 
 ### task
 
@@ -261,7 +286,12 @@ maestro task show <task-id>           # alias for status
 maestro task tail <task-id>           # live event stream (SSE, no polling)
 maestro task audit <task-id>          # durable audit record: attempts, usage, errors
 maestro task receipt <task-id>        # execution receipt: attempts, verification, gates, totals
-maestro task continue <task-id> --request "…"   # follow-up turn on the same task and branch
+maestro task continue <task-id> --request "…" [--context reuse|fresh] [--branch NAME] [--no-wait]
+                                      # follow-up turn on a finished task, same task and branch
+maestro task answer <task-id> <answer…> [--no-wait]
+                                      # answer a parked (input-required) task; it resumes
+maestro task cancel <task-id> [--reason TEXT]   # cancel a parked, queued or running task
+maestro task cleanup <task-id> [--force]        # remove a task's worktree (never the branch)
 maestro task rename-branch <task-id> <name>     # rename the task's branch in git and in its record
 ```
 
@@ -275,18 +305,25 @@ maestro doctor                        # diagnose state dir, daemon, git, agents,
 maestro budgets                       # budget caps (MAESTRO_BUDGET_*_USD) and current spend
 maestro gc                            # delete terminal tasks older than the TTL (manual only)
 maestro dashboard                     # terminal SSE dashboard (no polling)
-maestro peers ...                     # manage discovered/registered Maestro peers
+maestro peers list                    # live and stale Maestro peers (peers.json)
+maestro peers add ...                 # register a peer by hand (networks without broadcast)
+maestro peers remove <key|name>       # remove a peer
 maestro storage migrate-memvara       # import legacy filesystem state into memvara
 ```
 
 ### daemon
 
 ```text
-maestro daemon start                  # idempotent; detaches, survives shell exit
+maestro daemon start [--port N]      # idempotent; detaches, survives shell exit
 maestro daemon stop                   # SIGTERM → grace (MAESTRO_DAEMON_STOP_GRACE_S) → SIGKILL
 maestro daemon status [--json]        # running/pid/port/url or false
-maestro daemon restart                # stop + start
+maestro daemon restart [--port N]    # stop + start
 ```
+
+The daemon listens on port 9785. `--port N` chooses another; without it the
+port comes from `MAESTRO_DAEMON_PORT`, then `[daemon] port` in
+`~/.maestro/config.toml`. `0` means any free port. Clients read the port from
+`daemon.json`, so you never need to pass it to other commands.
 
 ### agents
 
@@ -320,19 +357,30 @@ Config files (TOML), merged in order — later wins per key:
 2. `<project-root>/.maestro/config.toml` — project level
 3. `<workspace-root>/.maestro/config.toml` — active worktree level
 
+The daemon reads these files for each task's workspace every time it needs
+them, so an edit applies to the next task without a restart, and a project's
+file applies to that project only. `[daemon] port` and `[storage]` are read
+only when the daemon starts.
+
 ```toml
 [defaults]                 # routing defaults (section 3)
 agent    = "codex"
 fallback = ["claude_code"]
 model    = "gpt-5.6-luna"
 effort   = "max"           # low | medium | high | xhigh | max
+max_parallel = 4           # running tasks per workspace; the first runs in the
+                           # workspace, the rest in their own git worktrees; 1 = one at a time
 
 [codex]                    # Codex-specific defaults (shown by `maestro config`)
 model  = "gpt-5.6-luna"
 effort = "max"             # env fallbacks: MAESTRO_CODEX_MODEL / MAESTRO_CODEX_EFFORT
 
 [verification]
+timeout_s = 1800           # how long the project's tests may run (default 30 minutes; 0 = no limit)
 command = ["make", "check"]  # stored for forward compatibility (string or list)
+
+[daemon]
+port = 9785                # the daemon's port (default 9785; 0 = any free port)
 
 [storage]
 backend = "filesystem"     # filesystem (default) | memvara; env fallback MAESTRO_STORAGE
@@ -357,7 +405,8 @@ Relevant environment variables: `MAESTRO_HOME`, `MAESTRO_WORKSPACE`,
 `MAESTRO_STORAGE`, `MAESTRO_CODEX_MODEL`, `MAESTRO_CODEX_EFFORT`,
 `MAESTRO_DELEGATE_TIMEOUT` (seconds, default 3600), `MAESTRO_BUDGET_*_USD`
 (per-agent budget caps), `MAESTRO_DAEMON_URL`, `MAESTRO_DAEMON_TOKEN`,
-`MAESTRO_DAEMON_STOP_GRACE_S`, `MAESTRO_MAX_RETRIES`, `MAESTRO_BACKOFF_S`,
+`MAESTRO_DAEMON_PORT` (the daemon's port), `MAESTRO_DAEMON_STOP_GRACE_S`,
+`MAESTRO_MAX_RETRIES`, `MAESTRO_BACKOFF_S`,
 `MAESTRO_LOGIN_ENV` (set `0` to stop passing login-shell env vars to agents).
 
 ## 11. MCP tool contract
@@ -403,6 +452,8 @@ When your environment exposes the Maestro MCP server, these tools are available
   commands yourself when you can run them.
 - Never create Maestro tasks for questions, explanations, or summaries.
 - Never cancel-and-restart a task to dodge an input-required question — answer
-  it instead.
+  it instead, with `maestro task answer` or `answer_task_question`.
+- Never tell the user that a parked task can only be answered through MCP: the
+  CLI `maestro task answer <task-id> <answer>` does the same.
 - Never read Maestro source or docs to learn its interface — this skill is the
   complete contract.
