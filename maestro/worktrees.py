@@ -37,6 +37,14 @@ def head_commit(workspace: Path) -> str:
     return run.stdout.strip()
 
 
+def repo_prefix(path: Path) -> str:
+    """Where ``path`` sits inside its repository, such as "pkg/sub", or ""
+    at the top. A task for a workspace in a subdirectory runs in the same
+    subdirectory of its worktree."""
+    run = _git(path, "rev-parse", "--show-prefix")
+    return run.stdout.strip().rstrip("/") if run.returncode == 0 else ""
+
+
 def main_repo_root(path: Path) -> Path | None:
     """The main checkout of the repository that ``path`` belongs to, or None
     when ``path`` is not in a git repository. For a worktree this is the

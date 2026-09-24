@@ -387,3 +387,28 @@ def test_max_parallel_one_never_creates_a_worktree(tmp_path, monkeypatch, binpat
         assert d.wait(second["task_id"], timeout=30)["status"]["state"] == "completed"
     finally:
         _stop(d, tmp_path / "go")
+
+
+def test_workspace_in_a_subdirectory_runs_in_the_same_subdirectory_of_the_worktree(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    repo = _repo(tmp_path)
+    pkg = repo / "pkg"
+    pkg.mkdir()
+    (pkg / "mod.py").write_text("x = 1\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "."], env=_ENV, check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "pkg"], env=_ENV, check=True)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        d.delegate(_doc(), pkg)
+        second = d.delegate(_doc(), pkg)
+        root = d.state_dir / "worktrees" / second["task_id"]
+        assert second["run_dir"] == str(root / "pkg")
+        gate.touch()
+        d.wait(second["task_id"], timeout=60)
+        assert (root / "pkg" / "ran-here.txt").read_text().strip() == str(root / "pkg")
+        # Cleanup removes the whole worktree, not only the subdirectory.
+        assert d.cleanup_worktree(second["task_id"], force=True)["removed"] is True
+        assert not root.exists()
+    finally:
+        _stop(d, gate)

@@ -107,3 +107,13 @@ def test_dirty_files_of_a_directory_outside_git_is_empty(tmp_path):
     plain.mkdir()
     (plain / "file.txt").write_text("x\n", encoding="utf-8")
     assert worktrees.dirty_files(plain) == []
+
+
+def test_repo_prefix_of_root_and_subdirectory(tmp_path):
+    ws = _repo(tmp_path)
+    (ws / "pkg" / "sub").mkdir(parents=True)
+    assert worktrees.repo_prefix(ws) == ""
+    assert worktrees.repo_prefix(ws / "pkg" / "sub") == "pkg/sub"
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert worktrees.repo_prefix(plain) == ""

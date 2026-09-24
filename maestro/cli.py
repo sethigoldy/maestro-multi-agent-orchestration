@@ -675,9 +675,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             """The task's worktree and its uncommitted files, or None when it
             has no worktree on disk."""
             claims = m._claims(task_id)
-            if claims.get("task_run_dir_kind") != "worktree" or not claims.get("task_run_dir"):
+            if claims.get("task_run_dir_kind") != "worktree":
                 return None
-            path = Path(claims["task_run_dir"])
+            # The whole worktree, even when the task ran in a subdirectory of it.
+            path = worktrees.worktree_path(state_dir, task_id)
             return (path, worktrees.dirty_files(path)) if path.is_dir() else None
 
         removed: list[dict[str, Any]] = []

@@ -848,7 +848,11 @@ class MaestroDaemon:
             self._active[key] = task_id
             record["run_dir"], record["run_dir_kind"] = key, "workspace"
             return "workspace"
-        record["run_dir"] = str(worktrees.worktree_path(self.state_dir, task_id))
+        # The worktree is a checkout of the whole repository; a workspace in a
+        # subdirectory of it runs in the same subdirectory of the worktree.
+        root = worktrees.worktree_path(self.state_dir, task_id)
+        prefix = worktrees.repo_prefix(Path(key))
+        record["run_dir"] = str(root / prefix) if prefix else str(root)
         record["run_dir_kind"] = "worktree"
         return "worktree"
 
@@ -1763,22 +1767,23 @@ class MaestroDaemon:
             self._record_run_dir(task_id, workspace, "workspace")
             return workspace, branch
         run_dir = Path(record["run_dir"])
+        root = worktrees.worktree_path(self.state_dir, task_id)  # run_dir is root or a subdirectory of it
         if recorded:
             branch = recorded if branch_exists(workspace, recorded) else self._renamed_task_branch(workspace, task_id, recorded)
-            if worktrees.ensure_worktree(workspace, run_dir, branch):
+            if worktrees.ensure_worktree(workspace, root, branch):
                 self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
                     "agent": "maestro",
-                    "line": f"[maestro] the worktree {run_dir} was missing, so it was created again from branch {branch}; only committed work is in it",
+                    "line": f"[maestro] the worktree {root} was missing, so it was created again from branch {branch}; only committed work is in it",
                 }))
             else:
-                checked = subprocess.run(["git", "-C", str(run_dir), "checkout", branch], text=True, capture_output=True)
+                checked = subprocess.run(["git", "-C", str(root), "checkout", branch], text=True, capture_output=True)
                 if checked.returncode != 0:
                     raise RuntimeError(
-                        f"could not check out the task branch {branch!r} in {run_dir}: {(checked.stderr or checked.stdout).strip()}"
+                        f"could not check out the task branch {branch!r} in {root}: {(checked.stderr or checked.stdout).strip()}"
                     )
         else:
             branch = doc.branch or f"maestro/{task_id}"
-            worktrees.add_worktree(workspace, run_dir, branch, new_branch=True, start=worktrees.head_commit(workspace))
+            worktrees.add_worktree(workspace, root, branch, new_branch=True, start=worktrees.head_commit(workspace))
         self._record_run_dir(task_id, run_dir, "worktree")
         return run_dir, branch
 
@@ -2197,15 +2202,16 @@ class MaestroDaemon:
             if kind != "worktree":
                 return {"task_id": task_id, "run_dir": str(run_dir), "removed": False,
                         "reason": "this task ran in the workspace; Maestro never removes or changes your checkout"}
-            if not run_dir.is_dir():
+            root = worktrees.worktree_path(self.state_dir, task_id)  # the whole worktree, even when run_dir is a subdirectory
+            if not root.is_dir():
                 return {"task_id": task_id, "run_dir": str(run_dir), "removed": False, "reason": "the worktree is already gone"}
-            dirty = worktrees.dirty_files(run_dir)
+            dirty = worktrees.dirty_files(root)
             if dirty and not force:
                 raise ValueError(
-                    f"The worktree {run_dir} has uncommitted changes: {', '.join(dirty)}. "
+                    f"The worktree {root} has uncommitted changes: {', '.join(dirty)}. "
                     "Commit them, or pass --force to remove the worktree anyway"
                 )
-            worktrees.remove_worktree(Path(record["workspace"]), run_dir, force=force)
+            worktrees.remove_worktree(Path(record["workspace"]), root, force=force)
             self.maestro._write_claim(task_id, "task_run_dir_removed", "true")
             return {"task_id": task_id, "run_dir": str(run_dir), "removed": True, "reason": "removed; the branch is kept"}
 
