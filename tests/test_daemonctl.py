@@ -415,7 +415,7 @@ def test_daemon_start_replaces_stale_marker(state_home):
 def test_daemon_start_child_crash_reports_log(state_home, monkeypatch):
     monkeypatch.setattr(
         daemonctl, "_spawn_command",
-        lambda base: [sys.executable, "-c", "import sys; print('boom', file=sys.stderr); raise SystemExit(3)"],
+        lambda base, port: [sys.executable, "-c", "import sys; print('boom', file=sys.stderr); raise SystemExit(3)"],
     )
     with pytest.raises(RuntimeError, match="exited while starting"):
         daemonctl.start(ready_timeout_s=10)
@@ -424,14 +424,14 @@ def test_daemon_start_child_crash_reports_log(state_home, monkeypatch):
 def test_daemon_start_child_never_ready(state_home, monkeypatch):
     monkeypatch.setattr(
         daemonctl, "_spawn_command",
-        lambda base: [sys.executable, "-c", "import time; time.sleep(60)"],
+        lambda base, port: [sys.executable, "-c", "import time; time.sleep(60)"],
     )
     with pytest.raises(RuntimeError, match="did not become ready"):
         daemonctl.start(ready_timeout_s=1)
 
 
 def test_daemon_start_spawn_failure(state_home, monkeypatch):
-    def _boom(base):
+    def _boom(base, port):
         raise OSError("no such interpreter")
 
     monkeypatch.setattr(daemonctl, "_spawn_command", _boom)
@@ -561,7 +561,7 @@ def test_cli_daemon_start_stop_restart(state_home, capsys):
 def test_cli_daemon_start_failure_exit_code(state_home, monkeypatch, capsys):
     from maestro import cli
 
-    monkeypatch.setattr(daemonctl, "_spawn_command", lambda base: ["/nonexistent/interpreter"])
+    monkeypatch.setattr(daemonctl, "_spawn_command", lambda base, port: ["/nonexistent/interpreter"])
     rc = cli.main(["daemon", "start"])
     assert rc == 1
     assert "failed to launch" in capsys.readouterr().err
@@ -592,7 +592,7 @@ def test_cli_daemon_stop_failure_exit_code(state_home, monkeypatch, capsys):
 def test_cli_daemon_restart_failure_exit_code(state_home, monkeypatch, capsys):
     from maestro import cli
 
-    def _boom():
+    def _boom(port=None):
         raise RuntimeError("nope")
 
     monkeypatch.setattr(daemonctl, "restart", _boom)

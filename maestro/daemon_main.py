@@ -27,7 +27,8 @@ def run_daemon(state_dir: str | None = None, port: int = 0, bind: str = "127.0.0
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="maestro-daemon", description="Run the Maestro local broker daemon")
-    parser.add_argument("--port", type=int, default=0, help="Port to bind (0 = pick a free port)")
+    parser.add_argument("--port", type=int, default=None,
+                        help="Port to listen on. Default: $MAESTRO_DAEMON_PORT, else [daemon] port in config.toml, else 9785. 0 means any free port")
     parser.add_argument("--bind", default="127.0.0.1", help="Interface to listen on: 127.0.0.1 (default, local only), 0.0.0.0 (all interfaces — enables token auth), or an explicit IP")
     parser.add_argument("--state-dir", default=None, help="State directory (default: ~/.maestro or $MAESTRO_HOME)")
     parser.add_argument("--allow-origin", action="append", default=None, metavar="ORIGIN", help="A browser origin, such as https://maestro.example.com, that may POST to the daemon besides its own address; use it for the public address of a reverse proxy. Repeat for more than one. Overrides $MAESTRO_DAEMON_ALLOWED_ORIGINS")
@@ -56,9 +57,26 @@ def run_forever(install_handlers: bool = True) -> None:
 def main(argv: list[str] | None = None) -> int:
     from .daemonctl import DaemonAlreadyRunning
 
+    import errno
+    from pathlib import Path
+
+    from .core import maestro_user_dir
+    from .daemonctl import port_in_use_message, resolve_port
+
     args = _parse_args(argv)
+    state_dir = Path(args.state_dir) if args.state_dir else maestro_user_dir()
     try:
-        info = run_daemon(state_dir=args.state_dir, port=args.port, bind=args.bind, allowed_origins=args.allow_origin)
+        port = resolve_port(args.port, state_dir)
+    except ValueError as exc:
+        print(f"maestro-daemon: {exc}", file=sys.stderr, flush=True)
+        return 2
+    try:
+        info = run_daemon(state_dir=args.state_dir, port=port, bind=args.bind, allowed_origins=args.allow_origin)
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        print(f"maestro-daemon: {port_in_use_message(port, state_dir)}", file=sys.stderr, flush=True)
+        return 1
     except DaemonAlreadyRunning as exc:
         # Starting a second daemon here would overwrite the running daemon's
         # marker and mark its running tasks as failed, so refuse instead.

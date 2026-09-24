@@ -49,6 +49,10 @@ def _pin_discovery_to_loopback(monkeypatch):
     import os
 
     monkeypatch.setenv("MAESTRO_DISCOVERY_TTL", "0")
+    # Daemons started by tests listen on any free port, not the fixed default
+    # 9785, so tests running in parallel (and a daemon the developer is
+    # running) never collide. tests/test_daemon_port.py unsets it.
+    monkeypatch.setenv("MAESTRO_DAEMON_PORT", "0")
     monkeypatch.setenv("MAESTRO_DISCOVERY_IF", "127.0.0.1")
     worker = os.environ.get("PYTEST_XDIST_WORKER", "")  # "gw0", "gw1", … under xdist
     if worker.startswith("gw") and worker[2:].isdigit():

@@ -51,6 +51,54 @@ from typing import Any, Iterator
 
 DEFAULT_STOP_GRACE_S = 10.0
 READY_TIMEOUT_S = 20.0
+# The port the daemon listens on unless told otherwise. It sits next to the
+# peer-discovery port (9786), so both are easy to find and to open in a firewall.
+DEFAULT_DAEMON_PORT = 9785
+
+
+def _port_or_error(value: object, source: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 65535:
+        raise ValueError(f"{source} must be a port number from 0 to 65535 (0 means any free port): {value!r}")
+    return value
+
+
+def resolve_port(explicit: int | None, state_dir: Path) -> int:
+    """The port the daemon should listen on.
+
+    The first of these that is set wins: the --port flag, the
+    MAESTRO_DAEMON_PORT environment variable, ``port`` in the [daemon] table
+    of <state dir>/config.toml, and finally DEFAULT_DAEMON_PORT (9785).
+    0 means any free port."""
+    if explicit is not None:
+        return _port_or_error(explicit, "--port")
+    env = os.environ.get("MAESTRO_DAEMON_PORT")
+    if env is not None:
+        try:
+            value: object = int(env)
+        except ValueError:
+            value = env
+        return _port_or_error(value, "MAESTRO_DAEMON_PORT")
+    import tomllib
+
+    config_path = Path(state_dir) / "config.toml"
+    try:
+        with config_path.open("rb") as fh:
+            config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError):
+        config = {}  # a missing or unreadable file is reported by the config loader, not here
+    table = config.get("daemon") if isinstance(config.get("daemon"), dict) else {}
+    if "port" in table:
+        return _port_or_error(table["port"], f"[daemon] port in {config_path}")
+    return DEFAULT_DAEMON_PORT
+
+
+def port_in_use_message(port: int, state_dir: Path) -> str:
+    """What to tell the user when the daemon's port is taken."""
+    return (
+        f"port {port} is already in use by another program, so the daemon cannot listen on it. "
+        f"Start the daemon on another port with 'maestro daemon start --port N', the MAESTRO_DAEMON_PORT "
+        f"environment variable, or [daemon] port in {Path(state_dir) / 'config.toml'}"
+    )
 LOCK_WAIT_S = 30.0
 OWNER_LOCK_NAME = "daemon.owner.lock"  # held by the daemon that serves HTTP and owns daemon.json
 USERS_LOCK_NAME = "daemon.users.lock"  # held (shared) by every daemon process using the state directory
@@ -469,14 +517,15 @@ def _start_lock(state_dir: Path, wait_s: float = LOCK_WAIT_S) -> Iterator[None]:
         os.close(fd)
 
 
-def _spawn_command(state_dir: Path) -> list[str]:
+def _spawn_command(state_dir: Path, port: int) -> list[str]:
     """Command that runs the foreground daemon entry point in a fresh interpreter."""
-    return [sys.executable, "-m", "maestro.daemon_main", "--state-dir", str(state_dir)]
+    return [sys.executable, "-m", "maestro.daemon_main", "--state-dir", str(state_dir), "--port", str(port)]
 
 
 def start(
     state_dir: Path | None = None,
     *,
+    port: int | None = None,
     ready_timeout_s: float = READY_TIMEOUT_S,
 ) -> DaemonInfo:
     """Start the daemon detached, or return the existing one when it is already up.
@@ -504,7 +553,7 @@ def start(
         log_file = log_path.open("a", encoding="utf-8")
         try:
             process = subprocess.Popen(
-                _spawn_command(base),
+                _spawn_command(base, resolve_port(port, base)),
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
@@ -530,6 +579,10 @@ def start(
             raise RuntimeError(f"daemon did not become ready within {ready_timeout_s}s; see {log_path}")
         tail = _tail(log_path, lines=15)
         _terminate(process, grace_s=DEFAULT_STOP_GRACE_S)
+        busy = next((line.split("maestro-daemon: ", 1)[1] for line in reversed(tail.splitlines())
+                     if "maestro-daemon: port " in line and "is already in use" in line), None)
+        if busy is not None:
+            raise RuntimeError(busy)  # the child already said which port and how to pick another
         raise RuntimeError(f"daemon exited while starting (pid {process.pid}); log tail:\n{tail}")
 
 
@@ -661,7 +714,7 @@ def _remove_stale_marker(base: Path, detail: str) -> str:
     return f"{detail}; the marker was removed"
 
 
-def restart(state_dir: Path | None = None, *, grace_s: float | None = None, ready_timeout_s: float = READY_TIMEOUT_S) -> DaemonInfo:
+def restart(state_dir: Path | None = None, *, port: int | None = None, grace_s: float | None = None, ready_timeout_s: float = READY_TIMEOUT_S) -> DaemonInfo:
     """Stop (if anything is running) and start a fresh daemon."""
     stop(state_dir=state_dir, grace_s=grace_s)
-    return start(state_dir=state_dir, ready_timeout_s=ready_timeout_s)
+    return start(state_dir=state_dir, port=port, ready_timeout_s=ready_timeout_s)
