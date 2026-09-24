@@ -106,6 +106,7 @@ def test_worktree_path_is_under_state_dir_and_named_by_task(tmp_path):
 def test_head_commit_and_no_commit(tmp_path):
     ws = _repo(tmp_path)
     assert len(worktrees.head_commit(ws)) == 40
+    (tmp_path / "e").mkdir()
     empty = _repo(tmp_path / "e", commit=False)
     with pytest.raises(RuntimeError, match="has no commit yet"):
         worktrees.head_commit(empty)
