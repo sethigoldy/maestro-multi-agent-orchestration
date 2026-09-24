@@ -706,8 +706,10 @@ pairs, or JSON. Set `[defaults]` to stop being asked.
 
 Verification is not configured here — it is set per handoff (`verification =
 "auto" | "command" | "none"`) and auto-detected per workspace; see
-"Deterministic verification" below. A `[verification]` table in this file is
-accepted for forward compatibility but not run by the daemon.
+"Deterministic verification" below. In a `[verification]` table in this file,
+`timeout_s` limits how long the tests may run (1800 seconds by default; 0 means
+no limit). Its `command` key is accepted for forward compatibility but not run
+by the daemon.
 
 **Work-mode presets:** a `[modes.<name>]` table pins agents to the phases of a
 task cycle (see "Work modes" below). Every key except `implementer` is

@@ -78,6 +78,49 @@ _STATE_BY_PHASE = {
 _ALL_STATES = (STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED, STATE_COMPLETED, STATE_FAILED, STATE_CANCELED)
 
 
+def _duration_text(seconds: int) -> str:
+    """A time limit in words: "30 minutes", "1 second", "90 seconds"."""
+    if seconds >= 60 and seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{seconds} second{'s' if seconds != 1 else ''}"
+
+
+class _VerificationRun:
+    """What a verification command did: its exit code, output, and whether
+    the time limit stopped it."""
+
+    def __init__(self, returncode: int, stdout: str, stderr: str, timed_out: bool = False) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+
+
+def _run_verification_command(command: list[str], cwd: Path, timeout_s: int | None) -> _VerificationRun:
+    """Run the project's verification command, at most ``timeout_s`` seconds.
+
+    The command runs in its own process group, so when the time limit is
+    reached every process it started (test workers, a server it launched) is
+    stopped too, not only the first one."""
+    from .adapters.base import _kill_group
+
+    try:
+        process = subprocess.Popen(
+            command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", start_new_session=True,
+        )
+    except (OSError, ValueError) as exc:  # command not launchable: treat as a failed verification
+        return _VerificationRun(127, "", f"verification command could not be launched: {exc}")
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_group(process)
+        stdout, stderr = process.communicate()
+        return _VerificationRun(process.returncode if process.returncode is not None else -9, stdout or "", stderr or "", timed_out=True)
+    return _VerificationRun(process.returncode, stdout, stderr)
+
+
 def _durable_state(claims: dict[str, str], runtime: dict[str, Any]) -> str:
     """Resolve the state of a task that has no live in-memory record.
 
@@ -1684,15 +1727,18 @@ class MaestroDaemon:
         # for the agent's work.
         has_changes, evidence = self._workspace_has_changes(workspace, task_id)
         diff = subprocess.run(["git", "diff", "--check"], cwd=workspace, text=True, capture_output=True)
-        try:
-            tests = subprocess.run(test_cmd, cwd=workspace, text=True, capture_output=True)
-        except (OSError, ValueError) as exc:  # command not launchable: treat as a failed verification
-            class _FailedRun:
-                returncode = 127
-                stdout = ""
-                stderr = f"verification command could not be launched: {exc}"
-
-            tests = _FailedRun()
+        timeout_s = int(self.maestro.config.get("verification_timeout_s", 1800)) or None
+        self._set_verifying(task_id, True)
+        limit_text = f"time limit {_duration_text(timeout_s)}" if timeout_s else "no time limit"
+        self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
+            "agent": "maestro", "line": f"[verify] running: {' '.join(test_cmd)} ({limit_text})",
+        }))
+        tests = _run_verification_command(test_cmd, workspace, timeout_s)
+        self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
+            "agent": "maestro",
+            "line": "[verify] stopped: the time limit was reached" if tests.timed_out else f"[verify] finished with exit code {tests.returncode}",
+        }))
+        self._set_verifying(task_id, False)
         # An auto-detected pytest run that found no tests (exit code 5) is not
         # a test failure when the project had no Python test suite when the
         # turn started. It proves nothing about the turn either, so it is
@@ -1710,7 +1756,15 @@ class MaestroDaemon:
         if ok and (fallback_only or no_tests) and not has_changes:
             ok = False
             no_changes_reason = evidence
+        if tests.timed_out:
+            ok = False
         note_text = f"verification note: {note}\n\n" if note else ""
+        if tests.timed_out:
+            note_text += (
+                f"RESULT: FAILED — the verification command did not finish within {_duration_text(timeout_s)} "
+                "(the [verification] timeout_s setting), so Maestro stopped it and every process it started. "
+                "Raise timeout_s, or set it to 0 for no limit, if the tests need longer.\n\n"
+            )
         if suite_vanished:
             note_text += (
                 "verification note: pytest collected no tests although the project had a Python test suite "
@@ -1752,6 +1806,16 @@ class MaestroDaemon:
         self.maestro._write_claim(task_id, "task_verification", f"{'PASSED' if ok else 'FAILED'}: {report_path}")
         self.bus.publish(TaskEvent(task_id=task_id, type="verify", data={"ok": ok, "command": " ".join(test_cmd), "report": str(report_path)}))
         return ok
+
+    def _set_verifying(self, task_id: str, verifying: bool) -> None:
+        """Write the VERIFYING phase while the tests run, and IMPLEMENTING after.
+
+        Only for a task that is still working: a task canceled in the meantime
+        keeps the phase its cancel wrote."""
+        if (self._tasks.get(task_id) or {}).get("state") != STATE_WORKING:
+            return
+        phase = Phase.VERIFYING if verifying else Phase.IMPLEMENTING
+        self.maestro._write_claim(task_id, "task_status", phase.value)
 
     def _prepare_run_dir(self, task_id: str, doc: HandoffDoc, workspace: Path, recorded: str | None) -> tuple[Path, str | None]:
         """Get the task's run directory ready for this turn; return it and the branch.

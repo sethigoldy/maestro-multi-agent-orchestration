@@ -64,13 +64,23 @@ environment). An effort outside the five supported values is an error.
 
 ```toml
 [verification]
+timeout_s = 1800                # seconds the tests may run; 0 means no limit
 command = ["make", "check"]     # or a string, split on whitespace
 ```
 
-Parsed and validated (string or list of strings). Note: this value is stored
-but **not consumed** by the daemon's verification step — verification uses the
-handoff's `verification` mode plus auto-detection (see below). It is kept for
-forward compatibility.
+`timeout_s` is how long the project's verification command (the tests) may run
+after the agent finishes. The default is 1800 seconds (30 minutes). When the
+time runs out, Maestro stops the command and every process it started, and
+verification fails with the reason "the verification command did not finish
+within 30 minutes". Without a limit, tests that hang (waiting for a database,
+the network or a prompt) would keep the task in the `VERIFYING` phase forever
+and hold its workspace. Set it higher for slow test suites, or to `0` for no
+limit. It must be a whole number of seconds, 0 or more.
+
+`command` is parsed and validated (string or list of strings). Note: this
+value is stored but **not consumed** by the daemon's verification step —
+verification uses the handoff's `verification` mode plus auto-detection (see
+below). It is kept for forward compatibility.
 
 ### `[storage]`
 
