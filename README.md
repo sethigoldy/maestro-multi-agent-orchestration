@@ -695,8 +695,10 @@ backend = "filesystem"    # filesystem (default) | memvara
 becomes the target and `[defaults].model`/`effort` fill in what the handoff left
 unset, unless the target agent's registry entry sets its own value. If neither the handoff nor `[defaults]` names an agent, Maestro does not
 guess: the task parks in state `input-required` with a question listing every
-available agent, and resumes via MCP `answer_task_question` (a bare agent name,
-`agent=… model=…` pairs, or JSON). Set `[defaults]` to stop being asked.
+available agent. `maestro task status <task>` shows that question. The task
+resumes when you answer it with `maestro task answer <task> codex` or the MCP tool
+`answer_task_question`. The answer can be a bare agent name, `agent=… model=…`
+pairs, or JSON. Set `[defaults]` to stop being asked.
 
 Verification is not configured here — it is set per handoff (`verification =
 "auto" | "command" | "none"`) and auto-detected per workspace; see

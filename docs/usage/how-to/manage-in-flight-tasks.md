@@ -10,16 +10,15 @@ block until completion. For reading finished state, see
 | Action | CLI | MCP tools |
 |---|---|---|
 | Watch live output | `maestro task tail <id>` | (console/dashboard) |
-| Answer an agent question | — | `answer_task_question` |
+| Answer an agent question | `maestro task answer <id> <answer>` | `answer_task_question` |
 | Send a follow-up instruction | `maestro task continue <id>` | `followup` |
 | Rename a finished task's branch | `maestro task rename-branch <id> <name>` | `rename_task_branch` |
-| Cancel the task | — | `cancel_task` |
+| Cancel the task | `maestro task cancel <id>` | `cancel_task` |
 | Block until done or input needed | `maestro task tail <id>` (streams to the end) | `task_wait` |
 
-Steering actions (question, follow-up, cancel) are exposed through the MCP
-tools only; the CLI is for watching and reading state. If you drive Maestro
-purely from the shell, your in-flight options are live-tail plus waiting —
-steer later via an MCP client or by letting the task finish and reviewing.
+You can steer a task from the shell or from an MCP client. Both go through the
+same running daemon, so an answer or a cancel sent from either one has the same
+effect.
 
 ## Watch a task live
 
@@ -47,7 +46,15 @@ code 130); when following one task, the exit code is 0 if it ended `completed`,
 ## Answer an agent's question
 
 When an agent stops mid-task to ask something, the task state becomes
-`input-required` and it waits. From an MCP client:
+`input-required` and it waits. `maestro task status <id>` shows the question
+in its `question` field, and what the task waits for in `awaiting`. From the
+shell:
+
+```bash
+maestro task answer task-20250718-143022-a1b2c3 "Use the existing repository layer; no new dependencies."
+```
+
+From an MCP client:
 
 ```text
 answer_task_question(workspace="/path/to/repo",
@@ -157,6 +164,14 @@ Rules:
   delete it on the remote yourself.
 
 ## Cancel a task
+
+From the shell:
+
+```bash
+maestro task cancel task-20250718-143022-a1b2c3 --reason "superseded by task-…"
+```
+
+From an MCP client:
 
 ```text
 cancel_task(workspace="/path/to/repo",

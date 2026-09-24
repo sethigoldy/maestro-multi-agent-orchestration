@@ -103,6 +103,16 @@ def normalize(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _draw(stdout: Any, frame: str) -> None:
+    """Write one frame with "\r\n" line breaks.
+
+    The dashboard runs the terminal in raw mode, which turns off the
+    terminal's own "\n" to "\r\n" translation. A bare "\n" would move the
+    cursor down without returning it to column 0, so every row would start
+    where the previous row ended."""
+    stdout.write(frame.replace("\n", "\r\n"))
+
+
 def load_tasks(url: str, token: str | None = None) -> list[dict[str, Any]]:
     headers = {"Authorization": f"Bearer {token}"} if token else {}
     with urllib.request.urlopen(urllib.request.Request(f"{url}/tasks", headers=headers), timeout=10) as resp:
@@ -421,12 +431,12 @@ def run(
                         state.selected = min(len(state.tasks) - 1, (state.selected or 0) + 1)
                     else:
                         continue
-                    stdout.write(render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
+                    _draw(stdout, render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
                     stdout.flush()
                 if read_fd in ready:
                     os.read(read_fd, 64)  # drain; one redraw per wakeup
                     state.clamp_selection()
-                    stdout.write(render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
+                    _draw(stdout, render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
                     stdout.flush()
                     if done.is_set():
                         exit_code = 1  # the stream ended (daemon stopped)
