@@ -67,7 +67,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     A ``task`` token that appears later, as an argument of another command or
     as an option value, is left alone.
     """
-    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue", "rename-branch"}
+    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue", "answer", "cancel", "rename-branch"}
     index = 0
     while index < len(argv) and argv[index].startswith("-"):
         index += 2 if _takes_separate_value(argv[index]) else 1
@@ -415,6 +415,28 @@ def _cmd_task_continue(args: argparse.Namespace) -> int:
     return _stream_task(url, task_id, token=token)
 
 
+def _cmd_task_answer(args: argparse.Namespace) -> int:
+    """Answer the question a parked (input-required) task is waiting on."""
+    url, token = _daemon_endpoint()
+    result = _post_jsonrpc(url, "tasks/answer", {"id": args.task_id, "answer": " ".join(args.answer)}, token=token)
+    task_id = (result or {}).get("task_id")
+    if args.no_wait or not task_id or (result or {}).get("state") != "working":
+        # The answer can leave the task waiting again (for example, a routing
+        # answer that names an unknown agent). Print the result instead of
+        # waiting on a turn that did not start.
+        print(json.dumps(result, indent=2))
+        return 0
+    print(f"[task] {task_id} — answered, resuming", flush=True)
+    return _stream_task(url, task_id, token=token)
+
+
+def _cmd_task_cancel(args: argparse.Namespace) -> int:
+    url, token = _daemon_endpoint()
+    result = _post_jsonrpc(url, "tasks/cancel", {"id": args.task_id, "reason": args.reason}, token=token)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _cmd_task_rename_branch(args: argparse.Namespace) -> int:
     """Rename a task's branch through the running daemon, or directly in the
     durable record when no daemon is running (nothing can be working then)."""
@@ -701,6 +723,17 @@ def main(argv: list[str] | None = None) -> int:
     task_continue.add_argument("--no-wait", action="store_true", help="Return as soon as the turn is submitted (no SSE streaming)")
     task_continue.add_argument("--branch", default=None, metavar="NAME",
                                help="Rename the task's branch to NAME before this turn (same rules as 'task rename-branch')")
+    task_answer = task_sub.add_parser(
+        "answer",
+        help="Answer the question a task in state input-required is waiting on ('task status' shows it); the task then resumes",
+    )
+    task_answer.add_argument("task_id")
+    task_answer.add_argument("answer", nargs="+",
+                             help="The answer; several words are joined with spaces (for a routing question: 'codex' or 'agent=codex model=...')")
+    task_answer.add_argument("--no-wait", action="store_true", help="Return as soon as the answer is accepted (no SSE streaming)")
+    task_cancel = task_sub.add_parser("cancel", help="Cancel a task that is waiting, queued or running")
+    task_cancel.add_argument("task_id")
+    task_cancel.add_argument("--reason", default="", help="Why the task is canceled (kept in its record)")
     task_rename = task_sub.add_parser(
         "rename-branch",
         help="Rename a finished task's git branch and update its record (or record a rename already done with 'git branch -m')",
@@ -828,6 +861,10 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_receipt(args)
         if args.cmd == "task" and args.task_cmd == "continue":
             return _cmd_task_continue(args)
+        if args.cmd == "task" and args.task_cmd == "answer":
+            return _cmd_task_answer(args)
+        if args.cmd == "task" and args.task_cmd == "cancel":
+            return _cmd_task_cancel(args)
         if args.cmd == "task" and args.task_cmd == "rename-branch":
             return _cmd_task_rename_branch(args)
         if args.cmd == "doctor":

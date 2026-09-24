@@ -43,6 +43,8 @@ CLI_COMMANDS = (
     "task tail",
     "task audit",
     "task continue",
+    "task answer",
+    "task cancel",
     "task rename-branch",
     "dashboard",
     "agents add",

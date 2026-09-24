@@ -164,3 +164,48 @@ def test_task_lock_releases_on_exception(tmp_path):
                 raise RuntimeError("boom")
     finally:
         m.close()
+
+
+def test_status_shows_the_question_a_parked_task_waits_on(tmp_path, monkeypatch):
+    # The phase claim maps input-required to REVIEWING, the same phase a
+    # finished task has. A parked task's status must say it is waiting, what it
+    # waits for, and the question, so a CLI user can answer it.
+    import json
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        runtime = {"state": "input-required", "awaiting": "routing", "question": "Which agent should run this task?"}
+        m._write_claim(tid, 'task_runtime', json.dumps(runtime))
+        s = m.status(tid)
+        assert s['state'] == 'input-required'
+        assert s['awaiting'] == 'routing'
+        assert s['question'] == 'Which agent should run this task?'
+    finally:
+        m.close()
+
+
+def test_status_of_a_task_that_is_not_parked_has_no_question(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        m._write_claim(tid, 'task_runtime', json.dumps({"state": "completed"}))
+        s = m.status(tid)
+        assert 'question' not in s and 'awaiting' not in s
+    finally:
+        m.close()
+
+
+def test_status_ignores_an_unreadable_runtime_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        m._write_claim(tid, 'task_runtime', '{not json')
+        assert 'question' not in m.status(tid)
+        m._write_claim(tid, 'task_runtime', '["not", "an", "object"]')
+        assert 'question' not in m.status(tid)
+    finally:
+        m.close()

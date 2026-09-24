@@ -6,6 +6,15 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Answer or cancel a waiting task from the shell.** Before this change, a task in state `input-required` could only be answered or canceled through the MCP tools `answer_task_question` and `cancel_task`. When no session had those tools loaded, the task stayed parked for good. It also kept its workspace, so every task delegated to that workspace afterwards waited behind it in the queue. `maestro task answer <task> <answer>` and `maestro task cancel <task> [--reason TEXT]` now do the same through the running daemon, using the existing A2A methods `tasks/answer` and `tasks/cancel`. `task answer` streams the resumed turn like `task continue`, or prints the result with `--no-wait`. If the task is still waiting after the answer, for example because a routing answer named an unknown agent, the command prints the result and exits instead of waiting.
+
+### Fixed
+
+- **`maestro task status` shows what a waiting task is asking.** The status's `phase` reported a waiting task as `REVIEWING`, the same phase a finished task has, and the question was not shown anywhere in the CLI. For a task in state `input-required`, the status now includes `state`, `awaiting` (`routing`, `approval`, `question` or `gate`) and `question`.
+- **The terminal dashboard draws each row at the start of its line.** `maestro dashboard` puts the terminal in raw mode, which turns off the terminal's own conversion of a line feed into a carriage return plus line feed. Each row therefore began in the column where the previous row ended, and the screen was unreadable. The dashboard now writes `\r\n` at the end of each line.
+
 ## [0.13.0] — 2026-09-23
 
 ### Added

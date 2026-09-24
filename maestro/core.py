@@ -728,6 +728,15 @@ class Maestro:
                 if result["workspace"]:  # pragma: no branch
                     break
         result["project_root"]=(index or {}).get("project_root") or str(self.project_root)
+        # The phase claim reports a parked task as REVIEWING, the same as a
+        # finished one. The runtime snapshot says it is waiting, what for, and
+        # the question to answer with `maestro task answer`.
+        try: runtime=json.loads(claims.get("task_runtime") or "{}")
+        except (ValueError, TypeError): runtime={}
+        if isinstance(runtime, dict) and runtime.get("state")=="input-required":
+            result["state"]="input-required"
+            result["awaiting"]=runtime.get("awaiting")
+            result["question"]=runtime.get("question")
         return result
 
     def list_tasks(self, *, workspace_filter: str | None = None, project_filter: str | None = None) -> list[dict[str, Any]]:

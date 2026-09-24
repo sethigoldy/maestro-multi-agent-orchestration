@@ -196,6 +196,32 @@ def test_run_renders_events_and_quits(tmp_path):
         server.server_close()
 
 
+def test_run_ends_every_line_with_carriage_return(tmp_path):
+    # The dashboard puts the terminal in raw mode, which turns off the
+    # terminal's own newline translation. A bare "\n" then moves the cursor
+    # down without returning it to column 0, so each row starts where the
+    # previous one ended. Every line break the dashboard writes must be "\r\n".
+    server, url = _sse_server(
+        tmp_path,
+        [
+            {"id": "task-1", "status": {"state": "completed"}, "metadata": {"title": "First"}},
+            {"id": "task-2", "status": {"state": "failed"}, "metadata": {"title": "Second"}},
+        ],
+        _frame("task-1", "output", {"line": "live-line"}),
+    )
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, stdin=_PipeStdin(b"j" + b"q", delay_s=0.3), stdout=out, is_tty=lambda: True)
+        text = out.getvalue()
+        assert rc == 0
+        assert "Second" in text
+        assert "\n" in text
+        assert "\n" not in text.replace("\r\n", "")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_run_exits_when_stream_closes(tmp_path):
     server, url = _sse_server(tmp_path, [], b"", close_after_connect=True)
     try:

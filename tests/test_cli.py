@@ -251,6 +251,68 @@ def test_task_continue_error_result_prints_json(monkeypatch, tmp_path, capsys):
     assert json.loads(capsys.readouterr().out)["error"]["code"] == -32004
 
 
+def _rpc_capture(monkeypatch, result):
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
+    captured = {}
+
+    def fake_post(url, method, payload, token=None):
+        captured["method"] = method
+        captured["payload"] = payload
+        return result
+
+    def fake_stream(url, task_id, token=None):
+        captured["streamed"] = task_id
+        return 0
+
+    monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
+    monkeypatch.setattr(cli, "_stream_task", fake_stream)
+    return captured
+
+
+def test_task_answer_posts_answer_and_streams_the_resumed_task(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _rpc_capture(monkeypatch, {"task_id": "task-p", "state": "working"})
+    rc = cli.main(["task", "answer", "task-p", "codex"])
+    assert rc == 0
+    assert captured["method"] == "tasks/answer"
+    assert captured["payload"] == {"id": "task-p", "answer": "codex"}
+    assert captured.get("streamed") == "task-p"
+    assert "[task] task-p — answered, resuming" in capsys.readouterr().out
+
+
+def test_task_answer_joins_words_into_one_answer(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    captured = _rpc_capture(monkeypatch, {"task_id": "task-p", "state": "working"})
+    assert cli.main(["task", "answer", "task-p", "agent=codex", "model=gpt-5.6-luna", "--no-wait"]) == 0
+    assert captured["payload"]["answer"] == "agent=codex model=gpt-5.6-luna"
+    assert "streamed" not in captured
+
+
+def test_task_answer_that_parks_again_prints_the_result(monkeypatch, tmp_path, capsys):
+    # An answer can leave the task waiting (for example, the routing answer
+    # named an unknown agent). The CLI must not wait on a stream then.
+    monkeypatch.chdir(tmp_path)
+    captured = _rpc_capture(monkeypatch, {"task_id": "task-p", "state": "input-required"})
+    assert cli.main(["task", "answer", "task-p", "codex"]) == 0
+    assert "streamed" not in captured
+    assert json.loads(capsys.readouterr().out)["state"] == "input-required"
+
+
+def test_task_cancel_posts_cancel_with_reason(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    result = {"cancel": {"task_id": "task-p", "state": "canceled"}, "task": {"id": "task-p"}}
+    captured = _rpc_capture(monkeypatch, result)
+    assert cli.main(["task", "cancel", "task-p", "--reason", "re-delegated"]) == 0
+    assert captured["method"] == "tasks/cancel"
+    assert captured["payload"] == {"id": "task-p", "reason": "re-delegated"}
+    assert json.loads(capsys.readouterr().out)["cancel"]["state"] == "canceled"
+
+
+def test_task_answer_and_cancel_are_not_rewritten_to_status():
+    assert cli._normalize_argv(["task", "answer", "t", "x"]) == ["task", "answer", "t", "x"]
+    assert cli._normalize_argv(["task", "cancel", "t"]) == ["task", "cancel", "t"]
+
+
 def test_config_lists_modes(monkeypatch, tmp_path, capsys):
     home = tmp_path / "home"
     home.mkdir()
