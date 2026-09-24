@@ -5,7 +5,7 @@ import sys
 
 from maestro import cli
 
-def test_version(): assert cli.VERSION=='0.15.0'
+def test_version(): assert cli.VERSION=='0.15.1'
 
 def test_normalize_task_shortcut(): assert cli._normalize_argv(['task','abc'])==['task','status','abc']
 

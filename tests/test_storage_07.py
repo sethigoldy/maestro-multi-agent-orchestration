@@ -455,7 +455,7 @@ def test_pyproject_optional_dependency_groups_are_arrays():
 def test_pyproject_version_is_release_version():
     import tomllib
     data = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text())
-    assert data["project"]["version"] == "0.15.0"
+    assert data["project"]["version"] == "0.15.1"
 
 
 def test_project_root_codex_config_overrides_user_for_worktree(tmp_path, monkeypatch):
