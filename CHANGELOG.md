@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-09-24
+
 ### Added
 
 - **Answer or cancel a waiting task from the shell.** Before this change, a task in state `input-required` could only be answered or canceled through the MCP tools `answer_task_question` and `cancel_task`. When no session had those tools loaded, the task stayed parked for good. It also kept its workspace, so every task delegated to that workspace afterwards waited behind it in the queue. `maestro task answer <task> <answer>` and `maestro task cancel <task> [--reason TEXT]` now do the same through the running daemon, using the existing A2A methods `tasks/answer` and `tasks/cancel`. `task answer` streams the resumed turn like `task continue`, or prints the result with `--no-wait`. If the task is still waiting after the answer, for example because a routing answer named an unknown agent, the command prints the result and exits instead of waiting.
