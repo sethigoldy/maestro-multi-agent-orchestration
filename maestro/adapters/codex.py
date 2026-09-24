@@ -1,16 +1,18 @@
 """Codex CLI adapter (generalizes the 0.8.x worker command).
 
-The autonomous-execution flags moved across codex releases: older CLIs take
-``--full-auto``; current ones (0.15x) take ``--approve-for-me`` (which implies
-the workspace-write sandbox) and reject ``--full-auto`` outright. The adapter
-probes ``codex exec --help`` once per instance and picks the flag set the
-installed CLI actually accepts, so both old and new installs work unmodified.
+The flags that let ``codex exec`` work without asking moved across codex
+releases. Current CLIs (0.146 and later) take ``--sandbox workspace-write``:
+they print "--full-auto is deprecated; use --sandbox workspace-write
+instead" and reject ``--approve-for-me``. Older CLIs take ``--full-auto``,
+and some take ``--approve-for-me``. The adapter reads ``codex exec --help``
+once per instance and picks the flag set that the help lists, preferring
+``--approve-for-me``, then ``--sandbox workspace-write``, then
+``--full-auto``; with no usable help it assumes the current surface.
 
-The probe is a first guess only: when the installed CLI accepts neither flag
-(or the probe itself fails), the run dies at argument-parse time with clap's
-``error: unexpected argument ... found``. In that case the adapter retries
-once with the *other* autonomy-flag set and caches the choice, so any version
-skew self-heals within a single attempt instead of failing every daemon retry.
+The help is a first guess only. When the installed CLI rejects the chosen
+flag at argument-parse time (clap's ``error: unexpected argument ...
+found``), the adapter tries each remaining flag set once, in the order
+above, and keeps the one that works for this instance.
 """
 
 from __future__ import annotations
@@ -25,13 +27,21 @@ from ..agents import AgentSpec
 from .base import AdapterResult, BaseAdapter
 
 
+SANDBOX_FLAGS = ["--sandbox", "workspace-write"]
+# Every autonomy flag set, in the order they are tried after a rejection.
+AUTONOMY_FLAG_SETS = [SANDBOX_FLAGS, ["--full-auto"], ["--approve-for-me"]]
+
+
 def classify_codex_help(help_text: str) -> list[str]:
     """Map a ``codex exec --help`` dump onto the autonomy flags it supports."""
+    if "--approve-for-me" in help_text:
+        # Implies the workspace-write sandbox; cannot be combined with --sandbox.
+        return ["--approve-for-me"]
+    if "--sandbox" in help_text:
+        return list(SANDBOX_FLAGS)
     if "--full-auto" in help_text:
         return ["--full-auto"]
-    # Current CLIs (0.15x): --approve-for-me implies the workspace-write sandbox
-    # and cannot be combined with an explicit --sandbox flag.
-    return ["--approve-for-me"]
+    return list(SANDBOX_FLAGS)  # no usable help: assume the current surface
 
 
 def _flag_rejection(error: str, flags: list[str]) -> bool:
@@ -91,15 +101,19 @@ class CodexAdapter(BaseAdapter):
         on_line: Callable[[str], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> AdapterResult:
-        first_flags = self._exec_flags()  # probe + cache before the first attempt
+        tried = [self._exec_flags()]  # probe + cache before the first attempt
         result = super().run(
             prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir,
             on_line=on_line, should_cancel=should_cancel,
         )
-        if not result.ok and _flag_rejection(result.error, first_flags):
-            # Version skew: the installed CLI rejected the probed autonomy flag.
-            # Retry once with the alternate surface (and remember it for this instance).
-            self._autonomy_flags = ["--full-auto"] if "--approve-for-me" in first_flags else ["--approve-for-me"]
+        # Version skew: the installed CLI rejected the chosen autonomy flag.
+        # Try each remaining flag set once, and keep the one that works.
+        while not result.ok and _flag_rejection(result.error, tried[-1][:1]):
+            remaining = [flags for flags in AUTONOMY_FLAG_SETS if flags not in tried]
+            if not remaining:
+                break
+            self._autonomy_flags = list(remaining[0])
+            tried.append(self._autonomy_flags)
             result = super().run(
                 prompt, workspace, task_id, settings=settings, timeout=timeout, log_dir=log_dir,
                 on_line=on_line, should_cancel=should_cancel,

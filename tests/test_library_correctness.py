@@ -18,6 +18,8 @@ import pytest
 from maestro.adapters import ClineAdapter, CopilotAdapter, CursorAdapter, GenericAdapter, HermesAdapter, PiAdapter
 from maestro.agents import AgentRegistry, AgentSpec, _dump_toml, _toml_scalar
 
+from config_files import write_config
+
 
 # ---------------------------------------------------------------------------
 # Bug 1: a per-task model or effort override must beat the registry default.
@@ -774,7 +776,7 @@ def test_cline_unknown_task_effort_falls_back_to_registry_effort():
 
 def test_defaults_do_not_override_the_target_registry_model_or_effort(maestro_daemon):
     maestro_daemon.registry.save(AgentSpec(name="codex", kind="codex", model="gpt-registry", effort="low"))
-    maestro_daemon.maestro.config["defaults"] = {"agent": "codex", "model": "gpt-default", "effort": "max"}
+    write_config(maestro_daemon.state_dir, {"defaults": {"agent": "codex", "model": "gpt-default", "effort": "max"}})
     doc = _task_doc(target_agent="codex", explicit_target=False)
     assert maestro_daemon._apply_defaults(doc) is True
     assert doc.agent_settings == {}
@@ -783,7 +785,7 @@ def test_defaults_do_not_override_the_target_registry_model_or_effort(maestro_da
 
 
 def test_defaults_fill_the_target_when_its_registry_sets_nothing(maestro_daemon):
-    maestro_daemon.maestro.config["defaults"] = {"agent": "codex", "model": "gpt-default", "effort": "max"}
+    write_config(maestro_daemon.state_dir, {"defaults": {"agent": "codex", "model": "gpt-default", "effort": "max"}})
     doc = _task_doc(target_agent="codex", explicit_target=False)
     maestro_daemon._apply_defaults(doc)
     assert doc.agent_settings == {"model": "gpt-default", "effort": "max"}

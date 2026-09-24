@@ -686,9 +686,11 @@ Full field reference:
 Precedence (most specific wins): `~/.maestro/config.toml` →
 `<project-root>/.maestro/config.toml` → `<active-worktree>/.maestro/config.toml`.
 
-The daemon reads config at startup — restart it after editing a config file for
-changes to take effect (`maestro config` always shows the current files, even if
-a running daemon is still holding older values).
+The daemon reads these files for each task's workspace whenever it needs them,
+so a project's `[defaults]` apply to that project's tasks, and an edit applies
+to the next task without restarting the daemon. `maestro config` shows the same
+values. `[daemon] port` and `[storage]` are the exceptions: they are read only
+when the daemon starts.
 
 ```toml
 [defaults]                # routing defaults — used when a handoff names no target agent
