@@ -670,9 +670,9 @@ def test_two_concurrent_answers_start_one_turn(daemon, tmp_path, binpath):
     barrier = threading.Barrier(2, timeout=10)
     real_defaults = daemon._apply_defaults
 
-    def apply_defaults(doc):
+    def apply_defaults(doc, workspace=None):
         barrier.wait()
-        return real_defaults(doc)
+        return real_defaults(doc, workspace)
 
     daemon._apply_defaults = apply_defaults
     results = _race([lambda: daemon.answer_question(tid, "approved"), lambda: daemon.answer_question(tid, "approved too")])

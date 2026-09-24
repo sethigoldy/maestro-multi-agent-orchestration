@@ -317,9 +317,9 @@ def test_cli_task_audit_shows_composed_context(live_daemon, tmp_path, monkeypatc
     _fake_bin(bp, "codex", 'cat > /dev/null\necho ok\nexit 0')
     monkeypatch.setenv("PATH", f"{bp}{os.pathsep}{os.environ['PATH']}")
 
-    # Standing entry injected via the config seam (mirrors [context.<label>] tables).
-    from maestro.context import ContextEntry
-    live_daemon.maestro.config["context"] = {"style": ContextEntry(label="style", kind="text", text="Standing rule.", source="user config")}
+    # A standing [context.<label>] entry in the user config file.
+    from config_files import write_config
+    write_config(live_daemon.state_dir, {"context": {"style": {"text": "Standing rule."}}})
 
     ws = _git_repo(tmp_path)
     started = live_daemon.delegate(_doc(context_entries=[{"label": "spec", "kind": "text", "text": "Per-task note."}]), ws)

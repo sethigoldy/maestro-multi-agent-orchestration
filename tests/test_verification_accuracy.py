@@ -23,6 +23,8 @@ from maestro import worker
 from maestro.daemon import MaestroDaemon
 from maestro.handoff import HandoffDoc
 
+from config_files import write_config
+
 GIT_ENV = dict(
     os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"
 )
@@ -864,7 +866,7 @@ def test_verification_time_limit_stops_the_command_and_its_children(daemon, tmp_
 
     ws = _repo(tmp_path, {"README.md": "# repo\n"})
     pidfile = tmp_path / "child.pid"
-    daemon.maestro.config["verification_timeout_s"] = 1
+    write_config(daemon.state_dir, {"verification": {"timeout_s": 1}})
     # The command starts a background child that would outlive a plain kill.
     command = f"sh -c 'sleep 60 & echo $! > {pidfile}; wait'"
     started = _time.monotonic()
@@ -887,7 +889,7 @@ def test_verification_time_limit_stops_the_command_and_its_children(daemon, tmp_
 
 def test_verification_without_a_time_limit_when_timeout_is_zero(daemon, tmp_path):
     ws = _repo(tmp_path, {"README.md": "# repo\n"})
-    daemon.maestro.config["verification_timeout_s"] = 0
+    write_config(daemon.state_dir, {"verification": {"timeout_s": 0}})
     ok, report = _verify(daemon, ws, verification="command", verification_command="true")
     assert ok and "did not finish" not in report
 
