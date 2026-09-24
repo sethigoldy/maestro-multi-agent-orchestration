@@ -94,6 +94,7 @@ def normalize(record: dict[str, Any]) -> dict[str, Any]:
         "title": meta.get("title"),
         "state": (record.get("status") or {}).get("state") or "unknown",
         "workspace": meta.get("workspace"),
+        "run_dir": meta.get("run_dir"),
         "branch": meta.get("branch"),
         "origin_agent": meta.get("origin_agent"),
         "target_agent": meta.get("target_agent"),
@@ -177,6 +178,8 @@ def render_frame(tasks: list[dict[str, Any]], selected: int | None, live: bool, 
         for label, value in (
             ("route", f"{sel.get('origin_agent') or '?'} → {sel.get('target_agent') or '?'}"),
             ("workspace", sel.get("workspace")),
+            # Shown only for a task that runs in its own worktree.
+            ("run dir", sel.get("run_dir") if sel.get("run_dir") not in (None, sel.get("workspace")) else None),
             ("branch", sel.get("branch")),
             ("error", (sel.get("error") or "").splitlines()[0] if sel.get("error") else None),
         ):

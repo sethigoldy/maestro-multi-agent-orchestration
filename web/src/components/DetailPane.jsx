@@ -43,6 +43,7 @@ export default function DetailPane({ task }) {
         <Meta label="task" value={task.task_id} />
         <Meta label="route" value={`${task.origin_agent || "?"} → ${task.target_agent || "?"}`} />
         <Meta label="workspace" value={task.workspace} />
+        {task.run_dir && task.run_dir !== task.workspace && <Meta label="run dir" value={task.run_dir} />}
         <Meta label="branch" value={task.branch} />
         {typeof task.usage?.cost_usd === "number" && (
           <Meta label="cost" value={`$${task.usage.cost_usd.toFixed(4)}`} />

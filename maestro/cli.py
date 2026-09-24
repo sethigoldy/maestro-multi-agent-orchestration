@@ -300,8 +300,9 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     }}, token=token)
     task = (result or {}).get("task") or {}
     task_id = task.get("id")
-    if not task_id:  # queued behind an active task in this workspace
-        print(json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line"}, indent=2))
+    if not task_id:  # queued: the daemon says why
+        reason = (task.get("metadata") or {}).get("reason") or "the task is waiting for a place to run"
+        print(json.dumps({"queued": True, "reason": reason}, indent=2))
         return 0
     if args.no_wait:
         print(json.dumps(result, indent=2))
@@ -339,6 +340,7 @@ def _cmd_task_audit(args: argparse.Namespace) -> int:
             "title": claims.get("task_title"),
             "state": runtime.get("state") or claims.get("task_status"),
             "workspace": claims.get("task_workspace"),
+            "run_dir": claims.get("task_run_dir") or claims.get("task_workspace"),
             "branch": claims.get("task_branch"),
             "origin_agent": claims.get("task_origin_agent"),
             "target_agent": claims.get("task_target_agent"),

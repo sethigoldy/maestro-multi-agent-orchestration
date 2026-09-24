@@ -98,7 +98,7 @@ def delegate(workspace: str, handoff_file: str, branch: str = "") -> str:
     except (ValueError, OSError) as exc:
         return json.dumps({"error": str(exc)}, indent=2)
     if started.get("queued"):
-        return json.dumps({"queued": True, "reason": "workspace already has an active task; this handoff is next in line", "ts": started["ts"]}, indent=2)
+        return json.dumps({"queued": True, "reason": started.get("reason"), "ts": started["ts"]}, indent=2)
     try:
         final = d.wait(str(started["task_id"]), timeout=_delegate_timeout())
     except ValueError as exc:  # the daemon went away and no replacement could be reached

@@ -29,7 +29,7 @@ const record = {{
   id: "task-1",
   status: {{ state: "completed" }},
   metadata: {{
-    title: "T", workspace: "/w", branch: "maestro/task-1",
+    title: "T", workspace: "/w", run_dir: "/home/worktrees/task-1", branch: "maestro/task-1",
     origin_agent: "human", target_agent: "codex",
     usage: {{ cost_usd: 0.5 }}, attempts: [{{ agent: "codex" }}], error: null,
   }},
@@ -39,6 +39,7 @@ const assert = (cond, msg) => {{ if (!cond) throw new Error(msg); }};
 assert(flat.task_id === "task-1", "task_id");
 assert(flat.state === "completed", "state");
 assert(flat.title === "T", "title");
+assert(flat.run_dir === "/home/worktrees/task-1", "run_dir");
 assert(flat.usage.cost_usd === 0.5, "usage");
 assert(flat.attempts.length === 1, "attempts");
 const bare = normalizeTask({{ id: "x" }});

@@ -217,3 +217,23 @@ def test_defaults_max_parallel_parsed_and_validated():
     for bad in (0, -1, "4", 2.5, True):
         with pytest.raises(ValueError, match="max_parallel must be a whole number of at least 1"):
             Maestro._parse_defaults({"max_parallel": bad})
+
+
+def test_status_reports_run_dir_and_defaults_to_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        s = m.status(tid)
+        # A task from before run directories existed ran in its workspace.
+        assert s['run_dir'] == s['workspace'] and s['run_dir_kind'] == 'workspace'
+        assert 'run_dir_removed' not in s
+        m._write_claim(tid, 'task_run_dir', '/home/.maestro/worktrees/x')
+        m._write_claim(tid, 'task_run_dir_kind', 'worktree')
+        m._write_claim(tid, 'task_run_dir_removed', 'false')
+        assert 'run_dir_removed' not in m.status(tid)
+        m._write_claim(tid, 'task_run_dir_removed', 'true')
+        s = m.status(tid)
+        assert s['run_dir'] == '/home/.maestro/worktrees/x' and s['run_dir_kind'] == 'worktree' and s['run_dir_removed'] is True
+    finally:
+        m.close()

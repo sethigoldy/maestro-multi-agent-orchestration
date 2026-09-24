@@ -735,6 +735,11 @@ class Maestro:
                 if result["workspace"]:  # pragma: no branch
                     break
         result["project_root"]=(index or {}).get("project_root") or str(self.project_root)
+        # Where the task's work is: the workspace, or the task's own worktree.
+        # A task from before run directories existed ran in its workspace.
+        result["run_dir"]=claims.get("task_run_dir") or result["workspace"]
+        result["run_dir_kind"]=claims.get("task_run_dir_kind") or "workspace"
+        if claims.get("task_run_dir_removed")=="true": result["run_dir_removed"]=True
         # The phase claim reports a parked task as REVIEWING, the same as a
         # finished one. The runtime snapshot says it is waiting, what for, and
         # the question to answer with `maestro task answer`.

@@ -33,7 +33,7 @@ class FakeDaemon:
     def delegate(self, doc, workspace):
         self.calls.append(("delegate", doc, workspace))
         if doc.title == "queued":
-            return {"task_id": None, "queued": True, "state": "submitted", "ts": "t0"}
+            return {"task_id": None, "queued": True, "reason": "busy", "run_dir": workspace, "state": "submitted", "ts": "t0"}
         return {"task_id": f"task-{doc.title}", "queued": False, "state": "submitted", "ts": "t0"}
 
     def status_a2a(self, task_id):
@@ -152,6 +152,8 @@ def test_send_queued_returns_placeholder_task():
     resp = dispatcher.handle(_req("message/send", {"message": msg}))
     assert resp["result"]["task"]["status"]["state"] == "submitted"
     assert resp["result"]["task"]["metadata"]["queued"] is True
+    assert resp["result"]["task"]["metadata"]["reason"] == "busy"
+    assert resp["result"]["task"]["metadata"]["run_dir"] == "/ws"
 
 
 def test_send_empty_message_rejected():

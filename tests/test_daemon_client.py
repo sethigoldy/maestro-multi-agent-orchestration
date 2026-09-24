@@ -220,6 +220,7 @@ def test_delegate_tool_reports_a_queued_handoff(owner, home, agents, tmp_path):
     handoff.write_text(json.dumps(_doc("quick").to_dict()), encoding="utf-8")
     out = json.loads(mcp_server.delegate(str(ws), str(handoff)))
     assert out["queued"] is True
+    assert "another task is using the workspace" in out["reason"]
 
 
 def test_client_status_and_list(owner, home, tmp_path):
