@@ -364,3 +364,26 @@ def test_three_tasks_run_at_once_each_in_its_own_directory(tmp_path, monkeypatch
         assert len(branches) == 3
     finally:
         _stop(d, gate)
+
+
+def test_max_parallel_one_never_creates_a_worktree(tmp_path, monkeypatch, binpath):
+    from maestro.agents import AgentSpec
+
+    # With max_parallel = 1 a task parked in the workspace holds it, and the
+    # next task waits, exactly as before worktrees existed.
+    _fake_bin(binpath, "asker", 'cat > /dev/null\necho \'{"question": "which db?"}\'\nexit 0')
+    _fake_bin(binpath, "codex", "cat > /dev/null\nexit 0")
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch, "[defaults]\nmax_parallel = 1\n")
+    d.registry.save(AgentSpec(name="asker", kind="generic", command="asker --go", output_format="jsonl"))
+    try:
+        parked = d.delegate(_doc(target_agent="asker"), ws)
+        assert d.wait(parked["task_id"], timeout=30)["status"]["state"] == "input-required"
+        second = d.delegate(_doc(), ws)
+        assert second["queued"] is True
+        assert "max_parallel is 1" in second["reason"]
+        assert not (d.state_dir / "worktrees").exists()
+        d.cancel(parked["task_id"])  # frees the workspace
+        assert d.wait(second["task_id"], timeout=30)["status"]["state"] == "completed"
+    finally:
+        _stop(d, tmp_path / "go")

@@ -811,8 +811,12 @@ class MaestroDaemon:
         )
 
     def _worktree_allowed(self, record: dict[str, Any]) -> bool:
-        """A task may run in a worktree unless it works in place (no-commit)
-        or runs on a remote daemon, which never uses the local checkout."""
+        """A task may run in a worktree unless it works in place (no-commit),
+        runs on a remote daemon (which never uses the local checkout), or the
+        user set max_parallel = 1, which keeps the behaviour from before
+        worktrees: a task for a busy workspace waits."""
+        if self._max_parallel() == 1:
+            return False
         doc = record.get("doc") or {}
         if ((doc.get("expectations") or {}).get("commit_policy") or "branch") == "no-commit":
             return False
@@ -867,6 +871,8 @@ class MaestroDaemon:
                 f"the workspace is at its limit of {limit} running tasks; this task starts when one of them "
                 "finishes or stops to ask a question"
             )
+        if limit == 1:
+            return "max_parallel is 1, so tasks for this workspace run one at a time; this task starts when the task using the workspace finishes"
         if not self._worktree_allowed(record):
             return "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes"
         return "this task's work is in the workspace, and another task is using the workspace; it starts when that task finishes"
