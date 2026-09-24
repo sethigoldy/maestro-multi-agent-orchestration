@@ -834,9 +834,7 @@ class MaestroDaemon:
         key = record["workspace"]
         if self._running_count(key, excluding=task_id) >= self._max_parallel():
             return None
-        kind = record.get("run_dir_kind")
-        if kind is None and (record.get("turn") or record.get("attempts")):
-            kind = "workspace"  # a task from before run directories existed ran in its workspace
+        kind = self._run_dir_kind(record)
         if kind == "worktree":
             return "worktree"
         workspace_free = self._active.get(key) in (None, task_id)
@@ -850,6 +848,16 @@ class MaestroDaemon:
         record["run_dir_kind"] = "worktree"
         return "worktree"
 
+    @staticmethod
+    def _run_dir_kind(record: dict[str, Any]) -> str | None:
+        """Where the task's turns run, or None before its first turn is
+        scheduled. A task from before run directories existed has no kind
+        recorded; if it has run, it ran in its workspace."""
+        kind = record.get("run_dir_kind")
+        if kind is None and (record.get("turn") or record.get("attempts")):
+            return "workspace"
+        return kind
+
     def _queue_reason(self, task_id: str) -> str:
         """Why a task waits in the queue, in words a user can act on."""
         record = self._tasks[task_id]
@@ -859,7 +867,7 @@ class MaestroDaemon:
                 f"the workspace is at its limit of {limit} running tasks; this task starts when one of them "
                 "finishes or stops to ask a question"
             )
-        if record.get("run_dir_kind") == "workspace":
+        if self._run_dir_kind(record) == "workspace":
             return "this task's work is in the workspace, and another task is using the workspace; it starts when that task finishes"
         return "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes"
 
