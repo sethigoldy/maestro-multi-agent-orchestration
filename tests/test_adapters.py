@@ -130,12 +130,21 @@ def test_codex_command_old_flag_surface(tmp_path, monkeypatch):
 
 
 def test_codex_command_new_flag_surface(tmp_path, monkeypatch):
+    # Current CLIs (0.146 and later) advertise --sandbox; --full-auto is
+    # deprecated there and --approve-for-me does not exist.
     _codex_adapter_with_help(tmp_path, monkeypatch, _CODEX_FAKE_NEW_HELP)
     adapter = CodexAdapter(_spec("codex"))
     cmd = adapter.build_command("p", tmp_path, "t", {})
-    assert cmd[:3] == ["codex", "exec", "--approve-for-me"]
+    assert cmd[:4] == ["codex", "exec", "--sandbox", "workspace-write"]
     # probe result is cached per instance: a second build does not re-probe
-    assert adapter._autonomy_flags == ["--approve-for-me"]
+    assert adapter._autonomy_flags == ["--sandbox", "workspace-write"]
+
+
+def test_codex_command_approve_for_me_surface(tmp_path, monkeypatch):
+    help_body = _CODEX_FAKE_NEW_HELP.replace('echo "  -s, --sandbox <MODE>   sandbox policy (new surface)"', 'echo "  --approve-for-me   run without asking"')
+    _codex_adapter_with_help(tmp_path, monkeypatch, help_body)
+    cmd = CodexAdapter(_spec("codex")).build_command("p", tmp_path, "t", {})
+    assert cmd[:3] == ["codex", "exec", "--approve-for-me"]
 
 
 def test_codex_command_no_cli_visible(tmp_path, monkeypatch):
@@ -143,7 +152,7 @@ def test_codex_command_no_cli_visible(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     adapter = CodexAdapter(_spec("codex"))
     cmd = adapter.build_command("p", tmp_path, "t", {})
-    assert cmd[:3] == ["codex", "exec", "--approve-for-me"]
+    assert cmd[:4] == ["codex", "exec", "--sandbox", "workspace-write"]
 
 
 def test_codex_command_task_settings_override_spec(tmp_path, monkeypatch):
@@ -429,7 +438,27 @@ echo '{"type":"turn.completed","total_cost_usd":0.3,"tokens_used":42}'
 exit 0
 """
 
-_CODEX_FAKE_REJECTS_BOTH = r"""
+# Codex 0.146.1: the help lists --sandbox (not --full-auto, which is hidden
+# and deprecated); --approve-for-me does not exist.
+_CODEX_FAKE_0_146 = r"""
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
+    echo "Usage: codex exec [OPTIONS] [PROMPT]"
+    echo "  -s, --sandbox <SANDBOX_MODE>  Select the sandbox policy"
+    exit 0
+fi
+echo "spawn $*" >> "$(dirname "$0")/.codex_spawns"
+for a in "$@"; do
+    case "$a" in
+        --approve-for-me) echo "error: unexpected argument '--approve-for-me' found" 1>&2; exit 2 ;;
+        --full-auto) echo "warning: \`--full-auto\` is deprecated; use \`--sandbox workspace-write\` instead." 1>&2 ;;
+    esac
+done
+cat > /dev/null
+echo '{"type":"turn.completed","total_cost_usd":0.3,"tokens_used":42}'
+exit 0
+"""
+
+_CODEX_FAKE_REJECTS_ALL = r"""
 if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then
     echo "Usage: codex exec [OPTIONS]"
     exit 0
@@ -437,7 +466,7 @@ fi
 echo spawn >> "$(dirname "$0")/.codex_spawns"
 for a in "$@"; do
     case "$a" in
-        --full-auto|--approve-for-me)
+        --full-auto|--approve-for-me|--sandbox)
             echo "error: unexpected argument '$a' found" 1>&2
             exit 2 ;;
     esac
@@ -445,7 +474,6 @@ done
 cat > /dev/null
 exit 0
 """
-
 
 def test_codex_flag_skew_retries_with_alternate_surface(tmp_path):
     # Probe advertises --full-auto (old help surface) but the runtime only
@@ -464,9 +492,10 @@ def test_codex_flag_skew_retries_with_alternate_surface(tmp_path):
     assert len(spawns) == 2
 
 
-def test_codex_flag_skew_new_surface_retries_with_full_auto(tmp_path):
-    # The transcript case: the probe picks --approve-for-me (current default),
-    # the installed CLI rejects it; one retry with --full-auto must succeed.
+def test_codex_blank_help_uses_sandbox_without_a_rejected_attempt(tmp_path):
+    # A CLI whose help lists no autonomy flag, and which rejects
+    # --approve-for-me: the current surface (--sandbox workspace-write) is
+    # used first, so no attempt is wasted on a rejected flag.
     binpath = tmp_path / "bin"
     binpath.mkdir()
     _fake_bin(binpath, "codex", _CODEX_FAKE_SKEW_NEW_HELP)
@@ -478,22 +507,37 @@ def test_codex_flag_skew_new_surface_retries_with_full_auto(tmp_path):
         os.environ["PATH"] = old
     assert result.ok is True and (result.usage or {}).get("cost_usd") == 0.3
     spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
-    assert len(spawns) == 2
+    assert len(spawns) == 1
 
 
-def test_codex_cli_rejects_both_flag_sets_stops_after_one_retry(tmp_path):
+def test_codex_0_146_uses_sandbox_workspace_write_first_time(tmp_path):
     binpath = tmp_path / "bin"
     binpath.mkdir()
-    _fake_bin(binpath, "codex", _CODEX_FAKE_REJECTS_BOTH)
+    _fake_bin(binpath, "codex", _CODEX_FAKE_0_146)
     old = os.environ.get("PATH", "")
     os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
     try:
-        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t3", timeout=30)
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t0", timeout=30)
+    finally:
+        os.environ["PATH"] = old
+    assert result.ok is True
+    spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
+    assert len(spawns) == 1 and "--sandbox workspace-write" in spawns[0]  # no rejected flag, no deprecation warning
+
+
+def test_codex_cli_rejecting_every_flag_set_tries_each_once(tmp_path):
+    binpath = tmp_path / "bin"
+    binpath.mkdir()
+    _fake_bin(binpath, "codex", _CODEX_FAKE_REJECTS_ALL)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = f"{binpath}{os.pathsep}{old}"
+    try:
+        result = CodexAdapter(_spec("codex")).run("p", tmp_path, "t4", timeout=30)
     finally:
         os.environ["PATH"] = old
     assert result.ok is False and "unexpected argument" in (result.error or "")
     spawns = (binpath / ".codex_spawns").read_text(encoding="utf-8").splitlines()
-    assert len(spawns) == 2  # one retry, then it stops — no loop
+    assert len(spawns) == 3  # --sandbox, --full-auto, --approve-for-me: each once, then it stops
 
 
 def test_codex_unrelated_failure_does_not_retry(tmp_path):
@@ -1554,7 +1598,7 @@ def test_probe_codex_no_cli_visible(tmp_path, monkeypatch):
     from maestro.adapters.codex import probe_codex_autonomy_flags
 
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
-    assert probe_codex_autonomy_flags() == ["--approve-for-me"]
+    assert probe_codex_autonomy_flags() == ["--sandbox", "workspace-write"]
 
 
 def test_probe_codex_probe_failure_falls_back(tmp_path, monkeypatch):
@@ -1564,7 +1608,7 @@ def test_probe_codex_probe_failure_falls_back(tmp_path, monkeypatch):
         raise OSError("probe exploded")
 
     monkeypatch.setattr(cx.subprocess, "run", boom)
-    assert cx.probe_codex_autonomy_flags("/bin/true") == ["--approve-for-me"]
+    assert cx.probe_codex_autonomy_flags("/bin/true") == ["--sandbox", "workspace-write"]
 
 
 # ---------------------------------------------------------------- opencode
