@@ -1,7 +1,7 @@
 # CLI reference
 
 Complete description of the `maestro` and `maestro-daemon` commands. The CLI is
-version 0.14.0; verify with `maestro --version`.
+version 0.15.0; verify with `maestro --version`.
 
 ## Global options
 

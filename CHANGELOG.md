@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-09-25
+
 ### Added
 
 - **The daemon listens on one fixed port, 9785, and you can choose another.** Until now the daemon picked a random free port every time it started, so its address changed on every restart. That made it hard to open in a firewall, reach from another machine, or put behind a reverse proxy. It now listens on 9785, next to the discovery port 9786. To use another port, pass `--port N` to `maestro daemon start`, `maestro daemon restart` or `maestro-daemon`, set `MAESTRO_DAEMON_PORT`, or set `[daemon] port` in `~/.maestro/config.toml`. The first of these that is set wins, and `0` still means any free port. If the port is used by another program, the daemon does not start, and the error names the port and these options. Clients still find the port in `daemon.json`, so nothing else needs to change.
