@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Maestro starts current Codex CLIs with `--sandbox workspace-write`.** Codex 0.146 removed `--approve-for-me` and deprecated `--full-auto`. Maestro chose `--approve-for-me` whenever `codex exec --help` did not list `--full-auto`, so every Codex run first failed with "unexpected argument '--approve-for-me'" and was then retried with the deprecated `--full-auto`, which printed a warning. Maestro now uses `--approve-for-me` only when the help lists it, then `--sandbox workspace-write` when the help lists `--sandbox`, then `--full-auto`. With no usable help it assumes `--sandbox workspace-write`. If the CLI rejects the chosen flag, Maestro tries each remaining one once.
+
 ## [0.15.0] — 2026-09-25
 
 ### Added
