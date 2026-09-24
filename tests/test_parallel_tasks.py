@@ -195,3 +195,112 @@ def test_queued_task_starts_when_a_running_task_parks(tmp_path, monkeypatch, bin
         assert not gate.exists()
     finally:
         _stop(d, gate)
+
+
+def test_worktree_task_changes_stay_in_its_worktree(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        first = d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        gate.touch()
+        d.wait(first["task_id"], timeout=60)
+        final = d.wait(second["task_id"], timeout=60)
+        wt = Path(second["run_dir"])
+        assert (ws / "ran-here.txt").read_text().strip() == str(ws)
+        assert (wt / "ran-here.txt").read_text().strip() == str(wt)
+        assert final["metadata"]["run_dir"] == str(wt)
+        claims = d.maestro._claims(second["task_id"])
+        assert claims["task_run_dir"] == str(wt) and claims["task_run_dir_kind"] == "worktree"
+        branch = subprocess.run(["git", "-C", str(wt), "rev-parse", "--abbrev-ref", "HEAD"], text=True, capture_output=True).stdout.strip()
+        assert branch == f"maestro/{second['task_id']}"
+    finally:
+        _stop(d, gate)
+
+
+def test_followup_in_a_deleted_worktree_recreates_it(tmp_path, monkeypatch, binpath):
+    import shutil
+
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        gate.touch()
+        d.wait(second["task_id"], timeout=60)
+        shutil.rmtree(second["run_dir"])
+        sub = d.bus.subscribe("output")
+        try:
+            d.followup(second["task_id"], "again")
+            note = sub.wait(
+                predicate=lambda e: e.task_id == second["task_id"] and "was created again" in (e.data.get("line") or ""),
+                timeout=30,
+            )
+        finally:
+            sub.close()
+        final = d.wait(second["task_id"], timeout=60)
+        assert note is not None
+        assert final["status"]["state"] == "completed"
+        assert Path(second["run_dir"]).is_dir()
+    finally:
+        _stop(d, gate)
+
+
+def test_rename_branch_of_a_worktree_task_keeps_its_worktree(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        gate.touch()
+        d.wait(second["task_id"], timeout=60)
+        d.rename_branch(second["task_id"], "feat/renamed")
+        d.followup(second["task_id"], "again")
+        d.wait(second["task_id"], timeout=60)
+        head = subprocess.run(["git", "-C", second["run_dir"], "rev-parse", "--abbrev-ref", "HEAD"], text=True, capture_output=True).stdout.strip()
+        assert head == "feat/renamed"
+    finally:
+        _stop(d, gate)
+
+
+def test_workspace_without_commit_fails_the_worktree_task(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = tmp_path / "empty"
+    ws.mkdir()
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        final = d.wait(second["task_id"], timeout=60)
+        assert final["status"]["state"] == "failed"
+        assert "has no commit yet" in final["metadata"]["error"]
+    finally:
+        _stop(d, gate)
+
+
+def test_followup_in_a_broken_worktree_fails_with_the_reason(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        gate.touch()
+        d.wait(second["task_id"], timeout=60)
+        # The worktree directory exists, but git can no longer use it.
+        (Path(second["run_dir"]) / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+        d.followup(second["task_id"], "again")
+        final = d.wait(second["task_id"], timeout=60)
+        assert final["status"]["state"] == "failed"
+        assert "could not check out the task branch" in final["metadata"]["error"]
+    finally:
+        _stop(d, gate)

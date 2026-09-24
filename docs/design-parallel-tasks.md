@@ -127,10 +127,11 @@ today's behaviour exactly.
   `git diff --check`, the check for changes, the turn baseline and the diff
   excerpt given to reviewers.
 - **The Python interpreter for verification.** A new worktree has no `.venv/`.
-  Maestro looks for `.venv/` or `venv/` in the run directory first, then in the
-  main repository (found with `git rev-parse --git-common-dir`), then uses
-  `MAESTRO_PYTHON` and Maestro's own interpreter as today. Without this step,
-  every Python task in a worktree would fail with "pytest missing".
+  Maestro uses `MAESTRO_PYTHON` when it is set, as today. Otherwise it looks
+  for `.venv/` or `venv/` in the run directory, then in the main checkout of
+  the repository (found with `git rev-parse --git-common-dir`), and finally
+  uses its own interpreter. Without the main-checkout step, every Python task
+  in a worktree would fail with "pytest missing".
 - **Task knowledge** (the list of changed files used by follow-ups) is read from
   the run directory.
 - **Context files, skills and config** still resolve against the workspace.

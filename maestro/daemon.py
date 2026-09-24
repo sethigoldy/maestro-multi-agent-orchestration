@@ -867,9 +867,9 @@ class MaestroDaemon:
                 f"the workspace is at its limit of {limit} running tasks; this task starts when one of them "
                 "finishes or stops to ask a question"
             )
-        if self._run_dir_kind(record) == "workspace":
-            return "this task's work is in the workspace, and another task is using the workspace; it starts when that task finishes"
-        return "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes"
+        if not self._worktree_allowed(record):
+            return "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes"
+        return "this task's work is in the workspace, and another task is using the workspace; it starts when that task finishes"
 
     def _launch(self, task_id: str, doc: HandoffDoc, ws: Path, turn_flag: threading.Event | None, routing_resolved: bool) -> str:
         """Start a task's first turn once it holds its workspace slot.
@@ -1136,7 +1136,7 @@ class MaestroDaemon:
         if record is not None:
             record["turn"] = turn  # follow-ups/answers are new turns; result files must not collide
         recorded = (record or {}).get("branch")
-        branch = self._prepare_branch(workspace, task_id, doc.commit_policy, requested=doc.branch, recorded=recorded)
+        run_dir, branch = self._prepare_run_dir(task_id, doc, workspace, recorded)
         if branch:
             record = self._tasks.get(task_id)
             if record is not None:
@@ -1146,7 +1146,7 @@ class MaestroDaemon:
                 # The branch was renamed by hand since the last turn and this
                 # turn adopted the new name: tell every view.
                 self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
-        self._record_turn_baseline(task_id, workspace, doc)
+        self._record_turn_baseline(task_id, run_dir, doc)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
         last_error: str | None = None
         for agent_name in chain:
@@ -1166,8 +1166,8 @@ class MaestroDaemon:
             for attempt in range(attempts):
                 if not self._turn_live(task_id, turn_flag):
                     return  # canceled or replaced by a newer turn: start no agent
-                rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
-                prompt = build_prompt(doc, task_id, workspace, record_transcript(self._tasks.get(task_id)), context_block=rendered.block)
+                rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, self._context_root(task_id, workspace))
+                prompt = build_prompt(doc, task_id, run_dir, record_transcript(self._tasks.get(task_id)), context_block=rendered.block)
                 settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
 
                 def _on_line(line: str, _task_id: str = task_id) -> None:
@@ -1175,7 +1175,7 @@ class MaestroDaemon:
 
                 result = adapter.run(
                     prompt,
-                    workspace,
+                    run_dir,
                     task_id,
                     settings=settings,
                     timeout=spec.timeout_s,
@@ -1196,7 +1196,7 @@ class MaestroDaemon:
                         self._set_state(task_id, STATE_INPUT_REQUIRED, question=result.question, awaiting="question", turn_flag=turn_flag)
                         return
                 if result.ok:
-                    self._post_complete(task_id, doc, workspace, agent_name, result, turn_flag)
+                    self._post_complete(task_id, doc, run_dir, agent_name, result, turn_flag)
                     return
                 last_error = result.error or f"agent {agent_name} failed"
                 if attempt < attempts - 1 and self.backoff_s > 0:
@@ -1479,7 +1479,7 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return self._gate_park(agent_name, role, f"agent {agent_name!r} failed preflight: {preflight.error or 'unknown error'}")
-        rendered = self._rendered_context(doc, task_id, role, spec.kind, workspace)
+        rendered = self._rendered_context(doc, task_id, role, spec.kind, self._context_root(task_id, workspace))
         if role == "verifier":
             prompt = build_verify_prompt(doc, task_id, workspace, verification_ok, report_path, context_block=rendered.block)
         else:
@@ -1541,7 +1541,7 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return "parked", f"Work-mode fixer agent {fix_agent!r} failed preflight:\n{preflight.error or 'unknown error'}\n\nAnswer with instructions to resume on the task branch, or cancel."
-        rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
+        rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, self._context_root(task_id, workspace))
         prompt = build_fix_prompt(doc, task_id, workspace, issues, det_failed, context_block=rendered.block)
         settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
         if not self._turn_live(task_id, turn_flag):
@@ -1743,6 +1743,54 @@ class MaestroDaemon:
         self.bus.publish(TaskEvent(task_id=task_id, type="verify", data={"ok": ok, "command": " ".join(test_cmd), "report": str(report_path)}))
         return ok
 
+    def _prepare_run_dir(self, task_id: str, doc: HandoffDoc, workspace: Path, recorded: str | None) -> tuple[Path, str | None]:
+        """Get the task's run directory ready for this turn; return it and the branch.
+
+        A task that runs in the workspace checks out its branch there, as
+        before. A task that runs in a worktree gets the worktree created on its
+        first turn, from the commit checked out in the workspace, and created
+        again from its branch if it was removed (only committed work comes
+        back). See docs/design-parallel-tasks.md, section 3."""
+        record = self._tasks.get(task_id) or {}
+        if record.get("run_dir_kind") != "worktree":
+            branch = self._prepare_branch(workspace, task_id, doc.commit_policy, requested=doc.branch, recorded=recorded)
+            self._record_run_dir(task_id, workspace, "workspace")
+            return workspace, branch
+        run_dir = Path(record["run_dir"])
+        if recorded:
+            branch = recorded if branch_exists(workspace, recorded) else self._renamed_task_branch(workspace, task_id, recorded)
+            if worktrees.ensure_worktree(workspace, run_dir, branch):
+                self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
+                    "agent": "maestro",
+                    "line": f"[maestro] the worktree {run_dir} was missing, so it was created again from branch {branch}; only committed work is in it",
+                }))
+            else:
+                checked = subprocess.run(["git", "-C", str(run_dir), "checkout", branch], text=True, capture_output=True)
+                if checked.returncode != 0:
+                    raise RuntimeError(
+                        f"could not check out the task branch {branch!r} in {run_dir}: {(checked.stderr or checked.stdout).strip()}"
+                    )
+        else:
+            branch = doc.branch or f"maestro/{task_id}"
+            worktrees.add_worktree(workspace, run_dir, branch, new_branch=True, start=worktrees.head_commit(workspace))
+        self._record_run_dir(task_id, run_dir, "worktree")
+        return run_dir, branch
+
+    def _record_run_dir(self, task_id: str, run_dir: Path, kind: str) -> None:
+        """Store where the task's turns run, for status, cleanup and later turns."""
+        record = self._tasks.get(task_id)
+        if record is not None:
+            record["run_dir"], record["run_dir_kind"] = str(run_dir), kind
+        self.maestro._write_claim(task_id, "task_run_dir", str(run_dir))
+        self.maestro._write_claim(task_id, "task_run_dir_kind", kind)
+        self.maestro._write_claim(task_id, "task_run_dir_removed", "false")
+
+    def _context_root(self, task_id: str, fallback: Path) -> Path:
+        """The directory context files and skills resolve against: the
+        caller's workspace, because files that are not in git exist only there."""
+        record = self._tasks.get(task_id) or {}
+        return Path(record["workspace"]) if record.get("workspace") else fallback
+
     def _prepare_branch(
         self, workspace: Path, task_id: str, commit_policy: str,
         requested: str | None = None, recorded: str | None = None,
@@ -1928,7 +1976,8 @@ class MaestroDaemon:
                 parsed = None
             if isinstance(parsed, dict):
                 runtime = parsed
-        workspace_raw = claims.get("task_workspace") or self._registry_workspace(task_id)
+        # Changed files are read where the task's work is: its run directory.
+        workspace_raw = claims.get("task_run_dir") or claims.get("task_workspace") or self._registry_workspace(task_id)
         knowledge = project_knowledge(task_id, claims, runtime, workspace=Path(workspace_raw) if workspace_raw else None)
         self.maestro._write_claim(task_id, "task_knowledge", knowledge.serialize())
         return knowledge
@@ -1971,7 +2020,7 @@ class MaestroDaemon:
         }
         # What a parked task was waiting for (routing vs. a question), and the
         # gate and verification details the status views show.
-        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification"):
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification", "run_dir", "run_dir_kind"):
             if runtime.get(key) is not None:
                 record[key] = runtime[key]
         with self._lock:
@@ -2307,6 +2356,7 @@ class MaestroDaemon:
             branch = record.get("branch")
             origin = record.get("origin_agent")
             target = record.get("target_agent")
+            run_dir = record.get("run_dir") or workspace
             title = record.get("title")
             usage = record.get("usage")
             attempts = record.get("attempts") or []
@@ -2327,6 +2377,7 @@ class MaestroDaemon:
             branch = claims.get("task_branch")
             origin = claims.get("task_origin_agent")
             target = claims.get("task_target_agent")
+            run_dir = claims.get("task_run_dir") or workspace
             title = claims.get("task_title")
             usage = runtime.get("usage")
             attempts = runtime.get("attempts") or []
@@ -2341,6 +2392,8 @@ class MaestroDaemon:
                     artifacts.append({"artifactId": f"{task_id}:{path.name}", "name": path.name, "parts": [{"kind": "url", "url": str(path)}]})
         metadata = {
             "workspace": workspace,
+            # Where the task's work is: the workspace, or the task's worktree.
+            "run_dir": run_dir,
             "branch": branch,
             "origin_agent": origin,
             "target_agent": target,
