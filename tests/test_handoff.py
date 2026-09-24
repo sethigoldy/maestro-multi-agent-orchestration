@@ -244,3 +244,19 @@ def test_load_handoff_file_with_context_section(tmp_path):
 def test_context_section_must_be_list_of_tables():
     with pytest.raises(ValueError, match="context entries"):
         from_dict({"handoff": {"title": "t", "request": "r"}, "routing": {}, "expectations": {}, "constraints": {}, "context": {"label": "x"}})
+
+
+def test_agent_may_commit_defaults_to_false_and_round_trips():
+    doc = HandoffDoc(title="T", request="R")
+    assert doc.agent_may_commit is False
+    assert doc.to_dict()["expectations"]["agent_may_commit"] is False
+    allowed = from_dict({"handoff": {"title": "T", "request": "R"}, "expectations": {"agent_may_commit": True}})
+    assert allowed.agent_may_commit is True
+    assert from_dict(allowed.to_dict()).agent_may_commit is True
+
+
+def test_agent_may_commit_is_validated():
+    with pytest.raises(ValueError, match="agent_may_commit must be true or false"):
+        from_dict({"handoff": {"title": "T", "request": "R"}, "expectations": {"agent_may_commit": "yes"}})
+    with pytest.raises(ValueError, match="agent_may_commit cannot be true when commit_policy='no-commit'"):
+        from_dict({"handoff": {"title": "T", "request": "R"}, "expectations": {"agent_may_commit": True, "commit_policy": "no-commit"}})

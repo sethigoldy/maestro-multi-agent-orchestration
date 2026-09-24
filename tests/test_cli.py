@@ -398,3 +398,12 @@ def test_config_lists_context(monkeypatch, tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["context"]["style"] == {"label": "style", "kind": "text", "text": "Be terse.", "source": "user config"}
     assert out["context"]["pdf-skill"]["kind"] == "skill" and out["context"]["pdf-skill"]["phases"] == ["implementer"]
+
+
+def test_delegate_agent_may_commit_flag(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    captured = _delegate_capture(monkeypatch)
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex", "--agent-may-commit"]) == 0
+    assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is True
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"]) == 0
+    assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is False

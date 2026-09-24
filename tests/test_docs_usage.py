@@ -70,6 +70,7 @@ HANDOFF_FIELDS = (
     "verification_command",
     "commit_policy",
     "branch",
+    "agent_may_commit",
     "budget_hint",
     "sensitive",
     "max_depth_remaining",

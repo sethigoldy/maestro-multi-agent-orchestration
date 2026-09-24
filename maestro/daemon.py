@@ -122,6 +122,19 @@ def _forwarded_handoff(doc: HandoffDoc) -> dict[str, Any]:
     return data
 
 
+def _commit_rule(doc: HandoffDoc) -> str:
+    """The prompt line that says whether the agent may commit.
+
+    Maestro never commits. By default the agent must not either: its changes
+    stay uncommitted so the supervisor can review them and commit. A handoff
+    can allow commits with [expectations] agent_may_commit = true."""
+    if doc.agent_may_commit:
+        return ("COMMITS: You may commit your work to the branch that is checked out. "
+                "Do not push, and do not create, switch or delete branches.")
+    return ("COMMITS: Do not commit, and do not create, switch or delete branches. "
+            "Leave your changes uncommitted in the working tree; the supervisor reviews them and commits them.")
+
+
 def build_prompt(doc: HandoffDoc, task_id: str, workspace: Path, transcript: list[dict[str, str]], context_block: str = "") -> str:
     design = doc.design or "(none — use your judgment within the request's scope)"
     context_files = ", ".join(doc.context_files) if doc.context_files else "(none)"
@@ -147,6 +160,7 @@ CONTEXT NOTES:
 CONTEXT FILES: {context_files}
 
 EXPECTATIONS: artifacts: {", ".join(doc.artifacts)}; verification: {doc.verification}; commit policy: {doc.commit_policy}
+{_commit_rule(doc)}
 
 EXECUTION MODE: this is a non-interactive batch run — nobody can answer questions or grant approvals while you work. Do not stop to ask for approval or confirmation; make reasonable decisions within the request's scope, complete the work in this run, and list any open questions in your final report so they can be answered on a follow-up turn.
 
@@ -276,7 +290,8 @@ def build_fix_prompt(doc: HandoffDoc, task_id: str, workspace: Path, issues: lis
 UNRESOLVED ISSUES FROM VERIFICATION AND REVIEW:
 {issue_text}
 
-Your job: fix exactly these issues with the smallest change that resolves them. Do not commit, and do not restructure beyond what the issues require.
+Your job: fix exactly these issues with the smallest change that resolves them, and do not restructure beyond what the issues require.
+{_commit_rule(doc)}
 Report back with: files changed, commands run and their results, and how each issue was resolved."""
 
 

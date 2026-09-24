@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **The agent is told not to commit, unless the task allows it.** Maestro never commits, and the supervisor reviews the agent's changes and commits them. But the agent's prompt only said `commit policy: branch`, so agents often tried to commit anyway. Codex's sandbox then refused to write `.git/index.lock`, and the agent reported a failure that was not one. The prompt now says: do not commit, do not create, switch or delete branches, and leave the changes uncommitted. A handoff can allow commits with `[expectations] agent_may_commit = true` (CLI: `delegate --agent-may-commit`). The prompt then allows commits to the checked-out branch, but still forbids pushing and switching branches. The fix-pass prompt follows the same setting. `agent_may_commit = true` together with `commit_policy = "no-commit"` is refused.
+
 ### Fixed
 
 - **The terminal dashboard shows the task list as soon as it opens.** `maestro dashboard` loaded the tasks at start but drew nothing until the daemon sent an event or a key was pressed. When no task was running, the daemon sent no events, so the screen stayed empty. The dashboard now draws the first screen straight away.
