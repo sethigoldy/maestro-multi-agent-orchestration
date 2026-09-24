@@ -194,8 +194,8 @@ table, registration commands, and onboarding recipes are in
         │  delegate(handoff)                 │                                │
         ├───────────────────────────────────►│  submitted                     │
         │                                    ├───────────────────────────────►│ working
-        │   ◄── SSE events: live output,    │◄───────────────────────────────┤ (attempts,
-        │       attempts, cost, verdicts    │                                │  usage, errors)
+        │   ◄── SSE events: live output,     │◄───────────────────────────────┤ (attempts,
+        │       attempts, cost, verdicts     │                                │  usage, errors)
         │                                    │  deterministic verification    │
         │                                    │  optional LLM gates            │
         │                                    │  completed / failed / canceled │
