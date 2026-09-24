@@ -376,14 +376,16 @@ class Maestro:
         Project-level routing defaults consulted at delegate time when a handoff
         names no target agent: ``agent`` (default implementer), ``fallback``
         (list of fallback agents), ``model`` / ``effort`` (applied to the chosen
-        agent when the handoff sets none). Absent table -> empty dict; invalid
+        agent when the handoff sets none). ``max_parallel`` is the number of tasks that may
+        run turns at the same time for one workspace (see
+        docs/design-parallel-tasks.md); the daemon uses 4 when it is absent. Absent table -> empty dict; invalid
         values raise so misconfiguration fails at daemon start, not mid-delegation.
         """
         if raw is None:
             return {}
         if not isinstance(raw, dict):
             raise ValueError("[defaults] must be a table")
-        unknown = set(raw) - {"agent", "fallback", "model", "effort"}
+        unknown = set(raw) - {"agent", "fallback", "model", "effort", "max_parallel"}
         if unknown:
             raise ValueError(f"[defaults] has unknown keys: {', '.join(sorted(unknown))}")
         out: dict[str, Any] = {}
@@ -404,6 +406,11 @@ class Maestro:
             if effort not in {"low", "medium", "high", "xhigh", "max"}:
                 raise ValueError(f"Unsupported default reasoning effort: {effort}")
             out["effort"] = effort
+        max_parallel = raw.get("max_parallel")
+        if max_parallel is not None:
+            if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1:
+                raise ValueError("[defaults] max_parallel must be a whole number of at least 1")
+            out["max_parallel"] = max_parallel
         return out
 
     def codex_defaults(self) -> dict[str, Any]:

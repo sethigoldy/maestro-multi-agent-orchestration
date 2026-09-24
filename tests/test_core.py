@@ -209,3 +209,11 @@ def test_status_ignores_an_unreadable_runtime_snapshot(tmp_path, monkeypatch):
         assert 'question' not in m.status(tid)
     finally:
         m.close()
+
+
+def test_defaults_max_parallel_parsed_and_validated():
+    assert Maestro._parse_defaults({"max_parallel": 2}) == {"max_parallel": 2}
+    assert Maestro._parse_defaults({}) == {}
+    for bad in (0, -1, "4", 2.5, True):
+        with pytest.raises(ValueError, match="max_parallel must be a whole number of at least 1"):
+            Maestro._parse_defaults({"max_parallel": bad})
