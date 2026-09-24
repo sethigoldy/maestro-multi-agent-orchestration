@@ -89,6 +89,22 @@ def test_state_apply_event_lifecycle():
     assert [t["task_id"] for t in state.tasks] == ["task-2", "task-1"]
 
 
+def test_state_event_for_new_task_uses_fetched_record_or_falls_back():
+    state = tui._State()
+    state.fetch = lambda task_id: {"task_id": task_id, "title": "Fetched", "state": "submitted", "origin_agent": "human", "target_agent": "codex"}
+    state.apply_event("task-a", "state", {"state": "working"})
+    assert state.by_id["task-a"]["title"] == "Fetched"
+    assert state.by_id["task-a"]["target_agent"] == "codex"
+    assert state.by_id["task-a"]["state"] == "working"  # the event still applies
+
+    def unreachable(task_id):
+        raise ValueError("cannot reach A2A endpoint")
+
+    state.fetch = unreachable
+    state.apply_event("task-b", "state", {"state": "working"})
+    assert state.by_id["task-b"] == {"task_id": "task-b", "state": "working"}
+
+
 def test_state_output_cap_and_clamp():
     state = tui._State()
     for i in range(2500):
@@ -118,10 +134,25 @@ class _PipeStdin:
         return self._read_fd
 
 
-def _sse_server(tmp_path, tasks_payload: list[dict], frames: bytes, close_after_connect: bool = False, rst_after_connect: bool = False, events_status: int = 200):
+def _sse_server(tmp_path, tasks_payload: list[dict], frames: bytes, close_after_connect: bool = False, rst_after_connect: bool = False, events_status: int = 200, rpc_tasks: dict | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        def do_POST(self):
+            # JSON-RPC tasks/get, answered from rpc_tasks (task id -> A2A task).
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            task = (rpc_tasks or {}).get(request["params"]["id"])
+            if task is None:
+                reply = {"jsonrpc": "2.0", "id": request["id"], "error": {"code": -32001, "message": "Unknown task"}}
+            else:
+                reply = {"jsonrpc": "2.0", "id": request["id"], "result": {"task": task}}
+            body = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self):
             if self.path == "/tasks":
@@ -214,6 +245,45 @@ def test_run_draws_the_task_list_before_any_event_or_key(tmp_path):
         # The first frame comes after switching to the alternate screen, and
         # before leaving it.
         assert text.index("\x1b[?1049h") < text.index("Seeded") < text.index("\x1b[?1049l")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_run_shows_route_and_title_of_a_task_that_starts_after_it_opens(tmp_path):
+    # The task list is loaded once, when the dashboard opens. A task delegated
+    # later reaches it only through events, which carry no title or agents.
+    # The dashboard must ask the daemon for that task's record, or its row
+    # shows the task id and its route shows "? -> ?".
+    late = {
+        "id": "task-late",
+        "status": {"state": "working"},
+        "metadata": {"title": "Late task", "origin_agent": "human", "target_agent": "codex", "workspace": "/repo"},
+    }
+    server, url = _sse_server(tmp_path, [], _frame("task-late", "state", {"state": "working"}), rpc_tasks={"task-late": late})
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, stdin=_PipeStdin(b"j" + b"q", delay_s=0.5), stdout=out, is_tty=lambda: True)
+        text = _ANSI_RE.sub("", out.getvalue())
+        assert rc == 0
+        assert "Late task" in text
+        assert "route: human → codex" in text
+        assert "workspace: /repo" in text
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_task_from_an_event_is_kept_when_its_record_cannot_be_fetched(tmp_path):
+    # If the daemon does not know the task (or cannot be reached), the event
+    # still adds a row, as before.
+    server, url = _sse_server(tmp_path, [], _frame("task-gone", "state", {"state": "working"}), rpc_tasks={})
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, stdin=_PipeStdin(b"j" + b"q", delay_s=0.5), stdout=out, is_tty=lambda: True)
+        text = _ANSI_RE.sub("", out.getvalue())
+        assert rc == 0
+        assert "task-gone" in text and "working" in text
     finally:
         server.shutdown()
         server.server_close()

@@ -9,6 +9,7 @@ semantic versioning.
 ### Fixed
 
 - **The terminal dashboard shows the task list as soon as it opens.** `maestro dashboard` loaded the tasks at start but drew nothing until the daemon sent an event or a key was pressed. When no task was running, the daemon sent no events, so the screen stayed empty. The dashboard now draws the first screen straight away.
+- **The terminal dashboard shows the title, route and workspace of a task delegated after it opened.** The dashboard loads the task list once, when it opens. A task delegated later reached it only through live events, which carry the state and output but not the title or the agents. Its row showed the task id, and its detail showed `route: ? → ?`. The dashboard now asks the daemon for the task's record (JSON-RPC `tasks/get`) the first time it sees an event for it. If that request fails, the row still appears, as before.
 
 ## [0.14.0] — 2026-09-24
 
