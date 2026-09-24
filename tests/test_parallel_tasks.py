@@ -267,7 +267,11 @@ def test_rename_branch_of_a_worktree_task_keeps_its_worktree(tmp_path, monkeypat
         second = d.delegate(_doc(), ws)
         gate.touch()
         d.wait(second["task_id"], timeout=60)
+        (ws / "only-in-workspace.txt").write_text("another task's work\n", encoding="utf-8")
         d.rename_branch(second["task_id"], "feat/renamed")
+        # The refreshed knowledge lists the worktree's changes, not the workspace's.
+        knowledge = d.maestro._claims(second["task_id"])["task_knowledge"]
+        assert "only-in-workspace.txt" not in knowledge and "ran-here.txt" in knowledge
         d.followup(second["task_id"], "again")
         d.wait(second["task_id"], timeout=60)
         head = subprocess.run(["git", "-C", second["run_dir"], "rev-parse", "--abbrev-ref", "HEAD"], text=True, capture_output=True).stdout.strip()

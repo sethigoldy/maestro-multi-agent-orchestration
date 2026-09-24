@@ -89,7 +89,9 @@ object:
 
 `run_dir` is where the task's work is: the workspace itself, or the task's own
 worktree under `~/.maestro/worktrees/<task-id>` when the task was delegated
-while the workspace was busy.
+while the workspace was busy. When that worktree does not exist (it was removed
+or deleted by hand), `metadata` also has `"run_dir_missing": true`; the next
+turn creates it again from the task's branch.
 
 For tasks delegated with a work mode (or explicit gate agents), `metadata` also
 carries `gates` — one entry per LLM gate turn that ran, shaped
