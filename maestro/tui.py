@@ -103,6 +103,16 @@ def normalize(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_task(url: str, task_id: str, token: str | None = None) -> dict[str, Any] | None:
+    """One task's record from the daemon (JSON-RPC ``tasks/get``), or None when
+    the daemon does not know the task."""
+    from .a2a_client import post_jsonrpc
+
+    result = post_jsonrpc(url, "tasks/get", {"id": task_id}, timeout=10, token=token)
+    task = (result or {}).get("task")
+    return normalize(task) if isinstance(task, dict) else None
+
+
 def _draw(stdout: Any, frame: str) -> None:
     """Write one frame with "\r\n" line breaks.
 
@@ -261,6 +271,9 @@ class _State:
         self.selected: int | None = 0
         self.live = False
         self.lost = False
+        # Fetches one task's full record by id. Set by run() so that a task
+        # first seen through an event gets its title, agents and workspace.
+        self.fetch: Callable[[str], dict[str, Any] | None] | None = None
 
     def set_tasks(self, tasks: list[dict[str, Any]]) -> None:
         """Replace the task table and rebuild the index that events use to find rows.
@@ -277,7 +290,16 @@ class _State:
             return
         task = self.by_id.get(task_id)
         if task is None:
-            task = {"task_id": task_id, "state": "submitted"}
+            # A task delegated after the dashboard opened. Its events carry no
+            # title or agents, so ask the daemon for its record. If that fails,
+            # the row still appears, showing the task id.
+            record = None
+            if self.fetch is not None:
+                try:
+                    record = self.fetch(task_id)
+                except (ValueError, OSError):
+                    record = None
+            task = record or {"task_id": task_id, "state": "submitted"}
             self.by_id[task_id] = task
             self.tasks.insert(0, task)  # newest first
         if type_ == "state":
@@ -366,6 +388,7 @@ def run(
     stdout = stdout or sys.stdout
     stdin = stdin or sys.stdin.buffer
     state = _State()
+    state.fetch = lambda task_id: load_task(url, task_id, token=token)
     try:
         state.set_tasks(load_tasks(url, token=token))
     except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -405,6 +428,10 @@ def run(
             except termios.error:
                 old_termios = None
         stdout.write("\x1b[?1049h\x1b[?25l")  # alt screen, hide cursor
+        # Draw the tasks loaded above straight away. Later frames are drawn on
+        # daemon events and key presses, and an idle daemon sends no events.
+        _draw(stdout, render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
+        stdout.flush()
         exit_code = 0
         try:
             while True:
