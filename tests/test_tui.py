@@ -196,6 +196,29 @@ def test_run_renders_events_and_quits(tmp_path):
         server.server_close()
 
 
+def test_run_draws_the_task_list_before_any_event_or_key(tmp_path):
+    # When no task is running, the daemon sends no events. The dashboard must
+    # still show the tasks it loaded at start, not an empty screen that waits
+    # for an event or a key press.
+    server, url = _sse_server(
+        tmp_path,
+        [{"id": "task-1", "status": {"state": "completed"}, "metadata": {"title": "Seeded"}}],
+        b"",
+    )
+    try:
+        out = io.StringIO()
+        rc = tui.run(url, stdin=_PipeStdin(b"q", delay_s=0.3), stdout=out, is_tty=lambda: True)
+        assert rc == 0
+        text = out.getvalue()
+        assert "Seeded" in text
+        # The first frame comes after switching to the alternate screen, and
+        # before leaving it.
+        assert text.index("\x1b[?1049h") < text.index("Seeded") < text.index("\x1b[?1049l")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_run_ends_every_line_with_carriage_return(tmp_path):
     # The dashboard puts the terminal in raw mode, which turns off the
     # terminal's own newline translation. A bare "\n" then moves the cursor

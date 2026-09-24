@@ -405,6 +405,10 @@ def run(
             except termios.error:
                 old_termios = None
         stdout.write("\x1b[?1049h\x1b[?25l")  # alt screen, hide cursor
+        # Draw the tasks loaded above straight away. Later frames are drawn on
+        # daemon events and key presses, and an idle daemon sends no events.
+        _draw(stdout, render_frame(state.tasks, state.selected, state.live, width=width_holder["width"]))
+        stdout.flush()
         exit_code = 0
         try:
             while True:

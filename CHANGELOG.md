@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The terminal dashboard shows the task list as soon as it opens.** `maestro dashboard` loaded the tasks at start but drew nothing until the daemon sent an event or a key was pressed. When no task was running, the daemon sent no events, so the screen stayed empty. The dashboard now draws the first screen straight away.
+
 ## [0.14.0] — 2026-09-24
 
 ### Added
