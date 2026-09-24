@@ -182,6 +182,24 @@ def rename_task_branch(workspace: str, task_id: str, branch: str) -> str:
 
 
 @mcp.tool()
+def cleanup_task_worktree(workspace: str, task_id: str, force: bool = False) -> str:
+    """Remove the git worktree of a task that ran next to a busy workspace.
+
+    Refused while the task is running, and refused when the worktree has
+    uncommitted changes unless force is true (the error lists the files). The
+    task's branch and its commits are always kept. For a task that ran in the
+    workspace itself this does nothing: your checkout is never removed."""
+    try:
+        d = get_daemon()
+        result = d.cleanup_worktree(d.resolve(task_id), force=force)
+    except KeyError as exc:
+        return json.dumps({"error": exc.args[0]}, indent=2)
+    except (ValueError, RuntimeError) as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
 def followup(workspace: str, task_id: str, instruction: str, context_mode: str = "reuse", branch: str = "") -> str:
     """Send a follow-up instruction to a finished task (completed/failed/canceled).
     The same agent resumes on the same task branch with the new instruction —

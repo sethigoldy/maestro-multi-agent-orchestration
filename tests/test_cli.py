@@ -428,3 +428,11 @@ def test_audit_reports_run_dir(monkeypatch, tmp_path, capsys):
         m.close()
     assert cli.main(["task", "audit", "task-a"]) == 0
     assert json.loads(capsys.readouterr().out)["run_dir"] == "/home/worktrees/task-a"
+
+def test_task_cleanup_posts_cleanup(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _rpc_capture(monkeypatch, {"cleanup": {"task_id": "t", "removed": True, "run_dir": "/w", "reason": "removed"}})
+    assert cli.main(["task", "cleanup", "t", "--force"]) == 0
+    assert captured["method"] == "tasks/cleanup"
+    assert captured["payload"] == {"id": "t", "force": True}
+    assert json.loads(capsys.readouterr().out)["cleanup"]["removed"] is True

@@ -12,6 +12,7 @@ from typing import Any
 from . import VERSION
 from .agents import AgentRegistry, AgentSpec, BUILTIN_ADAPTERS, GENERIC_KIND
 from .core import Maestro, RegistryUnreadableError, maestro_user_dir
+from . import worktrees
 
 
 def _workspace(value: str | None) -> Path:
@@ -67,7 +68,7 @@ def _normalize_argv(argv: list[str]) -> list[str]:
     A ``task`` token that appears later, as an argument of another command or
     as an option value, is left alone.
     """
-    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue", "answer", "cancel", "rename-branch"}
+    known_task_cmds = {"list", "status", "show", "tail", "audit", "receipt", "continue", "answer", "cancel", "cleanup", "rename-branch"}
     index = 0
     while index < len(argv) and argv[index].startswith("-"):
         index += 2 if _takes_separate_value(argv[index]) else 1
@@ -439,6 +440,14 @@ def _cmd_task_cancel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_task_cleanup(args: argparse.Namespace) -> int:
+    """Remove a task's worktree through the running daemon."""
+    url, token = _daemon_endpoint()
+    result = _post_jsonrpc(url, "tasks/cleanup", {"id": args.task_id, "force": bool(args.force)}, token=token)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def _cmd_task_rename_branch(args: argparse.Namespace) -> int:
     """Rename a task's branch through the running daemon, or directly in the
     durable record when no daemon is running (nothing can be working then)."""
@@ -662,7 +671,17 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             age = age_days_for(task_id, record)
             return age if age is not None and age >= args.days else None
 
+        def dirty_worktree(task_id: str) -> tuple[Path, list[str]] | None:
+            """The task's worktree and its uncommitted files, or None when it
+            has no worktree on disk."""
+            claims = m._claims(task_id)
+            if claims.get("task_run_dir_kind") != "worktree" or not claims.get("task_run_dir"):
+                return None
+            path = Path(claims["task_run_dir"])
+            return (path, worktrees.dirty_files(path)) if path.is_dir() else None
+
         removed: list[dict[str, Any]] = []
+        kept_worktrees: list[dict[str, Any]] = []
         kept = 0
         for record in m._registry_records():
             task_id = str(record.get("task_id") or "")
@@ -672,18 +691,36 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             if age is None:
                 kept += 1
                 continue
+            worktree = dirty_worktree(task_id)
+            if worktree is not None and worktree[1]:
+                # Uncommitted work: keep the worktree, and the record that
+                # tells the user where it is.
+                kept += 1
+                kept_worktrees.append({"task_id": task_id, "run_dir": str(worktree[0]), "uncommitted": worktree[1]})
+                continue
             if args.dry_run:
                 removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "dry_run": True})
                 continue
             # The check is repeated under the locks: a claim written since the
             # first check (a follow-up started, say) means the task is kept.
+            if worktree is not None:
+                claims = m._claims(task_id)
+                try:
+                    worktrees.remove_worktree(Path(claims.get("task_workspace") or worktree[0]), worktree[0], force=False)
+                except RuntimeError as exc:  # locked, or git refused: keep the task so the user can see why
+                    kept += 1
+                    kept_worktrees.append({"task_id": task_id, "run_dir": str(worktree[0]), "uncommitted": [], "error": str(exc)})
+                    continue
             dropped = m.unregister_task(task_id, should_remove=lambda current, task_id=task_id: removable_age(task_id, current) is not None)
             if dropped is None:
                 kept += 1
                 continue
             shutil.rmtree(state_dir / "tasks" / task_id, ignore_errors=True)
             removed.append({"task_id": task_id, "title": record.get("title"), "age_days": round(age, 1), "claims_dropped": dropped})
-        print(json.dumps({"removed": removed, "kept": kept}, indent=2))
+        output: dict[str, Any] = {"removed": removed, "kept": kept}
+        if kept_worktrees:
+            output["kept_worktrees"] = kept_worktrees
+        print(json.dumps(output, indent=2))
         return 0
     finally:
         m.close()
@@ -736,6 +773,12 @@ def main(argv: list[str] | None = None) -> int:
     task_cancel = task_sub.add_parser("cancel", help="Cancel a task that is waiting, queued or running")
     task_cancel.add_argument("task_id")
     task_cancel.add_argument("--reason", default="", help="Why the task is canceled (kept in its record)")
+    task_cleanup = task_sub.add_parser(
+        "cleanup",
+        help="Remove a task's worktree (never its branch, never your checkout); refused when the worktree has uncommitted changes unless --force",
+    )
+    task_cleanup.add_argument("task_id")
+    task_cleanup.add_argument("--force", action="store_true", help="Remove the worktree even though it has uncommitted changes")
     task_rename = task_sub.add_parser(
         "rename-branch",
         help="Rename a finished task's git branch and update its record (or record a rename already done with 'git branch -m')",
@@ -867,6 +910,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_task_answer(args)
         if args.cmd == "task" and args.task_cmd == "cancel":
             return _cmd_task_cancel(args)
+        if args.cmd == "task" and args.task_cmd == "cleanup":
+            return _cmd_task_cleanup(args)
         if args.cmd == "task" and args.task_cmd == "rename-branch":
             return _cmd_task_rename_branch(args)
         if args.cmd == "doctor":

@@ -304,3 +304,30 @@ def test_followup_in_a_broken_worktree_fails_with_the_reason(tmp_path, monkeypat
         assert "could not check out the task branch" in final["metadata"]["error"]
     finally:
         _stop(d, gate)
+
+def test_cleanup_rules(tmp_path, monkeypatch, binpath):
+    gate = tmp_path / "go"
+    _slow_agent(binpath, gate)
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        first = d.delegate(_doc(), ws)
+        second = d.delegate(_doc(), ws)
+        with pytest.raises(ValueError, match="is running"):
+            d.cleanup_worktree(second["task_id"])
+        gate.touch()
+        d.wait(first["task_id"], timeout=60)
+        d.wait(second["task_id"], timeout=60)
+        # The fake agent left ran-here.txt uncommitted in the worktree.
+        with pytest.raises(ValueError, match="uncommitted changes: ran-here.txt"):
+            d.cleanup_worktree(second["task_id"])
+        result = d.cleanup_worktree(second["task_id"], force=True)
+        assert result["removed"] is True and not Path(second["run_dir"]).exists()
+        again = d.cleanup_worktree(second["task_id"])
+        assert again["removed"] is False and again["reason"] == "the worktree is already gone"
+        assert d.maestro._claims(second["task_id"])["task_run_dir_removed"] == "true"
+        in_place = d.cleanup_worktree(first["task_id"])
+        assert in_place["removed"] is False and "ran in the workspace" in in_place["reason"]
+        assert (ws / "ran-here.txt").exists()  # the user's checkout is never touched
+    finally:
+        _stop(d, gate)

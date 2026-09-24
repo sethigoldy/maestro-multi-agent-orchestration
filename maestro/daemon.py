@@ -2173,6 +2173,36 @@ class MaestroDaemon:
             thread.start()
         return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
 
+    def cleanup_worktree(self, task_id: str, force: bool = False) -> dict[str, Any]:
+        """Remove a task's worktree (docs/design-parallel-tasks.md, section 5).
+
+        Never touches the workspace and never removes the branch. Refuses while
+        the task is running, and refuses to drop uncommitted work unless
+        ``force`` is given; the message lists the changed files."""
+        with self._lock:
+            record = self._tasks.get(task_id) or self._durable_record(task_id)
+            if record is None:
+                raise KeyError(f"Unknown task reference {task_id!r}")
+            if record.get("state") in (STATE_SUBMITTED, STATE_WORKING) or task_id in self._turn_starting:
+                raise ValueError(f"Task {task_id} is running; wait for it to finish or cancel it first")
+            claims = self.maestro._claims(task_id)
+            kind = record.get("run_dir_kind") or claims.get("task_run_dir_kind") or "workspace"
+            run_dir = Path(record.get("run_dir") or claims.get("task_run_dir") or record["workspace"])
+            if kind != "worktree":
+                return {"task_id": task_id, "run_dir": str(run_dir), "removed": False,
+                        "reason": "this task ran in the workspace; Maestro never removes or changes your checkout"}
+            if not run_dir.is_dir():
+                return {"task_id": task_id, "run_dir": str(run_dir), "removed": False, "reason": "the worktree is already gone"}
+            dirty = worktrees.dirty_files(run_dir)
+            if dirty and not force:
+                raise ValueError(
+                    f"The worktree {run_dir} has uncommitted changes: {', '.join(dirty)}. "
+                    "Commit them, or pass --force to remove the worktree anyway"
+                )
+            worktrees.remove_worktree(Path(record["workspace"]), run_dir, force=force)
+            self.maestro._write_claim(task_id, "task_run_dir_removed", "true")
+            return {"task_id": task_id, "run_dir": str(run_dir), "removed": True, "reason": "removed; the branch is kept"}
+
     def rename_branch(self, task_id: str, new_branch: str) -> dict[str, Any]:
         """Rename a task's branch in git and in the task's record.
 

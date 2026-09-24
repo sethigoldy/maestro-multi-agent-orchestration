@@ -329,3 +329,30 @@ def test_unexpected_exception_becomes_an_internal_error(capsys):
     resp = A2ADispatcher(Broken()).handle(_req("tasks/get", {"id": "task-1"}, rid=3))
     assert resp == {"jsonrpc": "2.0", "id": 3, "error": {"code": ERR_INTERNAL, "message": "Internal error: RuntimeError"}}
     assert "journal exploded" in capsys.readouterr().err  # the operator still gets the traceback
+
+
+def test_cleanup_method():
+    daemon = FakeDaemon()
+    calls = []
+
+    def cleanup_worktree(task_id, force=False):
+        calls.append((task_id, force))
+        if task_id == "task-busy":
+            raise ValueError("Task task-busy is running")
+        if task_id == "task-missing":
+            raise KeyError("Unknown task reference 'task-missing'")
+        return {"task_id": task_id, "removed": True, "run_dir": "/w", "reason": "removed; the branch is kept"}
+
+    daemon.cleanup_worktree = cleanup_worktree
+    daemon.resolve = lambda ref: ref
+    dispatcher = A2ADispatcher(daemon)
+    ok = dispatcher.handle(_req("tasks/cleanup", {"id": "task-1", "force": True}))
+    assert ok["result"]["cleanup"]["removed"] is True and calls[-1] == ("task-1", True)
+    busy = dispatcher.handle(_req("tasks/cleanup", {"id": "task-busy"}))
+    assert busy["error"]["code"] == ERR_INVALID_PARAMS and calls[-1] == ("task-busy", False)
+    missing = dispatcher.handle(_req("tasks/cleanup", {"id": "task-missing"}))
+    assert missing["error"]["code"] == ERR_TASK_NOT_FOUND
+    no_id = dispatcher.handle(_req("tasks/cleanup", {}))
+    assert no_id["error"]["code"] == ERR_INVALID_PARAMS
+    bad_force = dispatcher.handle(_req("tasks/cleanup", {"id": "task-1", "force": "yes"}))
+    assert bad_force["error"]["code"] == ERR_INVALID_PARAMS

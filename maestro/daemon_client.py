@@ -233,6 +233,10 @@ class DaemonClient:
         return self._call("tasks/renameBranch", {"id": task_id, "branch": new_branch})["rename"]
 
     @_or_embedded
+    def cleanup_worktree(self, task_id: str, force: bool = False) -> dict[str, Any]:
+        return self._call("tasks/cleanup", {"id": task_id, "force": force})["cleanup"]
+
+    @_or_embedded
     def agents(self) -> list[dict[str, Any]]:
         return self._call("agents/list", {})["agents"]
 
