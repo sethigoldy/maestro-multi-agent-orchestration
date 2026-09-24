@@ -17,6 +17,7 @@ export function normalizeTask(record) {
     title: meta.title,
     state: (record.status && record.status.state) || "unknown",
     workspace: meta.workspace,
+    run_dir: meta.run_dir,
     branch: meta.branch,
     origin_agent: meta.origin_agent,
     target_agent: meta.target_agent,

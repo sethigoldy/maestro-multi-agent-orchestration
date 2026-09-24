@@ -6,6 +6,17 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Several tasks can run in one workspace at the same time.** Until now a workspace ran one task at a time, and every other task for it waited in a queue. A task that stopped to ask a question kept its place, so if nobody answered, every later task for that workspace waited forever. Now the first task runs in the workspace, as before, and a task delegated while the workspace is busy runs in a git worktree of its own under `~/.maestro/worktrees/<task-id>`, on its own branch, and starts at once. The worktree starts from the commit checked out in the workspace; uncommitted changes in the workspace are not copied. Each task stays in the directory where it first ran, so its follow-ups and answers continue there. At most 4 tasks run turns at the same time for one workspace; set `[defaults] max_parallel` to change this, and `max_parallel = 1` gives the old behaviour. A task waiting for an answer does not count toward the limit. `commit_policy = "no-commit"` tasks work in place, so they still wait for the workspace. The design is in `docs/design-parallel-tasks.md`.
+- **Where a task's work is: `run_dir`.** `task status`, `task audit`, receipts, MCP results, A2A task metadata, the terminal dashboard and the web console show `run_dir`: the workspace, or the task's worktree. A worktree task's changes are there, not in your checkout, so review them there. When a worktree task's directory does not exist, `task status` and the task metadata also carry `run_dir_missing: true`, and the next turn creates the worktree again from the branch. Tasks created before this version report their workspace.
+- **Removing worktrees: `maestro task cleanup <task> [--force]`**, the MCP tool `cleanup_task_worktree` and the A2A method `tasks/cleanup`. They refuse while the task is running, and refuse when the worktree has uncommitted changes unless `--force` is given. The branch is always kept, and the workspace itself is never removed. `maestro gc` now also removes the worktrees of the old tasks it deletes, but keeps any task whose worktree has uncommitted changes and lists it under `kept_worktrees`.
+
+### Changed
+
+- **A queued delegation says why it waits.** The CLI and the MCP `delegate` tool used to print "workspace already has an active task; this handoff is next in line". They now print the daemon's reason: the workspace is at its limit of running tasks, or the task works in place (`no-commit`) or has its work in the workspace, and another task is using the workspace. Follow-ups and answers that have to wait carry the same `reason`.
+- **Verification in a worktree uses the main checkout's virtual environment** (`.venv/` or `venv/`) when the worktree has none, after `MAESTRO_PYTHON` and the run directory's own virtual environment.
+
 ### Fixed
 
 - **The terminal dashboard shows the task list as soon as it opens.** `maestro dashboard` loaded the tasks at start but drew nothing until the daemon sent an event or a key was pressed. When no task was running, the daemon sent no events, so the screen stayed empty. The dashboard now draws the first screen straight away.

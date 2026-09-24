@@ -33,6 +33,7 @@ MCP_TOOLS = (
     "answer_task_question",
     "followup",
     "rename_task_branch",
+    "cleanup_task_worktree",
 )
 
 CLI_COMMANDS = (
@@ -46,6 +47,7 @@ CLI_COMMANDS = (
     "task answer",
     "task cancel",
     "task rename-branch",
+    "task cleanup",
     "dashboard",
     "agents add",
     "agents discover",

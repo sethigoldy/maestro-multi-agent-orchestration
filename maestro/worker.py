@@ -67,17 +67,24 @@ def _python_executable(root: Path) -> str:
     """Return the Python interpreter that verification should use for this project.
 
     The order is: the MAESTRO_PYTHON environment variable, the project's own
-    virtual environment in ``.venv/`` or ``venv/``, and finally the interpreter
-    that is running Maestro itself.
+    virtual environment in ``.venv/`` or ``venv/``, the same in the main
+    checkout of the repository (for a task running in a worktree), and finally
+    the interpreter that is running Maestro itself.
     """
     env_python = os.environ.get("MAESTRO_PYTHON")
     if env_python and Path(env_python).is_file():
         return env_python
 
-    for venv in (".venv", "venv"):
-        repo_python = root / venv / "bin" / "python"
-        if repo_python.is_file() and os.access(repo_python, os.X_OK):
-            return str(repo_python)
+    from .worktrees import main_repo_root
+
+    # A task running in a worktree has no virtual environment of its own;
+    # the project's usually lives in the main checkout.
+    main = main_repo_root(root)
+    for base in (root,) + ((main,) if main is not None and main != root else ()):
+        for venv in (".venv", "venv"):
+            repo_python = base / venv / "bin" / "python"
+            if repo_python.is_file() and os.access(repo_python, os.X_OK):
+                return str(repo_python)
 
     return sys.executable
 

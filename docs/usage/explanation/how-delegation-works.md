@@ -33,8 +33,9 @@ not a process launch. Consequences:
   append-only journal (below).
 - Any registered agent can be target or origin; roles are data in the handoff,
   not assumptions in prompts.
-- One active task per workspace with FIFO queueing falls out of the broker
-  model: the daemon simply tracks which workspace slot is busy.
+- Parallel tasks in one workspace fall out of the broker model: the daemon
+  tracks which task is using the workspace, and gives a task that arrives
+  while it is busy a git worktree of its own.
 
 The trade-off is that you now run a service. In practice it is cheap (one
 process, no external dependencies), it prints everything you need on startup,
@@ -150,11 +151,16 @@ the journal so state stays cheap to scan.
 
 ## Workspaces and branches
 
-One workspace runs one active task; additional handoffs for that workspace
-queue FIFO and start when the slot frees. This is a concurrency guarantee, not
-a throughput limit: two different workspaces run concurrently, and each task
-gets its own branch (`maestro/<task-id>`) so parallel work never interleaves in
-one working tree.
+More than one task can run in a workspace at the same time, and parallel work never shares a working tree. The first task
+runs in the workspace. A task delegated while the workspace is busy runs in a
+git worktree under `~/.maestro/worktrees/<task-id>`, created from the commit
+checked out in the workspace (uncommitted changes in the workspace are not
+copied). Each task has its own branch (`maestro/<task-id>` unless the handoff
+names one) and stays in the directory where it first ran. At most
+`[defaults] max_parallel` tasks (4 by default) run turns at the same time for
+one workspace; the rest wait in a queue, and a task that stops to ask a question
+does not count. `commit_policy = "no-commit"` tasks work in place, so they wait
+for the workspace instead of getting a worktree.
 
 The branch is created *before* the agent starts, which means the review story
 is simple: whatever the agent did — or failed to do — is inspectable on that
