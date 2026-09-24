@@ -11,7 +11,7 @@ are accepted where a task id is expected (resolved against user-level state).
 ## Which daemon runs the tasks
 
 The tools that start, wait for or change tasks (`delegate`, `task_wait`,
-`followup`, `answer_task_question`, `cancel_task`, `rename_task_branch`,
+`followup`, `answer_task_question`, `cancel_task`, `rename_task_branch`, `cleanup_task_worktree`,
 `agents_list`) need a daemon. Only one daemon owns a state directory, and the
 MCP server never runs tasks beside it:
 
@@ -75,6 +75,7 @@ object:
   ],
   "metadata": {
     "workspace": "/path/to/repo",
+    "run_dir": "/path/to/repo",
     "branch": "maestro/task-20250718-143022-a1b2c3",
     "origin_agent": "human",
     "target_agent": "codex",
@@ -85,6 +86,10 @@ object:
   }
 }
 ```
+
+`run_dir` is where the task's work is: the workspace itself, or the task's own
+worktree under `~/.maestro/worktrees/<task-id>` when the task was delegated
+while the workspace was busy.
 
 For tasks delegated with a work mode (or explicit gate agents), `metadata` also
 carries `gates` — one entry per LLM gate turn that ran, shaped
@@ -136,8 +141,12 @@ handoff leaves it out and the remote uses its own default branch.
 
 - Timeout: `MAESTRO_DELEGATE_TIMEOUT` seconds (default 3600). On expiry the
   result carries `"timed_out": true` alongside the current task object.
-- If the workspace already has an active task, returns immediately with
-  `{"queued": true, "reason": "workspace already has an active task; this handoff is next in line", "ts": …}`.
+- If the task cannot start yet, returns immediately with
+  `{"queued": true, "reason": …, "ts": …}`. The reason says why: the workspace
+  is at its limit of running tasks (`[defaults] max_parallel`), or the task
+  works in place (`no-commit`) or has its work in the workspace, and another
+  task is using the workspace. A task delegated while the workspace is busy
+  usually does not queue: it runs in a worktree of its own.
 - Errors (unknown file, invalid handoff, self-delegation, depth exhausted,
   budget cap, non-git workspace, invalid, existing or clashing `branch`) return
   `{"error": "<message>"}`.
@@ -208,6 +217,27 @@ name; the new branch already exists or clashes with an existing branch as a
 folder; neither the old nor the new branch exists; the old
 branch is gone and git's reflog shows no rename from it to the new branch (the
 new branch may be unrelated to the task).
+
+## cleanup_task_worktree
+
+```text
+cleanup_task_worktree(workspace: str, task_id: str, force: bool = False) -> str
+```
+
+Removes the git worktree of a task that ran next to a busy workspace. The
+task's branch and its commits are always kept. Accepts a task id or a task
+number.
+
+Returns `{"task_id": …, "run_dir": …, "removed": true|false, "reason": …}`.
+`removed` is `false`, with a reason, when the task ran in the workspace itself
+(Maestro never removes your checkout) or the worktree is already gone. A later
+`followup` on a task whose worktree was removed creates the worktree again from
+its branch; only committed work comes back.
+
+Errors, each returned as `{"error": …}`: unknown task; the task is running (`submitted` or
+`working`) or a turn is starting; the worktree has uncommitted changes and
+`force` is not true (the message lists the files); git refused to remove the
+worktree (for example, it is locked).
 
 ## task_wait
 

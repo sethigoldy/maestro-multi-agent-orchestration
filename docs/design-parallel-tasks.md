@@ -1,6 +1,6 @@
 # Design: Parallel tasks in one workspace, using a git worktree per task
 
-Status: approved design, not implemented yet. Date: 2026-09-24.
+Status: implemented in 0.15.0. Date: 2026-09-24.
 
 ## 1. The problem
 

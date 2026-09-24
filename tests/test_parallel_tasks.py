@@ -19,7 +19,12 @@ _ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITT
 
 def _fake_bin(dirpath: Path, name: str, body: str) -> None:
     path = dirpath / name
-    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+    # Before a task, the adapter runs probes such as "<agent> --version",
+    # "<agent> exec --help" and "<agent> login status" from the test's working
+    # directory. Answer them at once, so the agent body (which may write files
+    # into its current directory) runs only as a real task.
+    probes = 'case " $* " in *" --version "*|*" --help "*|" login "*) echo "' + name + ' 0.0.0"; exit 0;; esac'
+    path.write_text(f"#!/bin/sh\n{probes}\n{body}\n", encoding="utf-8")
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
