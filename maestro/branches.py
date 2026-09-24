@@ -203,7 +203,10 @@ def rename_task_branch(maestro: "Maestro", task_id: str, new_branch: str) -> dic
         maestro._write_claim(task_id, "task_runtime", json.dumps(runtime, ensure_ascii=False))
     # The knowledge snapshot names the branch; re-project it so receipts and
     # the next follow-up's context show the new name.
-    knowledge = project_knowledge(task_id, maestro._claims(task_id), runtime, workspace=workspace)
+    # Changed files are read where the task's work is: its run directory.
+    claims = maestro._claims(task_id)
+    run_dir = Path(claims["task_run_dir"]) if claims.get("task_run_dir") else workspace
+    knowledge = project_knowledge(task_id, claims, runtime, workspace=run_dir)
     maestro._write_claim(task_id, "task_knowledge", knowledge.serialize())
     return {"task_id": task_id, "old_branch": old_branch, "branch": new_branch, "git_renamed": git_renamed}
 

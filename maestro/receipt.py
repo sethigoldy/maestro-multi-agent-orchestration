@@ -205,6 +205,7 @@ def build_receipt(task_id: str, maestro: Any, state_dir: str | Path | None = Non
             "title": claims.get("task_title") or (record or {}).get("title"),
             "request": claims.get("task_request"),
             "workspace": claims.get("task_workspace") or (record or {}).get("workspace"),
+            "run_dir": claims.get("task_run_dir") or claims.get("task_workspace") or (record or {}).get("workspace"),
             "branch": claims.get("task_branch") or runtime.get("branch"),
             "created_at": (record or {}).get("created_at"),
             "completed_at": max(finished_dts).isoformat() if finished_dts else None,
@@ -277,6 +278,7 @@ def format_receipt(receipt: dict[str, Any]) -> str:
     for label, value in (
         ("Status", str(receipt.get("state") or "unknown").upper()),
         ("Workspace", task.get("workspace")),
+        ("Run dir", task.get("run_dir") if task.get("run_dir") != task.get("workspace") else None),
         ("Branch", task.get("branch")),
         ("Duration", _fmt_duration(totals.get("duration_s"))),
         ("Cost", _fmt_cost(totals.get("cost_usd"))),

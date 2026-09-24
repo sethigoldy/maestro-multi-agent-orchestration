@@ -855,3 +855,78 @@ def test_unknown_suite_keeps_the_workspace_decision_for_missing_pytest(daemon, t
     (ws / "work.txt").write_text("done\n", encoding="utf-8")
     daemon._tasks["task-old"] = {"base_head": daemon._base_head(ws)}
     assert daemon._verify(ws, "task-old", _doc()) is True
+
+
+# ------------------------------------------------ time limit and visibility
+def test_verification_time_limit_stops_the_command_and_its_children(daemon, tmp_path):
+    import threading
+    import time as _time
+
+    ws = _repo(tmp_path, {"README.md": "# repo\n"})
+    pidfile = tmp_path / "child.pid"
+    daemon.maestro.config["verification_timeout_s"] = 1
+    # The command starts a background child that would outlive a plain kill.
+    command = f"sh -c 'sleep 60 & echo $! > {pidfile}; wait'"
+    started = _time.monotonic()
+    ok, report = _verify(daemon, ws, verification="command", verification_command=command)
+    assert not ok
+    assert _time.monotonic() - started < 20
+    assert "did not finish within 1 second" in report
+    assert "[verification] timeout_s" in report
+    child = int(pidfile.read_text().strip())
+    deadline = _time.monotonic() + 5
+    while _time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail("the verification command's child process was left running")
+
+
+def test_verification_without_a_time_limit_when_timeout_is_zero(daemon, tmp_path):
+    ws = _repo(tmp_path, {"README.md": "# repo\n"})
+    daemon.maestro.config["verification_timeout_s"] = 0
+    ok, report = _verify(daemon, ws, verification="command", verification_command="true")
+    assert ok and "did not finish" not in report
+
+
+def test_verifying_phase_and_output_lines_while_tests_run(daemon, tmp_path):
+    import threading
+    import time as _time
+
+    ws = _repo(tmp_path, {"README.md": "# repo\n"})
+    gate = tmp_path / "gate"
+    task_id = "task-phase"
+    doc = _doc(verification="command", verification_command=f"sh -c 'while [ ! -f {gate} ]; do sleep 0.05; done'")
+    daemon._tasks[task_id] = {"state": "working"}
+    daemon._record_turn_baseline(task_id, ws, doc)
+    sub = daemon.bus.subscribe("output")
+    result = {}
+    worker_thread = threading.Thread(target=lambda: result.__setitem__("ok", daemon._verify(ws, task_id, doc)))
+    worker_thread.start()
+    try:
+        deadline = _time.monotonic() + 10
+        while daemon.maestro._claims(task_id).get("task_status") != "VERIFYING":
+            assert _time.monotonic() < deadline, "the VERIFYING phase was never written"
+            _time.sleep(0.05)
+        line = sub.wait(predicate=lambda e: e.task_id == task_id and "[verify] running:" in (e.data.get("line") or ""), timeout=10)
+        assert line is not None and "time limit 30 minutes" in line.data["line"]
+    finally:
+        gate.touch()
+        worker_thread.join(timeout=30)
+        sub.close()
+    assert result["ok"] is True
+    assert daemon.maestro._claims(task_id)["task_status"] == "IMPLEMENTING"  # back to the working phase
+
+
+def test_verifying_phase_is_not_written_for_a_canceled_task(daemon, tmp_path):
+    ws = _repo(tmp_path, {"README.md": "# repo\n"})
+    task_id = "task-canceled"
+    doc = _doc(verification="command", verification_command="true")
+    daemon._tasks[task_id] = {"state": "canceled"}
+    daemon._record_turn_baseline(task_id, ws, doc)
+    daemon.maestro._write_claim(task_id, "task_status", "FAILED")
+    daemon._verify(ws, task_id, doc)
+    assert daemon.maestro._claims(task_id)["task_status"] == "FAILED"

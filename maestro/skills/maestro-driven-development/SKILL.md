@@ -367,8 +367,10 @@ When your environment exposes the Maestro MCP server, these tools are available
 
 - **`delegate(workspace, file, branch="")`** — submit a handoff file and **block until the
   task completes, fails, or needs input** (no polling). Returns the final A2A
-  task object (state, artifacts, workspace/branch metadata). If the workspace
-  already has an active task you get `{"queued": true, …}` immediately. Routing
+  task object (state, artifacts, workspace/run_dir/branch metadata). A task
+  delegated while the workspace is busy runs in a git worktree of its own, and
+  its changes are in `run_dir`, not in the workspace: review the diff there. If
+  the task cannot start yet you get `{"queued": true, "reason": …}` immediately. Routing
   defaults and the input-required question behave exactly as in section 3.
   `branch` names the task's git branch (default `maestro/<task-id>`); use it
   when the repository has branch naming conventions, instead of renaming later.
@@ -385,6 +387,9 @@ When your environment exposes the Maestro MCP server, these tools are available
   input-required task (routing selection or sensitive-workspace approval) and
   resume it.
 - **`cancel_task(workspace, task_id)`** — cancel a running/queued task.
+- **`cleanup_task_worktree(workspace, task_id, force=False)`** — remove a
+  worktree task's worktree once its changes are reviewed and committed. Refused
+  while it has uncommitted changes unless `force`; the branch is kept.
 - **`rename_task_branch(workspace, task_id, branch)`** — rename a finished task's
   branch in git and in the task's record. If the branch was already renamed with
   `git branch -m`, this only updates the record. If the task has no branch yet,

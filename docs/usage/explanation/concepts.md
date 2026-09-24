@@ -45,8 +45,14 @@ a task survives worktree creation/switching/deletion and daemon restarts: the
 daemon re-derives "what is true" from the journal, and nothing important ever
 lived only in a terminal buffer.
 
-One active task per workspace; extra delegations queue FIFO until the slot
-frees.
+More than one task can run in a workspace at the same time. The first task runs in the workspace itself. A task delegated
+while the workspace is busy runs in a git worktree of its own, under
+`~/.maestro/worktrees/<task-id>`, on its own branch, and starts at once. Each
+task stays in the directory where it first ran, so its follow-ups continue
+there. `run_dir` in the task's status tells you where its work is. At most 4
+tasks run at the same time for one workspace (`[defaults] max_parallel`), and
+tasks beyond that wait in a queue. The full design is in
+`docs/design-parallel-tasks.md`.
 
 ## Attempt
 

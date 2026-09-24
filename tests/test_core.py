@@ -209,3 +209,82 @@ def test_status_ignores_an_unreadable_runtime_snapshot(tmp_path, monkeypatch):
         assert 'question' not in m.status(tid)
     finally:
         m.close()
+
+
+def test_verification_timeout_setting(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('MAESTRO_HOME', str(home))
+    def load(text):
+        (home / 'config.toml').write_text(text, encoding='utf-8')
+        m = Maestro(tmp_path)
+        try:
+            return m.config['verification_timeout_s']
+        finally:
+            m.close()
+    assert load('') == 1800  # 30 minutes by default
+    assert load('[verification]\ntimeout_s = 600\n') == 600
+    assert load('[verification]\ntimeout_s = 0\n') == 0  # no time limit
+    for bad in ('-1', '"600"', 'true', '1.5'):
+        with pytest.raises(ValueError, match="timeout_s must be a whole number of seconds"):
+            load(f'[verification]\ntimeout_s = {bad}\n')
+
+
+def test_status_always_reports_the_task_state(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        assert 'state' not in m.status(tid)  # nothing recorded yet
+        m._write_claim(tid, 'task_runtime', json.dumps({"state": "working"}))
+        assert m.status(tid)['state'] == 'working'
+    finally:
+        m.close()
+
+
+def test_defaults_max_parallel_parsed_and_validated():
+    assert Maestro._parse_defaults({"max_parallel": 2}) == {"max_parallel": 2}
+    assert Maestro._parse_defaults({}) == {}
+    for bad in (0, -1, "4", 2.5, True):
+        with pytest.raises(ValueError, match="max_parallel must be a whole number of at least 1"):
+            Maestro._parse_defaults({"max_parallel": bad})
+
+
+def test_status_reports_run_dir_and_defaults_to_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        s = m.status(tid)
+        # A task from before run directories existed ran in its workspace.
+        assert s['run_dir'] == s['workspace'] and s['run_dir_kind'] == 'workspace'
+        assert 'run_dir_removed' not in s
+        m._write_claim(tid, 'task_run_dir', '/home/.maestro/worktrees/x')
+        m._write_claim(tid, 'task_run_dir_kind', 'worktree')
+        m._write_claim(tid, 'task_run_dir_removed', 'false')
+        assert 'run_dir_removed' not in m.status(tid)
+        m._write_claim(tid, 'task_run_dir_removed', 'true')
+        s = m.status(tid)
+        assert s['run_dir'] == '/home/.maestro/worktrees/x' and s['run_dir_kind'] == 'worktree' and s['run_dir_removed'] is True
+    finally:
+        m.close()
+
+
+def test_status_says_when_a_worktree_run_dir_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        wt = tmp_path / 'wt'
+        m._write_claim(tid, 'task_run_dir', str(wt))
+        m._write_claim(tid, 'task_run_dir_kind', 'worktree')
+        assert m.status(tid)['run_dir_missing'] is True  # deleted by hand, for example
+        wt.mkdir()
+        assert 'run_dir_missing' not in m.status(tid)
+        wt.rmdir()
+        m._write_claim(tid, 'task_run_dir_removed', 'true')
+        s = m.status(tid)
+        assert s['run_dir_removed'] is True and 'run_dir_missing' not in s  # removed on purpose
+    finally:
+        m.close()

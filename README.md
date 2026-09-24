@@ -206,7 +206,8 @@ table, registration commands, and onboarding recipes are in
 
 States follow the A2A vocabulary: `submitted → working → completed`, with
 `failed`, `canceled`, and `input-required` (parked for you to answer or fix)
-along the way. One active task per workspace; extra work queues FIFO.
+along the way. When a workspace is busy, a new task runs in its own git worktree
+instead of waiting (see "Parallel tasks" below).
 
 ## The execution receipt
 
@@ -389,8 +390,11 @@ watch → receipt.**
   fallback chain, verification policy. You create one via CLI flags, a TOML/JSON
   file, or (in the MCP path) Claude creates it for you.
 - **Task lifecycle** — each handoff becomes a task that moves through
-  `submitted → working → completed` (or `failed` / `canceled`). One active task
-  per workspace; extra work queues FIFO and starts when the slot frees.
+  `submitted → working → completed` (or `failed` / `canceled`). The first task
+  runs in your workspace. A task delegated while the workspace is busy gets its
+  own git worktree under `~/.maestro/worktrees/<task-id>` and starts at once, up
+  to 4 running tasks per workspace (`[defaults] max_parallel`). Tasks beyond the
+  limit wait in a queue.
 - **Fallback chain** — `--target codex --fallback copilot --fallback hermes`
   means: try Codex; if it fails or isn't available, try Copilot; then Hermes.
   Each attempt is recorded, including its cost (failed work still costs money).
@@ -702,8 +706,10 @@ pairs, or JSON. Set `[defaults]` to stop being asked.
 
 Verification is not configured here — it is set per handoff (`verification =
 "auto" | "command" | "none"`) and auto-detected per workspace; see
-"Deterministic verification" below. A `[verification]` table in this file is
-accepted for forward compatibility but not run by the daemon.
+"Deterministic verification" below. In a `[verification]` table in this file,
+`timeout_s` limits how long the tests may run (1800 seconds by default; 0 means
+no limit). Its `command` key is accepted for forward compatibility but not run
+by the daemon.
 
 **Work-mode presets:** a `[modes.<name>]` table pins agents to the phases of a
 task cycle (see "Work modes" below). Every key except `implementer` is
@@ -919,7 +925,7 @@ by hand.
 
 The MCP surface is task-oriented: `delegate`, `followup`, `task_wait`,
 `task_status`, `list_tasks`, `agents_list`, `cancel_task`,
-`answer_task_question`, `rename_task_branch` — exact signatures and return shapes in the
+`answer_task_question`, `rename_task_branch`, `cleanup_task_worktree` — exact signatures and return shapes in the
 [MCP tools reference](docs/usage/reference/mcp-tools.md).
 
 ---

@@ -359,6 +359,11 @@ class Maestro:
             command = [x for x in command.split() if x]
         elif command is not None and not (isinstance(command, list) and all(isinstance(x, str) for x in command)):
             raise ValueError("Verification command must be a string or list of strings")
+        # How long the project's tests may run before Maestro stops them and
+        # fails verification. 0 means no limit.
+        timeout_s = verification.get("timeout_s", 1800)
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s < 0:
+            raise ValueError("[verification] timeout_s must be a whole number of seconds, 0 or more (0 means no limit)")
         from .context import parse_context_config
         from .knowledge import parse_continuation
         from .modes import parse_modes
@@ -367,7 +372,7 @@ class Maestro:
         for source, table in context_layers:
             context.update(parse_context_config(table, source))
 
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults, "continuation": parse_continuation(merged.get("continuation"))}
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "verification_timeout_s": timeout_s, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults, "continuation": parse_continuation(merged.get("continuation"))}
 
     @staticmethod
     def _parse_defaults(raw: Any) -> dict[str, Any]:
@@ -376,14 +381,16 @@ class Maestro:
         Project-level routing defaults consulted at delegate time when a handoff
         names no target agent: ``agent`` (default implementer), ``fallback``
         (list of fallback agents), ``model`` / ``effort`` (applied to the chosen
-        agent when the handoff sets none). Absent table -> empty dict; invalid
+        agent when the handoff sets none). ``max_parallel`` is the number of tasks that may
+        run turns at the same time for one workspace (see
+        docs/design-parallel-tasks.md); the daemon uses 4 when it is absent. Absent table -> empty dict; invalid
         values raise so misconfiguration fails at daemon start, not mid-delegation.
         """
         if raw is None:
             return {}
         if not isinstance(raw, dict):
             raise ValueError("[defaults] must be a table")
-        unknown = set(raw) - {"agent", "fallback", "model", "effort"}
+        unknown = set(raw) - {"agent", "fallback", "model", "effort", "max_parallel"}
         if unknown:
             raise ValueError(f"[defaults] has unknown keys: {', '.join(sorted(unknown))}")
         out: dict[str, Any] = {}
@@ -404,6 +411,11 @@ class Maestro:
             if effort not in {"low", "medium", "high", "xhigh", "max"}:
                 raise ValueError(f"Unsupported default reasoning effort: {effort}")
             out["effort"] = effort
+        max_parallel = raw.get("max_parallel")
+        if max_parallel is not None:
+            if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) or max_parallel < 1:
+                raise ValueError("[defaults] max_parallel must be a whole number of at least 1")
+            out["max_parallel"] = max_parallel
         return out
 
     def codex_defaults(self) -> dict[str, Any]:
@@ -589,7 +601,7 @@ class Maestro:
 
     def _claims(self, task_id: str) -> dict[str, str]:
         mapping: dict[str, str] = {}
-        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_base_head", "task_python_test_suite", "task_request", "task_runtime", "task_gates", "task_knowledge"):
+        for predicate in ("task_status", "task_owner", "task_implementer", "task_design", "task_result", "task_verification", "task_workspace", "task_model", "task_effort", "task_number", "task_title", "task_origin_agent", "task_target_agent", "task_branch", "task_base_head", "task_python_test_suite", "task_request", "task_runtime", "task_gates", "task_knowledge", "task_run_dir", "task_run_dir_kind", "task_run_dir_removed"):
             claims = self.mem.history(self._subject(task_id), predicate)
             if claims:
                 mapping[predicate] = str(claims[-1].object)
@@ -728,13 +740,24 @@ class Maestro:
                 if result["workspace"]:  # pragma: no branch
                     break
         result["project_root"]=(index or {}).get("project_root") or str(self.project_root)
+        # Where the task's work is: the workspace, or the task's own worktree.
+        # A task from before run directories existed ran in its workspace.
+        result["run_dir"]=claims.get("task_run_dir") or result["workspace"]
+        result["run_dir_kind"]=claims.get("task_run_dir_kind") or "workspace"
+        if claims.get("task_run_dir_removed")=="true": result["run_dir_removed"]=True
+        elif result["run_dir_kind"]=="worktree" and not Path(result["run_dir"]).is_dir():
+            # Deleted by hand: the next turn creates it again from the branch.
+            result["run_dir_missing"]=True
         # The phase claim reports a parked task as REVIEWING, the same as a
         # finished one. The runtime snapshot says it is waiting, what for, and
         # the question to answer with `maestro task answer`.
         try: runtime=json.loads(claims.get("task_runtime") or "{}")
         except (ValueError, TypeError): runtime={}
+        if isinstance(runtime, dict) and runtime.get("state"):
+            # The task's own state; the phase above is coarser (a waiting task
+            # and a finished one share REVIEWING, for example).
+            result["state"]=runtime["state"]
         if isinstance(runtime, dict) and runtime.get("state")=="input-required":
-            result["state"]="input-required"
             result["awaiting"]=runtime.get("awaiting")
             result["question"]=runtime.get("question")
         return result

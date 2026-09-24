@@ -407,3 +407,41 @@ def test_delegate_agent_may_commit_flag(monkeypatch, tmp_path):
     assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is True
     assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"]) == 0
     assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is False
+
+
+def test_delegate_prints_why_a_task_is_queued(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
+    reason = "the workspace is at its limit of 4 running tasks; this task starts when one of them finishes or stops to ask a question"
+    monkeypatch.setattr(cli, "_post_jsonrpc", lambda url, method, payload, token=None: {
+        "task": {"kind": "task", "id": None, "status": {"state": "submitted"}, "metadata": {"queued": True, "reason": reason, "run_dir": "/ws"}},
+    })
+    rc = cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"queued": True, "reason": reason}
+
+
+def test_audit_reports_run_dir(monkeypatch, tmp_path, capsys):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MAESTRO_HOME", str(home))
+    from maestro.core import Maestro, maestro_user_dir
+
+    m = Maestro(maestro_user_dir())
+    try:
+        m._register_task("task-a", "T", 1)
+        m._write_claim("task-a", "task_workspace", "/ws")
+        m._write_claim("task-a", "task_run_dir", "/home/worktrees/task-a")
+    finally:
+        m.close()
+    assert cli.main(["task", "audit", "task-a"]) == 0
+    assert json.loads(capsys.readouterr().out)["run_dir"] == "/home/worktrees/task-a"
+
+def test_task_cleanup_posts_cleanup(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _rpc_capture(monkeypatch, {"cleanup": {"task_id": "t", "removed": True, "run_dir": "/w", "reason": "removed"}})
+    assert cli.main(["task", "cleanup", "t", "--force"]) == 0
+    assert captured["method"] == "tasks/cleanup"
+    assert captured["payload"] == {"id": "t", "force": True}
+    assert json.loads(capsys.readouterr().out)["cleanup"]["removed"] is True

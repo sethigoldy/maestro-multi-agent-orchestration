@@ -24,7 +24,15 @@ agent    = "codex"          # default implementation agent
 fallback = ["claude_code"]  # optional fallback chain (list of agent names)
 model    = "gpt-5.6-luna"   # optional; applied when the handoff sets none
 effort   = "max"            # optional: low | medium | high | xhigh | max
+max_parallel = 4            # optional: running tasks per workspace (default 4)
 ```
+
+`max_parallel` is the number of tasks that may run turns at the same time for
+one workspace. The first task runs in the workspace; the others run in git
+worktrees of their own under `~/.maestro/worktrees/<task-id>`. Tasks beyond the
+limit wait in a queue. A task that is waiting for an answer, or has finished,
+does not count. It must be a whole number of at least 1; `1` gives the
+behaviour of earlier versions, where every task for a busy workspace waited.
 
 Consulted at delegate time when a handoff names no target agent: `agent`
 becomes the task's target (as if explicitly chosen), `fallback` fills an empty
@@ -56,13 +64,23 @@ environment). An effort outside the five supported values is an error.
 
 ```toml
 [verification]
+timeout_s = 1800                # seconds the tests may run; 0 means no limit
 command = ["make", "check"]     # or a string, split on whitespace
 ```
 
-Parsed and validated (string or list of strings). Note: this value is stored
-but **not consumed** by the daemon's verification step — verification uses the
-handoff's `verification` mode plus auto-detection (see below). It is kept for
-forward compatibility.
+`timeout_s` is how long the project's verification command (the tests) may run
+after the agent finishes. The default is 1800 seconds (30 minutes). When the
+time runs out, Maestro stops the command and every process it started, and
+verification fails with the reason "the verification command did not finish
+within 30 minutes". Without a limit, tests that hang (waiting for a database,
+the network or a prompt) would keep the task in the `VERIFYING` phase forever
+and hold its workspace. Set it higher for slow test suites, or to `0` for no
+limit. It must be a whole number of seconds, 0 or more.
+
+`command` is parsed and validated (string or list of strings). Note: this
+value is stored but **not consumed** by the daemon's verification step —
+verification uses the handoff's `verification` mode plus auto-detection (see
+below). It is kept for forward compatibility.
 
 ### `[storage]`
 
