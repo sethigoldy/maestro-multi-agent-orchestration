@@ -740,6 +740,9 @@ class Maestro:
         result["run_dir"]=claims.get("task_run_dir") or result["workspace"]
         result["run_dir_kind"]=claims.get("task_run_dir_kind") or "workspace"
         if claims.get("task_run_dir_removed")=="true": result["run_dir_removed"]=True
+        elif result["run_dir_kind"]=="worktree" and not Path(result["run_dir"]).is_dir():
+            # Deleted by hand: the next turn creates it again from the branch.
+            result["run_dir_missing"]=True
         # The phase claim reports a parked task as REVIEWING, the same as a
         # finished one. The runtime snapshot says it is waiting, what for, and
         # the question to answer with `maestro task answer`.

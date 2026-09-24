@@ -238,6 +238,7 @@ def test_followup_in_a_deleted_worktree_recreates_it(tmp_path, monkeypatch, binp
         gate.touch()
         d.wait(second["task_id"], timeout=60)
         shutil.rmtree(second["run_dir"])
+        assert d.status_a2a(second["task_id"])["metadata"]["run_dir_missing"] is True
         sub = d.bus.subscribe("output")
         try:
             d.followup(second["task_id"], "again")
@@ -251,6 +252,7 @@ def test_followup_in_a_deleted_worktree_recreates_it(tmp_path, monkeypatch, binp
         assert note is not None
         assert final["status"]["state"] == "completed"
         assert Path(second["run_dir"]).is_dir()
+        assert "run_dir_missing" not in final["metadata"]
     finally:
         _stop(d, gate)
 

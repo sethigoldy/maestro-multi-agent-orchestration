@@ -2444,6 +2444,10 @@ class MaestroDaemon:
             "attempts": attempts,
             "error": error,
         }
+        run_dir_kind = record.get("run_dir_kind") if record is not None else claims.get("task_run_dir_kind")
+        if run_dir_kind == "worktree" and run_dir and not Path(run_dir).is_dir():
+            # Removed by task cleanup or deleted by hand; the next turn creates it again.
+            metadata["run_dir_missing"] = True
         if gates is not None:
             metadata["gates"] = gates
         if bounces is not None:

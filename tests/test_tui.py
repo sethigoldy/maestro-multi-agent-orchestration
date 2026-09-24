@@ -1112,3 +1112,9 @@ def test_detail_shows_run_dir_only_when_it_differs_from_workspace():
     assert "run dir:" not in same
     assert "run dir: /h/worktrees/t" in other
     assert tui.normalize({"id": "t", "metadata": {"run_dir": "/x"}})["run_dir"] == "/x"
+
+
+def test_detail_marks_a_missing_run_dir():
+    task = {"task_id": "t", "title": "T", "state": "completed", "workspace": "/repo", "run_dir": "/h/worktrees/t", "run_dir_missing": True}
+    assert "run dir: /h/worktrees/t (missing)" in _ANSI_RE.sub("", tui.render_frame([task], 0, live=True))
+    assert tui.normalize({"id": "t", "metadata": {"run_dir_missing": True}})["run_dir_missing"] is True
