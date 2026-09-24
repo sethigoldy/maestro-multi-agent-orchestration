@@ -112,7 +112,7 @@ inside `custom_instructions` of `~/.openhands/agent_settings.json`.
 
 ```text
 maestro delegate (--file FILE | --title T --request R [--target A | --mode NAME])
-                 [--fallback A …] [--design-file FILE] [--branch NAME]
+                 [--fallback A …] [--design-file FILE] [--branch NAME] [--agent-may-commit]
                  [--context TEXT …] [--context-file PATH …] [--skill DIR …]
                  [--no-wait] [--workspace DIR | --project DIR]
 ```
@@ -127,6 +127,7 @@ task's event stream.
 | `--mode NAME` | Apply the work-mode preset of that name (a `[modes.NAME]` config table) — it pins the implementer/verifier/reviewer/fixer agents for this task. With `--file`, a flag value overrides the file's `[routing] mode` |
 | `--fallback A` | Fallback agent, tried in order after the target fails or is unavailable. Repeatable |
 | `--design-file FILE` | File whose text becomes the handoff's authoritative design |
+| `--agent-may-commit` | Allow the agent to commit its work to the task branch. Without it the agent is told not to commit, so its changes stay uncommitted for you to review. With `--file`, the flag sets the file's `[expectations] agent_may_commit` to true. Refused, exit 2, with `commit_policy = "no-commit"` |
 | `--branch NAME` | Name for the task's git branch, for example `feat/login-form`. Without it the branch is `maestro/<task-id>`. With `--file`, the flag value overrides the file's `[expectations] branch`. The branch must not exist yet, and its name must not clash with an existing branch as a folder (with a branch `feat` present, `feat/login` cannot be created, and with `feat/x` present, `feat` cannot be created). An invalid, existing or clashing name exits 2 before any agent runs |
 | `--context TEXT` | Add a `text` context entry to the handoff. Repeatable; labels are auto-numbered (`context-1`, …) |
 | `--context-file PATH` | Add a `file` context entry for that path (inlined when ≤8KB, otherwise artifact-referenced). Repeatable; label = file stem |

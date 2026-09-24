@@ -400,6 +400,15 @@ def test_config_lists_context(monkeypatch, tmp_path, capsys):
     assert out["context"]["pdf-skill"]["kind"] == "skill" and out["context"]["pdf-skill"]["phases"] == ["implementer"]
 
 
+def test_delegate_agent_may_commit_flag(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    captured = _delegate_capture(monkeypatch)
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex", "--agent-may-commit"]) == 0
+    assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is True
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"]) == 0
+    assert captured["payload"]["message"]["parts"][0]["data"]["expectations"]["agent_may_commit"] is False
+
+
 def test_delegate_prints_why_a_task_is_queued(monkeypatch, tmp_path, capsys):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")

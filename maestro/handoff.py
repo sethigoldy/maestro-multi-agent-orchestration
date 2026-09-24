@@ -70,6 +70,9 @@ class HandoffDoc:
     commit_policy: str = "branch"
     # Name of the task branch. None means the default, maestro/<task_id>.
     branch: str | None = None
+    # Whether the agent may commit its work. By default it must not: Maestro
+    # never commits, and the supervisor reviews the changes and commits them.
+    agent_may_commit: bool = False
     budget_hint: float | None = None
     # [constraints]
     sensitive: bool = False
@@ -108,6 +111,7 @@ class HandoffDoc:
                 "verification_command": self.verification_command,
                 "commit_policy": self.commit_policy,
                 "branch": self.branch,
+                "agent_may_commit": self.agent_may_commit,
                 "budget_hint": self.budget_hint,
             },
             "constraints": {
@@ -132,6 +136,10 @@ def validate_handoff(doc: HandoffDoc) -> HandoffDoc:
         doc.branch = validate_branch_name(doc.branch)
         if doc.commit_policy == "no-commit":
             raise ValueError("branch cannot be set when commit_policy='no-commit' (that policy creates no branch)")
+    if not isinstance(doc.agent_may_commit, bool):
+        raise ValueError(f"agent_may_commit must be true or false: {doc.agent_may_commit!r}")
+    if doc.agent_may_commit and doc.commit_policy == "no-commit":
+        raise ValueError("agent_may_commit cannot be true when commit_policy='no-commit' (that policy works in place, without a branch to commit to)")
     if doc.verification not in VERIFICATION_MODES:
         raise ValueError(f"verification must be one of {VERIFICATION_MODES}: {doc.verification!r}")
     if doc.verification_command is not None:
@@ -251,6 +259,7 @@ def from_dict(data: dict[str, Any]) -> HandoffDoc:
         verification_command=_optional_text(expectations, "verification_command") or None,
         commit_policy=_text(expectations, "commit_policy") or "branch",
         branch=_optional_text(expectations, "branch") or None,
+        agent_may_commit=expectations.get("agent_may_commit", False),
         budget_hint=budget_hint,
         sensitive=bool(constraints.get("sensitive", False)),
         max_depth_remaining=max_depth_remaining,

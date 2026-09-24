@@ -277,6 +277,11 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
             target_agent=args.target or "codex", fallback=list(args.fallback),
             mode=args.mode, explicit_target=args.target is not None,
         )
+    if args.agent_may_commit:
+        from .handoff import validate_handoff
+
+        doc.agent_may_commit = True
+        doc = validate_handoff(doc)
     if args.branch is not None:
         from .handoff import validate_handoff
 
@@ -796,6 +801,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--fallback", action="append", default=[], help="Fallback agent (repeatable)")
     d.add_argument("--branch", default=None, metavar="NAME",
                    help="Name for the task's git branch (default maestro/<task_id>); must not exist yet")
+    d.add_argument("--agent-may-commit", action="store_true",
+                   help="Allow the agent to commit its work to the task branch (by default it is told not to commit)")
     d.add_argument("--design-file", default=None, help="Design text file to attach")
     d.add_argument("--context", action="append", default=[], metavar="TEXT",
                    help="Context entry text injected into the agent's prompt (repeatable; label auto-numbered)")

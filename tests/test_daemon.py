@@ -2772,3 +2772,23 @@ def test_parked_task_can_be_canceled_after_restart(tmp_path):
     finally:
         _drain_workers(d2)
         d2.stop()
+
+
+def test_prompts_tell_the_agent_not_to_commit_by_default():
+    from maestro.daemon import build_fix_prompt, build_prompt
+
+    doc = HandoffDoc(title="T", request="R")
+    for prompt in (build_prompt(doc, "task-1", Path("/tmp"), []), build_fix_prompt(doc, "task-1", Path("/tmp"), ["x"], False)):
+        assert "COMMITS: Do not commit" in prompt
+        assert "Leave your changes uncommitted" in prompt
+        assert "You may commit" not in prompt
+
+
+def test_prompts_allow_commits_when_the_handoff_says_so():
+    from maestro.daemon import build_fix_prompt, build_prompt
+
+    doc = HandoffDoc(title="T", request="R", agent_may_commit=True)
+    for prompt in (build_prompt(doc, "task-1", Path("/tmp"), []), build_fix_prompt(doc, "task-1", Path("/tmp"), ["x"], False)):
+        assert "COMMITS: You may commit your work to the branch that is checked out" in prompt
+        assert "Do not push" in prompt
+        assert "Do not commit" not in prompt

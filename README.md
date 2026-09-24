@@ -1027,7 +1027,8 @@ cd web && npm ci && node build.mjs             # rewrites maestro/web_dist/ (byt
 - **Reactive, not polling**: events flow over SSE everywhere; dashboards and
   waits subscribe instead of spinning.
 - **Verification is deterministic.** Evidence, not vibes.
-- **Maestro never commits code and never installs dependencies.**
+- **Maestro never commits code and never installs dependencies.** The agent is
+  told not to commit either, unless the handoff sets `agent_may_commit = true`.
 - **The workspace is always explicit** — passed in, recorded, never guessed.
 
 ---
