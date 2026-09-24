@@ -209,3 +209,35 @@ def test_status_ignores_an_unreadable_runtime_snapshot(tmp_path, monkeypatch):
         assert 'question' not in m.status(tid)
     finally:
         m.close()
+
+
+def test_verification_timeout_setting(tmp_path, monkeypatch):
+    home = tmp_path / 'home'
+    home.mkdir()
+    monkeypatch.setenv('MAESTRO_HOME', str(home))
+    def load(text):
+        (home / 'config.toml').write_text(text, encoding='utf-8')
+        m = Maestro(tmp_path)
+        try:
+            return m.config['verification_timeout_s']
+        finally:
+            m.close()
+    assert load('') == 1800  # 30 minutes by default
+    assert load('[verification]\ntimeout_s = 600\n') == 600
+    assert load('[verification]\ntimeout_s = 0\n') == 0  # no time limit
+    for bad in ('-1', '"600"', 'true', '1.5'):
+        with pytest.raises(ValueError, match="timeout_s must be a whole number of seconds"):
+            load(f'[verification]\ntimeout_s = {bad}\n')
+
+
+def test_status_always_reports_the_task_state(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        assert 'state' not in m.status(tid)  # nothing recorded yet
+        m._write_claim(tid, 'task_runtime', json.dumps({"state": "working"}))
+        assert m.status(tid)['state'] == 'working'
+    finally:
+        m.close()

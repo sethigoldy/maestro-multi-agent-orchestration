@@ -359,6 +359,11 @@ class Maestro:
             command = [x for x in command.split() if x]
         elif command is not None and not (isinstance(command, list) and all(isinstance(x, str) for x in command)):
             raise ValueError("Verification command must be a string or list of strings")
+        # How long the project's tests may run before Maestro stops them and
+        # fails verification. 0 means no limit.
+        timeout_s = verification.get("timeout_s", 1800)
+        if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s < 0:
+            raise ValueError("[verification] timeout_s must be a whole number of seconds, 0 or more (0 means no limit)")
         from .context import parse_context_config
         from .knowledge import parse_continuation
         from .modes import parse_modes
@@ -367,7 +372,7 @@ class Maestro:
         for source, table in context_layers:
             context.update(parse_context_config(table, source))
 
-        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults, "continuation": parse_continuation(merged.get("continuation"))}
+        return {"model": codex.get("model") or os.environ.get("MAESTRO_CODEX_MODEL"), "effort": effort, "verification_command": command, "verification_timeout_s": timeout_s, "storage_backend": backend, "modes": parse_modes(merged.get("modes")), "context": context, "defaults": defaults, "continuation": parse_continuation(merged.get("continuation"))}
 
     @staticmethod
     def _parse_defaults(raw: Any) -> dict[str, Any]:
@@ -733,8 +738,11 @@ class Maestro:
         # the question to answer with `maestro task answer`.
         try: runtime=json.loads(claims.get("task_runtime") or "{}")
         except (ValueError, TypeError): runtime={}
+        if isinstance(runtime, dict) and runtime.get("state"):
+            # The task's own state; the phase above is coarser (a waiting task
+            # and a finished one share REVIEWING, for example).
+            result["state"]=runtime["state"]
         if isinstance(runtime, dict) and runtime.get("state")=="input-required":
-            result["state"]="input-required"
             result["awaiting"]=runtime.get("awaiting")
             result["question"]=runtime.get("question")
         return result

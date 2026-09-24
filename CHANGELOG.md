@@ -6,6 +6,15 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **A time limit for verification.** After the agent finishes, Maestro runs the project's tests. That run had no time limit, so tests that hung (waiting for a database, the network or a prompt) kept the task working forever, and the task kept its workspace. The tests may now run for `[verification] timeout_s` seconds, 1800 (30 minutes) by default. When the time runs out, Maestro stops the command and every process it started, and verification fails with a reason that names the setting. Set `timeout_s = 0` for no limit.
+- **You can see when a task is running its tests.** While verification runs, the task's phase is `VERIFYING` instead of `IMPLEMENTING`, and the task's output shows `[verify] running: <command> (time limit 30 minutes)` and then how the command ended. `maestro task tail` and the dashboards show these lines.
+
+### Changed
+
+- **`maestro task status` always shows the task's `state`** (`submitted`, `working`, `input-required`, `completed`, `failed` or `canceled`) when it is recorded, not only for a task waiting for an answer. The `phase` field is coarser: a waiting task and a finished one both show `REVIEWING`.
+
 ### Fixed
 
 - **The terminal dashboard shows the task list as soon as it opens.** `maestro dashboard` loaded the tasks at start but drew nothing until the daemon sent an event or a key was pressed. When no task was running, the daemon sent no events, so the screen stayed empty. The dashboard now draws the first screen straight away.
