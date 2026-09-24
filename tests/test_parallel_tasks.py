@@ -331,3 +331,31 @@ def test_cleanup_rules(tmp_path, monkeypatch, binpath):
         assert (ws / "ran-here.txt").exists()  # the user's checkout is never touched
     finally:
         _stop(d, gate)
+
+
+def test_three_tasks_run_at_once_each_in_its_own_directory(tmp_path, monkeypatch, binpath):
+    marker_dir = tmp_path / "running"
+    marker_dir.mkdir()
+    gate = tmp_path / "go"
+    # Each agent records that it is running, then waits for the gate. If the
+    # tasks ran one after another, the test would time out waiting for 3 markers.
+    _fake_bin(binpath, "codex", f'cat > /dev/null\ntouch "{marker_dir}/$$"\nwhile [ ! -f "{gate}" ]; do sleep 0.05; done\necho "$PWD" > ran-here.txt\nexit 0')
+    ws = _repo(tmp_path)
+    d = _daemon(tmp_path, monkeypatch)
+    try:
+        started = [d.delegate(_doc(title=f"t{i}"), ws) for i in range(3)]
+        deadline = time.monotonic() + 30
+        while len(list(marker_dir.iterdir())) < 3:
+            assert time.monotonic() < deadline, "the three tasks did not run at the same time"
+            time.sleep(0.05)
+        gate.touch()
+        finals = [d.wait(s["task_id"], timeout=60) for s in started]
+        assert [f["status"]["state"] for f in finals] == ["completed"] * 3
+        dirs = [Path(s["run_dir"]) for s in started]
+        assert dirs[0] == ws and len(set(dirs)) == 3
+        for path in dirs:
+            assert (path / "ran-here.txt").read_text().strip() == str(path)
+        branches = {subprocess.run(["git", "-C", str(p), "rev-parse", "--abbrev-ref", "HEAD"], text=True, capture_output=True).stdout.strip() for p in dirs}
+        assert len(branches) == 3
+    finally:
+        _stop(d, gate)
