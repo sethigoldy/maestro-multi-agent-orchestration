@@ -82,6 +82,22 @@ value is stored but **not consumed** by the daemon's verification step —
 verification uses the handoff's `verification` mode plus auto-detection (see
 below). It is kept for forward compatibility.
 
+### `[daemon]`
+
+```toml
+[daemon]
+port = 9785               # port the daemon listens on; 0 means any free port
+```
+
+The port the daemon listens on, in the user-level config file
+(`~/.maestro/config.toml`, or `$MAESTRO_HOME/config.toml`). The default is
+9785, next to the peer-discovery port 9786. The `--port` flag of
+`maestro daemon start`, `maestro daemon restart` and `maestro-daemon`, and the
+`MAESTRO_DAEMON_PORT` environment variable, both take precedence over this
+value. It must be a whole number from 0 to 65535. Clients read the daemon's
+actual port from `daemon.json`, so nothing else needs to change when you
+change it.
+
 ### `[storage]`
 
 ```toml
@@ -297,6 +313,7 @@ code from that command is a failure, including exit code 5 from pytest. With
 | `MAESTRO_HOME` | `~/.maestro` | State directory (registry, claim journal, daemon marker, peers, tasks) |
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for CLI task commands; an empty value scopes to the home directory |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Daemon endpoint for CLI daemon commands (e.g. another machine's) |
+| `MAESTRO_DAEMON_PORT` | `9785` | Port the daemon listens on when `--port` is not given; it takes precedence over `[daemon] port`. `0` means any free port |
 | `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that endpoint; also the stable token a daemon uses when it generates one on a non-loopback bind |
 | `MAESTRO_DAEMON_ALLOWED_ORIGINS` | — | Comma-separated browser origins (`scheme://host[:port]`) that may POST to the daemon besides its own address, such as a reverse proxy's public address. `maestro-daemon --allow-origin` replaces it when given. An invalid entry stops the daemon from starting |
 | `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before moving to the next fallback (total attempts = 1 + N) |

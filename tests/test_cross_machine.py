@@ -193,7 +193,7 @@ def test_parse_args_defaults_and_bind():
     from maestro.daemon_main import _parse_args
 
     args = _parse_args([])
-    assert args.bind == "127.0.0.1" and args.port == 0
+    assert args.bind == "127.0.0.1" and args.port is None  # None: resolved from env, config or 9785
     args = _parse_args(["--bind", "0.0.0.0", "--port", "8790"])
     assert args.bind == "0.0.0.0" and args.port == 8790
 

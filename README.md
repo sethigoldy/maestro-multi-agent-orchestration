@@ -81,6 +81,14 @@ started it; a new terminal can talk to it immediately. Its state lives in
 `~/.maestro/daemon.json` (plus `daemon.log` for output), and a stale marker from
 a dead process is reported as stopped — never as running.
 
+The daemon listens on port **9785** on this machine. To use another port, pass
+`--port N` to `maestro daemon start` or `maestro daemon restart`, set the
+`MAESTRO_DAEMON_PORT` environment variable, or set `port` in the `[daemon]`
+table of `~/.maestro/config.toml`; the first of these that is set wins, and
+`0` means any free port. If the port is already used by another program, the
+daemon does not start, and the error names the port and these three options.
+Clients never need the port: they read it from `daemon.json`.
+
 Only one daemon owns a state directory at a time. The owning daemon holds a
 lock file (`daemon.owner.lock`) for as long as it runs. A second
 `maestro-daemon` on the same state directory refuses to start and says which
@@ -329,8 +337,10 @@ maestro daemon restart             # stop + start
 
 `maestro-daemon` is the same daemon run **in the foreground** of your terminal
 (it prints its port and blocks until interrupted) — useful for development,
-debugging, service managers, and CI. `--port 0` picks a free port;
-`--state-dir DIR` points it at an alternate state directory.
+debugging, service managers, and CI. It uses the same port as the background
+daemon (9785 unless `--port`, `MAESTRO_DAEMON_PORT` or `[daemon] port` says
+otherwise); `--port 0` picks a free port. `--state-dir DIR` points it at an
+alternate state directory.
 
 ### 5. Delegate your first task
 
@@ -749,6 +759,7 @@ phases = ["implementer"]         # optional — default: all phases
 | `MAESTRO_HOME` | `~/.maestro` | State directory (registry, tasks, claims, peers, daemon marker) |
 | `MAESTRO_WORKSPACE` | cwd | Default workspace for task commands |
 | `MAESTRO_DAEMON_URL` | from `daemon.json` | Point CLI commands at a specific daemon (e.g. another machine's) |
+| `MAESTRO_DAEMON_PORT` | `9785` | Port the daemon listens on when `--port` is not given (before `[daemon] port` in the config); `0` means any free port |
 | `MAESTRO_DAEMON_TOKEN` | — | Bearer token for that daemon; also the token a daemon uses when it generates one on a non-loopback bind |
 | `MAESTRO_MAX_RETRIES` | `2` | Retry attempts per agent before falling back (1 + N total) |
 | `MAESTRO_BACKOFF_S` | `1.0` | Base seconds for retry backoff (linear: base × attempt number) |

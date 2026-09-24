@@ -521,7 +521,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 print(_format_daemon_info(info, verb))
             return 0 if info.running else 1
         if args.daemon_cmd == "start":
-            info = daemonctl.start()
+            info = daemonctl.start(port=args.port)
             print(_format_daemon_info(info, "already running" if info.already_running else "started"))
             return 0
         if args.daemon_cmd == "stop":
@@ -529,10 +529,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             print(_format_daemon_info(info, "stopped"))
             return 0
         # restart
-        info = daemonctl.restart()
+        info = daemonctl.restart(port=args.port)
         print(_format_daemon_info(info, "restarted"))
         return 0
-    except (RuntimeError, TimeoutError) as exc:
+    except (RuntimeError, TimeoutError, ValueError) as exc:
         print(f"maestro: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
@@ -848,11 +848,15 @@ def main(argv: list[str] | None = None) -> int:
 
     daemon = sub.add_parser("daemon", help="Manage the background daemon (start/stop/status/restart)")
     daemon_sub = daemon.add_subparsers(dest="daemon_cmd", required=True)
-    daemon_sub.add_parser("start", help="Start the daemon in the background and return immediately (idempotent)")
+    daemon_start = daemon_sub.add_parser("start", help="Start the daemon in the background and return immediately (idempotent)")
+    daemon_start.add_argument("--port", type=int, default=None,
+                              help="Port to listen on (default: $MAESTRO_DAEMON_PORT, else [daemon] port in config.toml, else 9785; 0 means any free port)")
     daemon_stop = daemon_sub.add_parser("stop", help="Stop the daemon gracefully: SIGTERM, grace period, SIGKILL if needed (idempotent)")
     daemon_status = daemon_sub.add_parser("status", help="Show daemon state; exits 0 when running, 1 when stopped")
     daemon_status.add_argument("--json", action="store_true", dest="as_json", help="Machine-readable JSON status")
-    daemon_sub.add_parser("restart", help="Stop (if running) and start the daemon")
+    daemon_restart = daemon_sub.add_parser("restart", help="Stop (if running) and start the daemon")
+    daemon_restart.add_argument("--port", type=int, default=None,
+                                help="Port to listen on (default: $MAESTRO_DAEMON_PORT, else [daemon] port in config.toml, else 9785; 0 means any free port)")
 
     skill = sub.add_parser("skill", help="Manage the global maestro-driven-development skill across coding agents")
     skill_sub = skill.add_subparsers(dest="skill_cmd", required=True)

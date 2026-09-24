@@ -55,7 +55,7 @@ different `--state-dir`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--port N` | `0` | Port to bind; `0` picks a free port |
+| `--port N` | `9785` | Port to listen on. Without the flag the port comes from `MAESTRO_DAEMON_PORT`, then `[daemon] port` in `config.toml`, then 9785. `0` picks a free port. If the port is used by another program, the command prints which port and how to choose another, and exits 1. An invalid value exits 2 |
 | `--bind IF` | `127.0.0.1` | Listen interface. `127.0.0.1` (loopback, no token), `0.0.0.0`/`::` (all interfaces — token auth enabled, primary LAN IP advertised), or an explicit IP (advertised and dialed as-is; token auth enabled) |
 | `--state-dir DIR` | `~/.maestro` or `$MAESTRO_HOME` | State directory for this daemon |
 | `--allow-origin ORIGIN` | `$MAESTRO_DAEMON_ALLOWED_ORIGINS` | A browser origin, written `scheme://host[:port]`, that may POST to the daemon besides the daemon's own address. Use it for the public address of a reverse proxy. Repeat the option for more than one origin. When given, it replaces the environment variable's list. An invalid origin stops the daemon from starting |
@@ -63,10 +63,10 @@ different `--state-dir`.
 ## maestro daemon
 
 ```text
-maestro daemon start
+maestro daemon start [--port N]
 maestro daemon stop
 maestro daemon status [--json]
-maestro daemon restart
+maestro daemon restart [--port N]
 ```
 
 The lifecycle manager for the background daemon. It drives the same broker as
@@ -78,6 +78,13 @@ The lifecycle manager for the background daemon. It drives the same broker as
 | `stop` | SIGTERM first, then a grace period (`MAESTRO_DAEMON_STOP_GRACE_S`, default 10 s), then SIGKILL if required. Removes the marker on completion and cleans stale markers. A process is signalled only when it is confirmed to be the daemon that wrote the marker (it holds `daemon.owner.lock`, or, for a marker from an older version, its endpoint answers with a Maestro agent card; a card that names a pid and state directory must name the marker's pid and this state directory, and a card from 0.12.0 or earlier, which names neither, is accepted when the marker's pid runs a `maestro-daemon`, `maestro.daemon_main`, `maestro-mcp` or `maestro.mcp_server` command). If the daemon crashed and its pid now belongs to an unrelated process, `stop` removes the stale marker, does not signal that process, and says so. Before SIGKILL, `stop` checks that the pid still has the start time it had before SIGTERM (or, when the start time cannot be read, that it still holds `daemon.owner.lock`); if not, it leaves the process alone and says it was not force-killed. `stop` never removes the marker while a daemon holds `daemon.owner.lock`. **Idempotent**: stopping when nothing is running is not an error |
 | `status` | Reports running/stopped with PID, port, URL, state directory, and uptime. Distinguishes *no marker*, *marker but dead process* (stale), *a live process that is not the daemon* (stale: the pid was reused), and *alive but not answering*. Exit code: `0` running, `1` stopped. `--json` prints the machine-readable form (`running`, `pid`, `port`, `host`, `url`, `state_dir`, `started_at`, `uptime_s`) |
 | `restart` | `stop` + `start` with error handling |
+
+The daemon listens on port 9785 by default. `--port N` on `start` or `restart`
+chooses another; without it the port comes from `MAESTRO_DAEMON_PORT`, then
+`[daemon] port` in `<state-dir>/config.toml`, then 9785. `0` means any free
+port. If the port is used by another program, `start` fails with a message
+that names the port and these options, and exits 1. Clients find the port in
+`daemon.json`, so only the daemon needs to know it.
 
 The `daemon.json` marker (written by the daemon itself) is the single source of
 truth; `maestro daemon start` never keeps a second copy.

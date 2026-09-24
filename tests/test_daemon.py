@@ -897,7 +897,7 @@ def test_daemon_main_parse_defaults(tmp_path):
     import maestro.daemon_main as dm
 
     args = dm._parse_args([])
-    assert args.port == 0 and args.state_dir is None
+    assert args.port is None and args.state_dir is None  # None: resolved from env, config or 9785
 
 
 def test_mcp_answer_task_question_and_error_paths(tmp_path, monkeypatch):
