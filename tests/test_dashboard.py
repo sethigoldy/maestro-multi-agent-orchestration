@@ -549,7 +549,11 @@ def test_cli_delegate_queued_behind_active(live_daemon, tmp_path, monkeypatch):
     try:
         captured: dict[str, object] = {}
         monkeypatch.setattr(clic.sys, "stdout", type("S", (), {"write": lambda self, s: captured.__setitem__("out", (captured.get("out") or "") + s), "flush": lambda self: None})())
-        code = clic.main(["delegate", "--title", "T2", "--request", "R2", "--target", "codex", "--workspace", str(ws)])
+        # A no-commit task works in place, so it waits for the workspace.
+        # (A task with a branch would run in a worktree of its own instead.)
+        handoff = tmp_path / "h.toml"
+        handoff.write_text('[handoff]\ntitle = "T2"\nrequest = "R2"\n[expectations]\ncommit_policy = "no-commit"\n', encoding="utf-8")
+        code = clic.main(["delegate", "--file", str(handoff), "--target", "codex", "--workspace", str(ws)])
         payload = json.loads(str(captured.get("out") or "{}"))
         assert code == 0 and payload["queued"] is True
     finally:
