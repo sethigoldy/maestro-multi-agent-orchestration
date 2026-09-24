@@ -163,6 +163,22 @@ Rules:
 - Only the local branch is renamed. If you pushed the old branch, rename or
   delete it on the remote yourself.
 
+## Find and remove a task's worktree
+
+A task delegated while its workspace was busy runs in a git worktree of its
+own, and its changes are there, not in your checkout. `maestro task status <id>`
+shows where in `run_dir` (for a task that ran in the workspace, `run_dir` is the
+workspace). Review and commit the changes from that directory, then remove the
+worktree:
+
+```bash
+maestro task cleanup task-20250718-143022-a1b2c3
+```
+
+The command refuses while the task is running, and when the worktree still has
+uncommitted changes; add `--force` to remove it anyway. The branch is always
+kept. MCP clients use `cleanup_task_worktree`.
+
 ## Cancel a task
 
 From the shell:

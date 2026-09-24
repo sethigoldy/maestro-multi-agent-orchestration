@@ -549,7 +549,11 @@ def test_cli_delegate_queued_behind_active(live_daemon, tmp_path, monkeypatch):
     try:
         captured: dict[str, object] = {}
         monkeypatch.setattr(clic.sys, "stdout", type("S", (), {"write": lambda self, s: captured.__setitem__("out", (captured.get("out") or "") + s), "flush": lambda self: None})())
-        code = clic.main(["delegate", "--title", "T2", "--request", "R2", "--target", "codex", "--workspace", str(ws)])
+        # A no-commit task works in place, so it waits for the workspace.
+        # (A task with a branch would run in a worktree of its own instead.)
+        handoff = tmp_path / "h.toml"
+        handoff.write_text('[handoff]\ntitle = "T2"\nrequest = "R2"\n[expectations]\ncommit_policy = "no-commit"\n', encoding="utf-8")
+        code = clic.main(["delegate", "--file", str(handoff), "--target", "codex", "--workspace", str(ws)])
         payload = json.loads(str(captured.get("out") or "{}"))
         assert code == 0 and payload["queued"] is True
     finally:
@@ -913,3 +917,73 @@ def test_console_route_404_when_dist_missing(live_daemon, monkeypatch):
     monkeypatch.setattr(dash, "WEB_DIST", Path("/nonexistent/maestro-web-dist"))
     status, body, ctype = _get(f"http://127.0.0.1:{live_daemon.port}/console.js")
     assert status == 404 and "application/json" in ctype
+
+
+def test_cli_gc_removes_clean_worktrees_and_keeps_dirty_ones(live_daemon, tmp_path, monkeypatch):
+    from maestro import cli as clic
+    from maestro import worktrees
+
+    ws = _git_repo(tmp_path)
+    m = live_daemon.maestro
+    paths = {}
+    for n, name in enumerate(("clean", "dirty")):
+        task_id = f"task-20000101-00000{n}-{name}"
+        path = worktrees.worktree_path(live_daemon.state_dir, task_id)
+        worktrees.add_worktree(ws, path, f"maestro/{name}", new_branch=True, start=worktrees.head_commit(ws))
+        with m._task_lock():
+            m._register_task(task_id, name, 800 + n)
+        for pred, val in (("task_status", "FAILED"), ("task_workspace", str(ws)), ("task_run_dir", str(path)), ("task_run_dir_kind", "worktree")):
+            m._write_claim(task_id, pred, val)
+        task_dir = live_daemon.state_dir / "tasks" / task_id
+        task_dir.mkdir(parents=True)
+        ancient = time.time() - 200 * 86400
+        os.utime(task_dir, (ancient, ancient))
+        paths[name] = (task_id, path)
+    (paths["dirty"][1] / "notes.txt").write_text("unsaved work\n", encoding="utf-8")
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(clic.sys, "stdout", type("S", (), {"write": lambda self, s: captured.__setitem__("out", (captured.get("out") or "") + s), "flush": lambda self: None})())
+    assert clic.main(["gc", "--days", "90", "--dry-run"]) == 0
+    dry = json.loads(str(captured.get("out") or "{}"))
+    assert [r["task_id"] for r in dry["removed"]] == [paths["clean"][0]]
+    assert paths["clean"][1].is_dir()  # a dry run removes nothing
+
+    captured.clear()
+    assert clic.main(["gc", "--days", "90"]) == 0
+    real = json.loads(str(captured.get("out") or "{}"))
+    assert [r["task_id"] for r in real["removed"]] == [paths["clean"][0]]
+    assert not paths["clean"][1].exists()
+    assert paths["dirty"][1].is_dir() and (paths["dirty"][1] / "notes.txt").is_file()
+    kept = real["kept_worktrees"]
+    assert kept == [{"task_id": paths["dirty"][0], "run_dir": str(paths["dirty"][1]), "uncommitted": ["notes.txt"]}]
+    assert any(str(r.get("task_id")) == paths["dirty"][0] for r in m._registry_records())
+
+
+def test_cli_gc_keeps_a_task_whose_worktree_git_cannot_remove(live_daemon, tmp_path, monkeypatch):
+    import subprocess
+
+    from maestro import cli as clic
+    from maestro import worktrees
+
+    ws = _git_repo(tmp_path)
+    m = live_daemon.maestro
+    task_id = "task-20000101-000000-locked"
+    path = worktrees.worktree_path(live_daemon.state_dir, task_id)
+    worktrees.add_worktree(ws, path, "maestro/locked", new_branch=True, start=worktrees.head_commit(ws))
+    subprocess.run(["git", "-C", str(ws), "worktree", "lock", str(path)], check=True)  # remove now fails without --force
+    with m._task_lock():
+        m._register_task(task_id, "locked", 810)
+    for pred, val in (("task_status", "FAILED"), ("task_workspace", str(ws)), ("task_run_dir", str(path)), ("task_run_dir_kind", "worktree")):
+        m._write_claim(task_id, pred, val)
+    task_dir = live_daemon.state_dir / "tasks" / task_id
+    task_dir.mkdir(parents=True)
+    ancient = time.time() - 200 * 86400
+    os.utime(task_dir, (ancient, ancient))
+
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(clic.sys, "stdout", type("S", (), {"write": lambda self, s: captured.__setitem__("out", (captured.get("out") or "") + s), "flush": lambda self: None})())
+    assert clic.main(["gc", "--days", "90"]) == 0
+    out = json.loads(str(captured.get("out") or "{}"))
+    assert out["removed"] == []
+    assert out["kept_worktrees"][0]["task_id"] == task_id and "could not remove the worktree" in out["kept_worktrees"][0]["error"]
+    assert path.is_dir() and any(str(r.get("task_id")) == task_id for r in m._registry_records())

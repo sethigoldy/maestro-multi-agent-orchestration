@@ -156,6 +156,7 @@ maestro task continue <task-id> --request "new instruction" [--context reuse|fre
 maestro task answer <task-id|number> <answer…> [--no-wait]
 maestro task cancel <task-id|number> [--reason TEXT]
 maestro task rename-branch <task-id|number> <new-branch>
+maestro task cleanup <task-id|number> [--force]
 ```
 
 Bare `maestro task <n>` is normalized to `task status`. This also works after
@@ -172,6 +173,7 @@ the top-level options, so `maestro --workspace DIR task 1` runs
 | `continue` | Continues a finished task (completed/failed/canceled) with a new instruction: the same task id, workspace, branch, and routing resume — the follow-up turn runs under the handoff's fixer agent when one is pinned. `--context reuse` (default) injects the compact [task-knowledge snapshot](../reference/configuration.md#continuation--task-continuation-context); `--context fresh` starts a clean reasoning context. Blocks and streams the turn like `delegate` unless `--no-wait` prints the submission JSON and returns immediately. `--branch NAME` first renames the task's branch to NAME, with the same rules and refusals as `rename-branch`, and then runs the turn on it; for a task whose first turn could not create its branch, it sets the name this turn creates. Requires a reachable daemon; unknown tasks, exhausted delegation depth and a refused `--branch` exit 2 |
 | `answer` | Answers the question a task in state `input-required` is waiting on, and the task resumes. `task status` shows the question, and what the task waits for (`routing`, `approval`, `question` or `gate`). The words of the answer are joined with spaces, so `maestro task answer 12 agent=codex model=gpt-5.6-luna` sends `agent=codex model=gpt-5.6-luna`. For a routing question, answer with an agent name such as `codex`. When the answer starts a new turn, the command streams it like `task continue`; `--no-wait` prints the result instead. If the task is still waiting after the answer (for example, the routing answer named an unknown agent), or the answer was queued behind another task in the workspace, the command prints the result and exits. Answering a task that is not waiting, or sending an empty answer, exits 2. Needs a running daemon. |
 | `cancel` | Cancels a task that is waiting, queued or running, and prints the result as JSON. `--reason` is kept in the task's record. Canceling frees the task's workspace, so the next task queued for that workspace starts. Canceling a task that already finished exits 2. Needs a running daemon. |
+| `cleanup` | Removes the git worktree of a task that ran next to a busy workspace, and prints the result as JSON (`task_id`, `run_dir`, `removed`, `reason`). The task's branch and its commits are always kept. For a task that ran in the workspace itself it removes nothing and says so, because Maestro never removes your checkout. Refused, exit 2, while the task is running or a turn is starting, and when the worktree has uncommitted changes; the message lists the files. `--force` removes a worktree with uncommitted changes anyway. A later `task continue` creates the worktree again from the branch; only committed work comes back. Needs a running daemon. |
 | `rename-branch` | Renames a task's git branch and updates the task's record, so `task list`, `task status`, receipts and later `task continue` turns all use the new name. If you already renamed the branch yourself with `git branch -m`, the command only updates the record; it first checks git's reflog for that rename, and refuses if the new branch was not renamed from the task's branch, so an unrelated branch that happens to exist never becomes the task's branch. Only the local branch is renamed; a copy already pushed to a remote keeps its old name there. If the task has no branch yet, because it has not started or its first turn could not create the branch it asked for, the command changes the name that the next turn will create and prints `has no branch yet; its next turn will create <name>`. The new name must then be one that can be created, as at delegation. The command is refused while an agent is working on the task or a turn is starting, when the task uses `commit_policy = "no-commit"` (it never has a branch), when the new name already exists or clashes with an existing branch as a folder, and when neither the old nor the new branch exists. A `task continue` sent while a rename is under way waits for it to finish. It goes through the daemon when one is reachable and writes the state directory directly otherwise. Refusals and unknown tasks exit 2 |
 
 ## dashboard
@@ -267,6 +269,14 @@ Deletes terminal tasks (phases `COMPLETE`/`FAILED`; canceled tasks land in
 directory or registry record. `--dry-run` lists what would be deleted without
 deleting. Prints a JSON summary (`removed`, `kept`). Manual only — never runs
 automatically.
+
+A task that ran in a worktree of its own (see `maestro task cleanup`) has its
+worktree removed together with its record, but only when the worktree has no
+uncommitted changes. A task whose worktree has uncommitted changes is kept,
+worktree and record both, and listed under `kept_worktrees` with its
+`run_dir` and the changed files, so you can find the work. If git refuses to
+remove a worktree (for example, it is locked), the task is kept too, and the
+entry carries git's message in `error`. Branches are never removed.
 
 It is safe to run while the daemon is working: gc removes each task under the
 same locks the daemon uses to register tasks and append claims, so nothing the

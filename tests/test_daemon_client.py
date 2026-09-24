@@ -175,6 +175,9 @@ def test_mcp_tools_work_through_the_owner(owner, home, agents, tmp_path):
 
     finished = json.loads(mcp_server.cancel_task(str(ws), task_id))
     assert "already finished" in finished["error"]
+    kept = json.loads(mcp_server.cleanup_task_worktree(str(ws), task_id))
+    assert kept["removed"] is False and "ran in the workspace" in kept["reason"]  # never touches the checkout
+    assert "error" in json.loads(mcp_server.cleanup_task_worktree(str(ws), "task-19700101-000000-deadbe"))
     assert "error" in json.loads(mcp_server.task_wait(str(ws), "task-19700101-000000-deadbe"))
     assert "error" in json.loads(mcp_server.task_wait(str(ws), "999"))
     assert "error" in json.loads(mcp_server.rename_task_branch(str(ws), task_id, "bad name"))
@@ -220,6 +223,7 @@ def test_delegate_tool_reports_a_queued_handoff(owner, home, agents, tmp_path):
     handoff.write_text(json.dumps(_doc("quick").to_dict()), encoding="utf-8")
     out = json.loads(mcp_server.delegate(str(ws), str(handoff)))
     assert out["queued"] is True
+    assert "another task is using the workspace" in out["reason"]
 
 
 def test_client_status_and_list(owner, home, tmp_path):
@@ -819,3 +823,10 @@ def test_a_second_switch_to_an_embedded_daemon_keeps_the_first(home, monkeypatch
     monkeypatch.setattr(dm, "_instance", embedded)
     info = daemonctl.DaemonInfo(running=True, pid=os.getpid(), url="http://127.0.0.1:1", state_dir=home)
     assert dm._use_legacy_embedded(home, info, {}) is embedded
+
+
+def test_cleanup_tool_reports_a_refusal(owner, home, agents, tmp_path):
+    ws = _git_repo(tmp_path)
+    running = owner.delegate(_doc(agents), ws)  # the sleepy agent keeps it running
+    out = json.loads(mcp_server.cleanup_task_worktree(str(ws), running["task_id"]))
+    assert "is running" in out["error"]

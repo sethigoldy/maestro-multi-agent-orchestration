@@ -130,6 +130,8 @@ class A2ADispatcher:
             return self._followup(request_id, params)
         if method == "tasks/renameBranch":
             return self._rename_branch(request_id, params)
+        if method == "tasks/cleanup":
+            return self._cleanup(request_id, params)
         if method == "tasks/delegate":
             return self._delegate(request_id, params)
         if method == "tasks/wait":
@@ -184,7 +186,7 @@ class A2ADispatcher:
         except (ValueError, KeyError) as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         if result.get("queued"):
-            task_obj = {"kind": "task", "id": None, "status": {"state": STATE_SUBMITTED, "timestamp": result["ts"]}, "metadata": {"queued": True}}
+            task_obj = {"kind": "task", "id": None, "status": {"state": STATE_SUBMITTED, "timestamp": result["ts"]}, "metadata": {"queued": True, "reason": result.get("reason"), "run_dir": result.get("run_dir")}}
         else:
             task_obj = self.daemon.status_a2a(str(result["task_id"]))
         return jsonrpc_ok(request_id, {"task": task_obj})
@@ -230,6 +232,22 @@ class A2ADispatcher:
         except ValueError as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         return jsonrpc_ok(request_id, {"followup": result, "task": self.daemon.status_a2a(result["task_id"])})
+
+    def _cleanup(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+        """Remove a task's worktree (``force`` drops uncommitted changes)."""
+        task_ref = params.get("id")
+        if not isinstance(task_ref, str) or not task_ref:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.id is required")
+        force = params.get("force", False)
+        if not isinstance(force, bool):
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, "params.force must be true or false")
+        try:
+            result = self.daemon.cleanup_worktree(self.daemon.resolve(task_ref), force=force)
+        except KeyError as exc:
+            return jsonrpc_error(request_id, ERR_TASK_NOT_FOUND, str(exc.args[0]))
+        except (ValueError, RuntimeError) as exc:
+            return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
+        return jsonrpc_ok(request_id, {"cleanup": result})
 
     def _rename_branch(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         task_ref = params.get("id")

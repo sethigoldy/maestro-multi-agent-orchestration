@@ -778,3 +778,18 @@ def test_cli_task_receipt_unknown_task(live_daemon, monkeypatch, capsys):
     code = cli.main(["task", "receipt", "424242"])
     assert code == 2
     assert "Unknown task number" in capsys.readouterr().err
+
+
+def test_receipt_shows_run_dir_when_it_differs_from_workspace(plain_state):
+    from maestro.receipt import build_receipt, format_receipt
+
+    m, _ = plain_state
+    tid = "task-20260101-000000-dddddd"
+    _seed(m, tid, runtime={"state": "completed"})
+    same = build_receipt(tid, m)
+    assert same["task"]["run_dir"] == "/ws/here"
+    assert "Run dir" not in format_receipt(same)
+    m._write_claim(tid, "task_run_dir", "/home/worktrees/x")
+    other = build_receipt(tid, m)
+    assert other["task"]["run_dir"] == "/home/worktrees/x"
+    assert "Run dir" in format_receipt(other) and "/home/worktrees/x" in format_receipt(other)

@@ -24,7 +24,15 @@ agent    = "codex"          # default implementation agent
 fallback = ["claude_code"]  # optional fallback chain (list of agent names)
 model    = "gpt-5.6-luna"   # optional; applied when the handoff sets none
 effort   = "max"            # optional: low | medium | high | xhigh | max
+max_parallel = 4            # optional: running tasks per workspace (default 4)
 ```
+
+`max_parallel` is the number of tasks that may run turns at the same time for
+one workspace. The first task runs in the workspace; the others run in git
+worktrees of their own under `~/.maestro/worktrees/<task-id>`. Tasks beyond the
+limit wait in a queue. A task that is waiting for an answer, or has finished,
+does not count. It must be a whole number of at least 1; `1` gives the
+behaviour of earlier versions, where every task for a busy workspace waited.
 
 Consulted at delegate time when a handoff names no target agent: `agent`
 becomes the task's target (as if explicitly chosen), `fallback` fills an empty

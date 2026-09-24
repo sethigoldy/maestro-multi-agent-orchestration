@@ -241,3 +241,50 @@ def test_status_always_reports_the_task_state(tmp_path, monkeypatch):
         assert m.status(tid)['state'] == 'working'
     finally:
         m.close()
+
+
+def test_defaults_max_parallel_parsed_and_validated():
+    assert Maestro._parse_defaults({"max_parallel": 2}) == {"max_parallel": 2}
+    assert Maestro._parse_defaults({}) == {}
+    for bad in (0, -1, "4", 2.5, True):
+        with pytest.raises(ValueError, match="max_parallel must be a whole number of at least 1"):
+            Maestro._parse_defaults({"max_parallel": bad})
+
+
+def test_status_reports_run_dir_and_defaults_to_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        s = m.status(tid)
+        # A task from before run directories existed ran in its workspace.
+        assert s['run_dir'] == s['workspace'] and s['run_dir_kind'] == 'workspace'
+        assert 'run_dir_removed' not in s
+        m._write_claim(tid, 'task_run_dir', '/home/.maestro/worktrees/x')
+        m._write_claim(tid, 'task_run_dir_kind', 'worktree')
+        m._write_claim(tid, 'task_run_dir_removed', 'false')
+        assert 'run_dir_removed' not in m.status(tid)
+        m._write_claim(tid, 'task_run_dir_removed', 'true')
+        s = m.status(tid)
+        assert s['run_dir'] == '/home/.maestro/worktrees/x' and s['run_dir_kind'] == 'worktree' and s['run_dir_removed'] is True
+    finally:
+        m.close()
+
+
+def test_status_says_when_a_worktree_run_dir_is_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAESTRO_HOME', str(tmp_path/'home'))
+    m = Maestro(tmp_path)
+    try:
+        tid = _seed_task(m)
+        wt = tmp_path / 'wt'
+        m._write_claim(tid, 'task_run_dir', str(wt))
+        m._write_claim(tid, 'task_run_dir_kind', 'worktree')
+        assert m.status(tid)['run_dir_missing'] is True  # deleted by hand, for example
+        wt.mkdir()
+        assert 'run_dir_missing' not in m.status(tid)
+        wt.rmdir()
+        m._write_claim(tid, 'task_run_dir_removed', 'true')
+        s = m.status(tid)
+        assert s['run_dir_removed'] is True and 'run_dir_missing' not in s  # removed on purpose
+    finally:
+        m.close()

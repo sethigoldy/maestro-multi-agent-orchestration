@@ -37,7 +37,7 @@ from .a2a import (
     agent_card,
     sse_encode,
 )
-from . import daemonctl
+from . import daemonctl, worktrees
 from .daemon_client import DaemonClient, unanswered_message
 from .adapters import AdapterNotAvailable, BaseAdapter, make_adapter
 from .agents import BUILTIN_ADAPTERS, AgentRegistry, AgentSpec, _write_private
@@ -818,20 +818,111 @@ class MaestroDaemon:
         # Register first: once the task is queued, _release may start it at any
         # moment from another thread, and it must already have its claims.
         self._register_and_claims(task_id, doc, key)
-        queued = False
         with self._lock:
-            if key in self._active and self._active[key] is not None:
-                queued = True
-                self._queue.append(task_id)  # FIFO per workspace; starts when the slot frees
-            else:
-                self._active[key] = task_id
+            # Where the first turn runs: the workspace when it is free, else a
+            # worktree of its own, else the queue (docs/design-parallel-tasks.md).
+            queued = self._claim_turn(task_id) is None
+            if queued:
+                self._queue.append(task_id)  # FIFO; starts when a place frees
             # Set under the lock: _release clears it under the same lock.
             record["queued"] = queued
+            reason = self._queue_reason(task_id) if queued else None
+            run_dir = record.get("run_dir") or key
         self._persist(task_id)
         if queued:
-            return {"task_id": task_id, "queued": True, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
+            return {"task_id": task_id, "queued": True, "reason": reason, "run_dir": run_dir, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
         state = self._launch(task_id, doc, ws, turn_flag, routing_resolved)
-        return {"task_id": task_id, "queued": False, "state": state, "ts": utcnow_iso()}
+        return {"task_id": task_id, "queued": False, "run_dir": run_dir, "state": state, "ts": utcnow_iso()}
+
+    def _max_parallel(self) -> int:
+        """How many tasks may run turns at the same time for one workspace."""
+        return int((self.maestro.config.get("defaults") or {}).get("max_parallel", 4))
+
+    def _is_running(self, task_id: str) -> bool:
+        """True while the task runs a turn or is about to. Parked, finished
+        and queued tasks are not running."""
+        record = self._tasks[task_id]
+        if record.get("queued"):
+            return False
+        return record.get("state") in (STATE_SUBMITTED, STATE_WORKING) or task_id in self._turn_starting
+
+    def _running_count(self, key: str, *, excluding: str | None = None) -> int:
+        """Tasks of one workspace that are running a turn."""
+        return sum(
+            1 for tid, rec in self._tasks.items()
+            if tid != excluding and rec.get("workspace") == key and self._is_running(tid)
+        )
+
+    def _worktree_allowed(self, record: dict[str, Any]) -> bool:
+        """A task may run in a worktree unless it works in place (no-commit),
+        runs on a remote daemon (which never uses the local checkout), or the
+        user set max_parallel = 1, which keeps the behaviour from before
+        worktrees: a task for a busy workspace waits."""
+        if self._max_parallel() == 1:
+            return False
+        doc = record.get("doc") or {}
+        if ((doc.get("expectations") or {}).get("commit_policy") or "branch") == "no-commit":
+            return False
+        target = (doc.get("routing") or {}).get("target_agent")
+        spec = self.registry.get(target) if target else None
+        return not (spec is not None and spec.kind == "a2a_remote")
+
+    def _claim_turn(self, task_id: str) -> str | None:
+        """Decide where the task's next turn runs. The caller holds the lock.
+
+        Returns "workspace" or "worktree", or None when the turn must wait in
+        the queue. A task stays in the directory where it first ran: its
+        uncommitted work is there. A new task takes the workspace when it is
+        free, and otherwise gets a worktree of its own. No turn starts while
+        the workspace already has max_parallel running tasks.
+        See docs/design-parallel-tasks.md, section 3.
+        """
+        record = self._tasks[task_id]
+        key = record["workspace"]
+        if self._running_count(key, excluding=task_id) >= self._max_parallel():
+            return None
+        kind = self._run_dir_kind(record)
+        if kind == "worktree":
+            return "worktree"
+        workspace_free = self._active.get(key) in (None, task_id)
+        if kind == "workspace" or workspace_free or not self._worktree_allowed(record):
+            if not workspace_free:
+                return None
+            self._active[key] = task_id
+            record["run_dir"], record["run_dir_kind"] = key, "workspace"
+            return "workspace"
+        # The worktree is a checkout of the whole repository; a workspace in a
+        # subdirectory of it runs in the same subdirectory of the worktree.
+        root = worktrees.worktree_path(self.state_dir, task_id)
+        prefix = worktrees.repo_prefix(Path(key))
+        record["run_dir"] = str(root / prefix) if prefix else str(root)
+        record["run_dir_kind"] = "worktree"
+        return "worktree"
+
+    @staticmethod
+    def _run_dir_kind(record: dict[str, Any]) -> str | None:
+        """Where the task's turns run, or None before its first turn is
+        scheduled. A task from before run directories existed has no kind
+        recorded; if it has run, it ran in its workspace."""
+        kind = record.get("run_dir_kind")
+        if kind is None and (record.get("turn") or record.get("attempts")):
+            return "workspace"
+        return kind
+
+    def _queue_reason(self, task_id: str) -> str:
+        """Why a task waits in the queue, in words a user can act on."""
+        record = self._tasks[task_id]
+        limit = self._max_parallel()
+        if self._running_count(record["workspace"], excluding=task_id) >= limit:
+            return (
+                f"the workspace is at its limit of {limit} running tasks; this task starts when one of them "
+                "finishes or stops to ask a question"
+            )
+        if limit == 1:
+            return "max_parallel is 1, so tasks for this workspace run one at a time; this task starts when the task using the workspace finishes"
+        if not self._worktree_allowed(record):
+            return "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes"
+        return "this task's work is in the workspace, and another task is using the workspace; it starts when that task finishes"
 
     def _launch(self, task_id: str, doc: HandoffDoc, ws: Path, turn_flag: threading.Event | None, routing_resolved: bool) -> str:
         """Start a task's first turn once it holds its workspace slot.
@@ -870,6 +961,10 @@ class MaestroDaemon:
             "agent": None,
             "workspace": key,
             "branch": None,
+            # Where the task's turns run: the workspace itself, or a worktree
+            # of its own. Decided when its first turn is scheduled.
+            "run_dir": None,
+            "run_dir_kind": None,
             "title": doc.title,
             "doc": doc.to_dict(),
             "attempts": [],
@@ -898,7 +993,7 @@ class MaestroDaemon:
         self._persist(task_id, doc)
 
     def _start_queued(self, task_id: str) -> None:
-        """Promote a queued handoff now that its workspace is free."""
+        """Start a queued handoff whose turn _pump_queue has just claimed."""
         from .handoff import from_dict
 
         record = self._tasks.get(task_id)
@@ -916,9 +1011,8 @@ class MaestroDaemon:
                 # next queued task; this task must not start.
                 record.pop("continuation", None)
                 return
-            if self._active.get(key) not in (None, task_id):
-                return  # the slot was taken first by another handoff
-            self._active[key] = task_id
+            if record.get("run_dir_kind") != "worktree" and self._active.get(key) != task_id:
+                return  # its claim on the workspace was lost: leave it untouched
             record["queued"] = False
             doc = from_dict(record["doc"])
             ws = Path(key)
@@ -991,6 +1085,10 @@ class MaestroDaemon:
                     print(f"[maestro] task {task_id}: knowledge refresh failed after {state}:", file=sys.stderr, flush=True)
                     traceback.print_exc(file=sys.stderr)
             self.bus.publish(TaskEvent(task_id=task_id, type="state", data={"state": state, **{k: v for k, v in data.items() if v is not None}}))
+            if state == STATE_INPUT_REQUIRED:
+                # A parked task no longer counts as running, so a queued task
+                # may be able to start now.
+                self._pump_queue()
             return True
 
     def _flag_for(self, task_id: str, turn_flag: threading.Event | None) -> threading.Event | None:
@@ -1091,7 +1189,7 @@ class MaestroDaemon:
         if record is not None:
             record["turn"] = turn  # follow-ups/answers are new turns; result files must not collide
         recorded = (record or {}).get("branch")
-        branch = self._prepare_branch(workspace, task_id, doc.commit_policy, requested=doc.branch, recorded=recorded)
+        run_dir, branch = self._prepare_run_dir(task_id, doc, workspace, recorded)
         if branch:
             record = self._tasks.get(task_id)
             if record is not None:
@@ -1101,7 +1199,7 @@ class MaestroDaemon:
                 # The branch was renamed by hand since the last turn and this
                 # turn adopted the new name: tell every view.
                 self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
-        self._record_turn_baseline(task_id, workspace, doc)
+        self._record_turn_baseline(task_id, run_dir, doc)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
         last_error: str | None = None
         for agent_name in chain:
@@ -1121,8 +1219,8 @@ class MaestroDaemon:
             for attempt in range(attempts):
                 if not self._turn_live(task_id, turn_flag):
                     return  # canceled or replaced by a newer turn: start no agent
-                rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
-                prompt = build_prompt(doc, task_id, workspace, record_transcript(self._tasks.get(task_id)), context_block=rendered.block)
+                rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, self._context_root(task_id, workspace))
+                prompt = build_prompt(doc, task_id, run_dir, record_transcript(self._tasks.get(task_id)), context_block=rendered.block)
                 settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
 
                 def _on_line(line: str, _task_id: str = task_id) -> None:
@@ -1130,7 +1228,7 @@ class MaestroDaemon:
 
                 result = adapter.run(
                     prompt,
-                    workspace,
+                    run_dir,
                     task_id,
                     settings=settings,
                     timeout=spec.timeout_s,
@@ -1151,7 +1249,7 @@ class MaestroDaemon:
                         self._set_state(task_id, STATE_INPUT_REQUIRED, question=result.question, awaiting="question", turn_flag=turn_flag)
                         return
                 if result.ok:
-                    self._post_complete(task_id, doc, workspace, agent_name, result, turn_flag)
+                    self._post_complete(task_id, doc, run_dir, agent_name, result, turn_flag)
                     return
                 last_error = result.error or f"agent {agent_name} failed"
                 if attempt < attempts - 1 and self.backoff_s > 0:
@@ -1168,37 +1266,37 @@ class MaestroDaemon:
         return lambda: not self._turn_live(task_id, turn_flag)
 
     def _release(self, task_id: str) -> None:
-        """Free the workspace slot and start every queued handoff whose workspace is now free."""
-        started: list[str] = []
+        """Free the workspace if this task holds it, then start every queued
+        handoff that can run now."""
         with self._lock:
             record = self._tasks.get(task_id)
             key = record["workspace"] if record else None
             if key is not None and self._active.get(key) == task_id:
                 del self._active[key]
-            changed = True
-            while changed:
-                changed = False
-                for queued_id in list(self._queue):
-                    qrec = self._tasks.get(queued_id)
-                    if qrec is None:
-                        self._queue.remove(queued_id)  # stale entry: drop it
-                        changed = True
-                        break
-                    if qrec["workspace"] not in self._active:
-                        self._queue.remove(queued_id)
-                        # Take the slot now, under the lock. Otherwise the
-                        # rescan below still sees the workspace as free and
-                        # removes the next queued task for it too, and that
-                        # task is never started.
-                        self._active[qrec["workspace"]] = queued_id
-                        # It holds the slot and is no longer queued, so a
-                        # cancel from now on frees the slot for the next task.
-                        qrec["queued"] = False
-                        started.append(queued_id)
-                        changed = True
-                        break  # the slot just filled: re-scan from the front (FIFO fairness)
-        for queued_id in started:
-            self._start_queued(queued_id)
+        self._pump_queue()
+
+    def _pump_queue(self) -> None:
+        """Start every queued handoff that can now claim a turn, oldest first.
+
+        It runs when a task finishes, is canceled, or stops to ask a question,
+        because each of those can free the workspace or a place under the
+        limit. Starting a task can park it at once (routing or approval), which
+        runs this again; by then this run has finished going through the queue."""
+        started: list[str] = []
+        with self._lock:
+            for queued_id in list(self._queue):
+                qrec = self._tasks.get(queued_id)
+                if qrec is None:
+                    self._queue.remove(queued_id)  # stale entry: drop it
+                    continue
+                if self._claim_turn(queued_id) is None:
+                    continue
+                self._queue.remove(queued_id)
+                # It is no longer queued, so a cancel from now on frees what it holds.
+                qrec["queued"] = False
+                started.append(queued_id)
+            for queued_id in started:
+                self._start_queued(queued_id)
 
     @staticmethod
     def _turn_settings(spec: AgentSpec, doc: HandoffDoc) -> dict[str, Any]:
@@ -1434,7 +1532,7 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return self._gate_park(agent_name, role, f"agent {agent_name!r} failed preflight: {preflight.error or 'unknown error'}")
-        rendered = self._rendered_context(doc, task_id, role, spec.kind, workspace)
+        rendered = self._rendered_context(doc, task_id, role, spec.kind, self._context_root(task_id, workspace))
         if role == "verifier":
             prompt = build_verify_prompt(doc, task_id, workspace, verification_ok, report_path, context_block=rendered.block)
         else:
@@ -1496,7 +1594,7 @@ class MaestroDaemon:
         preflight = adapter.preflight()
         if not preflight.ok:
             return "parked", f"Work-mode fixer agent {fix_agent!r} failed preflight:\n{preflight.error or 'unknown error'}\n\nAnswer with instructions to resume on the task branch, or cancel."
-        rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, workspace)
+        rendered = self._rendered_context(doc, task_id, "implementer", spec.kind, self._context_root(task_id, workspace))
         prompt = build_fix_prompt(doc, task_id, workspace, issues, det_failed, context_block=rendered.block)
         settings = self._with_context_settings(spec.kind, self._turn_settings(spec, doc), rendered)
         if not self._turn_live(task_id, turn_flag):
@@ -1719,6 +1817,55 @@ class MaestroDaemon:
         phase = Phase.VERIFYING if verifying else Phase.IMPLEMENTING
         self.maestro._write_claim(task_id, "task_status", phase.value)
 
+    def _prepare_run_dir(self, task_id: str, doc: HandoffDoc, workspace: Path, recorded: str | None) -> tuple[Path, str | None]:
+        """Get the task's run directory ready for this turn; return it and the branch.
+
+        A task that runs in the workspace checks out its branch there, as
+        before. A task that runs in a worktree gets the worktree created on its
+        first turn, from the commit checked out in the workspace, and created
+        again from its branch if it was removed (only committed work comes
+        back). See docs/design-parallel-tasks.md, section 3."""
+        record = self._tasks.get(task_id) or {}
+        if record.get("run_dir_kind") != "worktree":
+            branch = self._prepare_branch(workspace, task_id, doc.commit_policy, requested=doc.branch, recorded=recorded)
+            self._record_run_dir(task_id, workspace, "workspace")
+            return workspace, branch
+        run_dir = Path(record["run_dir"])
+        root = worktrees.worktree_path(self.state_dir, task_id)  # run_dir is root or a subdirectory of it
+        if recorded:
+            branch = recorded if branch_exists(workspace, recorded) else self._renamed_task_branch(workspace, task_id, recorded)
+            if worktrees.ensure_worktree(workspace, root, branch):
+                self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
+                    "agent": "maestro",
+                    "line": f"[maestro] the worktree {root} was missing, so it was created again from branch {branch}; only committed work is in it",
+                }))
+            else:
+                checked = subprocess.run(["git", "-C", str(root), "checkout", branch], text=True, capture_output=True)
+                if checked.returncode != 0:
+                    raise RuntimeError(
+                        f"could not check out the task branch {branch!r} in {root}: {(checked.stderr or checked.stdout).strip()}"
+                    )
+        else:
+            branch = doc.branch or f"maestro/{task_id}"
+            worktrees.add_worktree(workspace, root, branch, new_branch=True, start=worktrees.head_commit(workspace))
+        self._record_run_dir(task_id, run_dir, "worktree")
+        return run_dir, branch
+
+    def _record_run_dir(self, task_id: str, run_dir: Path, kind: str) -> None:
+        """Store where the task's turns run, for status, cleanup and later turns."""
+        record = self._tasks.get(task_id)
+        if record is not None:
+            record["run_dir"], record["run_dir_kind"] = str(run_dir), kind
+        self.maestro._write_claim(task_id, "task_run_dir", str(run_dir))
+        self.maestro._write_claim(task_id, "task_run_dir_kind", kind)
+        self.maestro._write_claim(task_id, "task_run_dir_removed", "false")
+
+    def _context_root(self, task_id: str, fallback: Path) -> Path:
+        """The directory context files and skills resolve against: the
+        caller's workspace, because files that are not in git exist only there."""
+        record = self._tasks.get(task_id) or {}
+        return Path(record["workspace"]) if record.get("workspace") else fallback
+
     def _prepare_branch(
         self, workspace: Path, task_id: str, commit_policy: str,
         requested: str | None = None, recorded: str | None = None,
@@ -1856,29 +2003,27 @@ class MaestroDaemon:
             if not self._acquire_or_queue(task_id):
                 # Parked tasks keep their slot, but not across a daemon restart;
                 # another task may hold the workspace now.
-                return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True}
+                return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True, "reason": self._queue_reason(task_id)}
             self._turn_starting.add(task_id)
             thread = threading.Thread(target=self._run_task, args=(task_id, doc, workspace, turn_flag), daemon=True)
             thread.start()
         return {"task_id": task_id, "state": STATE_WORKING}
 
     def _acquire_or_queue(self, task_id: str) -> bool:
-        """Take the task's workspace slot for a follow-up or an answer.
+        """Claim a turn for a follow-up or an answer (see _claim_turn).
 
         The caller holds the lock and has just checked, under it, that the
         task may start a turn; that is what stops two concurrent follow-ups
-        or answers from both getting here. A slot the task already holds is
-        its own (a parked task keeps its slot while it waits), so it is kept.
+        or answers from both getting here. A task that ran in the workspace
+        keeps it while it is parked, so its own claim succeeds.
 
-        Returns True when the task now holds the slot. When another task holds
-        it, the continuation is queued behind that task (FIFO, like a queued
-        delegation) and False is returned; it starts when the slot frees.
+        Returns True when the turn may start now. Otherwise the continuation
+        is queued (FIFO, like a queued delegation), False is returned, and it
+        starts when the workspace or a place under the limit frees.
         """
         record = self._tasks[task_id]
-        key = record["workspace"]
         with self._lock:
-            if self._active.get(key) in (None, task_id):
-                self._active[key] = task_id
+            if self._claim_turn(task_id) is not None:
                 record["queued"] = False
                 return True
             self._queue.append(task_id)
@@ -1906,7 +2051,8 @@ class MaestroDaemon:
                 parsed = None
             if isinstance(parsed, dict):
                 runtime = parsed
-        workspace_raw = claims.get("task_workspace") or self._registry_workspace(task_id)
+        # Changed files are read where the task's work is: its run directory.
+        workspace_raw = claims.get("task_run_dir") or claims.get("task_workspace") or self._registry_workspace(task_id)
         knowledge = project_knowledge(task_id, claims, runtime, workspace=Path(workspace_raw) if workspace_raw else None)
         self.maestro._write_claim(task_id, "task_knowledge", knowledge.serialize())
         return knowledge
@@ -1949,7 +2095,7 @@ class MaestroDaemon:
         }
         # What a parked task was waiting for (routing vs. a question), and the
         # gate and verification details the status views show.
-        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification"):
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification", "run_dir", "run_dir_kind"):
             if runtime.get(key) is not None:
                 record[key] = runtime[key]
         with self._lock:
@@ -2097,10 +2243,41 @@ class MaestroDaemon:
             self._set_state(task_id, STATE_SUBMITTED, turn_flag=turn_flag)
             if not self._acquire_or_queue(task_id):
                 self._persist(task_id)
-                return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True, "ts": utcnow_iso()}
+                return {"task_id": task_id, "state": STATE_SUBMITTED, "queued": True, "reason": self._queue_reason(task_id), "ts": utcnow_iso()}
             thread = threading.Thread(target=self._run_task, args=(task_id, followup_doc, workspace, turn_flag), daemon=True)
             thread.start()
         return {"task_id": task_id, "state": STATE_SUBMITTED, "ts": utcnow_iso()}
+
+    def cleanup_worktree(self, task_id: str, force: bool = False) -> dict[str, Any]:
+        """Remove a task's worktree (docs/design-parallel-tasks.md, section 5).
+
+        Never touches the workspace and never removes the branch. Refuses while
+        the task is running, and refuses to drop uncommitted work unless
+        ``force`` is given; the message lists the changed files."""
+        with self._lock:
+            record = self._tasks.get(task_id) or self._durable_record(task_id)
+            if record is None:
+                raise KeyError(f"Unknown task reference {task_id!r}")
+            if record.get("state") in (STATE_SUBMITTED, STATE_WORKING) or task_id in self._turn_starting:
+                raise ValueError(f"Task {task_id} is running; wait for it to finish or cancel it first")
+            claims = self.maestro._claims(task_id)
+            kind = record.get("run_dir_kind") or claims.get("task_run_dir_kind") or "workspace"
+            run_dir = Path(record.get("run_dir") or claims.get("task_run_dir") or record["workspace"])
+            if kind != "worktree":
+                return {"task_id": task_id, "run_dir": str(run_dir), "removed": False,
+                        "reason": "this task ran in the workspace; Maestro never removes or changes your checkout"}
+            root = worktrees.worktree_path(self.state_dir, task_id)  # the whole worktree, even when run_dir is a subdirectory
+            if not root.is_dir():
+                return {"task_id": task_id, "run_dir": str(run_dir), "removed": False, "reason": "the worktree is already gone"}
+            dirty = worktrees.dirty_files(root)
+            if dirty and not force:
+                raise ValueError(
+                    f"The worktree {root} has uncommitted changes: {', '.join(dirty)}. "
+                    "Commit them, or pass --force to remove the worktree anyway"
+                )
+            worktrees.remove_worktree(Path(record["workspace"]), root, force=force)
+            self.maestro._write_claim(task_id, "task_run_dir_removed", "true")
+            return {"task_id": task_id, "run_dir": str(run_dir), "removed": True, "reason": "removed; the branch is kept"}
 
     def rename_branch(self, task_id: str, new_branch: str) -> dict[str, Any]:
         """Rename a task's branch in git and in the task's record.
@@ -2285,6 +2462,7 @@ class MaestroDaemon:
             branch = record.get("branch")
             origin = record.get("origin_agent")
             target = record.get("target_agent")
+            run_dir = record.get("run_dir") or workspace
             title = record.get("title")
             usage = record.get("usage")
             attempts = record.get("attempts") or []
@@ -2305,6 +2483,7 @@ class MaestroDaemon:
             branch = claims.get("task_branch")
             origin = claims.get("task_origin_agent")
             target = claims.get("task_target_agent")
+            run_dir = claims.get("task_run_dir") or workspace
             title = claims.get("task_title")
             usage = runtime.get("usage")
             attempts = runtime.get("attempts") or []
@@ -2319,6 +2498,8 @@ class MaestroDaemon:
                     artifacts.append({"artifactId": f"{task_id}:{path.name}", "name": path.name, "parts": [{"kind": "url", "url": str(path)}]})
         metadata = {
             "workspace": workspace,
+            # Where the task's work is: the workspace, or the task's worktree.
+            "run_dir": run_dir,
             "branch": branch,
             "origin_agent": origin,
             "target_agent": target,
@@ -2327,6 +2508,10 @@ class MaestroDaemon:
             "attempts": attempts,
             "error": error,
         }
+        run_dir_kind = record.get("run_dir_kind") if record is not None else claims.get("task_run_dir_kind")
+        if run_dir_kind == "worktree" and run_dir and not Path(run_dir).is_dir():
+            # Removed by task cleanup or deleted by hand; the next turn creates it again.
+            metadata["run_dir_missing"] = True
         if gates is not None:
             metadata["gates"] = gates
         if bounces is not None:

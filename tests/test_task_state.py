@@ -160,7 +160,11 @@ def test_answer_after_restart_queues_behind_a_busy_workspace(tmp_path, monkeypat
         other = second.delegate(_doc(title="other"), ws)  # the restart freed the parked task's slot
         assert other["queued"] is False
         out = second.answer_question(parked["task_id"], "approved")
-        assert out == {"task_id": parked["task_id"], "state": "submitted", "queued": True}
+        assert out == {
+            "task_id": parked["task_id"], "state": "submitted", "queued": True,
+            # It never ran (it waited for approval), and it works in place.
+            "reason": "this task works in place (commit_policy no-commit), and another task is using the workspace; it starts when that task finishes",
+        }
         assert second.wait(other["task_id"], timeout=30)["status"]["state"] == "completed"
         assert second.wait(parked["task_id"], timeout=30)["status"]["state"] == "completed"
     finally:

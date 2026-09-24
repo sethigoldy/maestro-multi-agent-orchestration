@@ -1103,3 +1103,18 @@ def test_run_restores_winch_handler(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_detail_shows_run_dir_only_when_it_differs_from_workspace():
+    base = {"task_id": "t", "title": "T", "state": "working", "workspace": "/repo"}
+    same = _ANSI_RE.sub("", tui.render_frame([dict(base, run_dir="/repo")], 0, live=True))
+    other = _ANSI_RE.sub("", tui.render_frame([dict(base, run_dir="/h/worktrees/t")], 0, live=True))
+    assert "run dir:" not in same
+    assert "run dir: /h/worktrees/t" in other
+    assert tui.normalize({"id": "t", "metadata": {"run_dir": "/x"}})["run_dir"] == "/x"
+
+
+def test_detail_marks_a_missing_run_dir():
+    task = {"task_id": "t", "title": "T", "state": "completed", "workspace": "/repo", "run_dir": "/h/worktrees/t", "run_dir_missing": True}
+    assert "run dir: /h/worktrees/t (missing)" in _ANSI_RE.sub("", tui.render_frame([task], 0, live=True))
+    assert tui.normalize({"id": "t", "metadata": {"run_dir_missing": True}})["run_dir_missing"] is True

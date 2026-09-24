@@ -232,16 +232,23 @@ spend anytime with `maestro budgets`. Details:
 
 ## Queueing and no-wait
 
-One workspace runs one active task at a time. If you delegate to a busy
-workspace, the new handoff is queued FIFO and starts when the slot frees:
+If you delegate to a busy workspace, the new task does not wait. It runs in a
+git worktree of its own under `~/.maestro/worktrees/<task-id>`, and its changes
+are there, not in your checkout. `maestro task status <task>` shows the path in
+`run_dir`. A task waits in a queue only when the workspace already has
+`[defaults] max_parallel` running tasks (4 by default), or when it is a
+`no-commit` task, which works in place. The command then says why:
 
 ```bash
 maestro delegate --file next.toml --workspace /path/to/repo
 # {
 #   "queued": true,
-#   "reason": "workspace already has an active task; this handoff is next in line"
+#   "reason": "the workspace is at its limit of 4 running tasks; this task starts when one of them finishes or stops to ask a question"
 # }
 ```
+
+When you have reviewed a worktree task's changes and committed or discarded
+them, remove its worktree with `maestro task cleanup <task>`.
 
 With `--no-wait`, the command returns immediately after enqueueing and prints
 the daemon's response (task id, or the queued notice). Follow the task with
