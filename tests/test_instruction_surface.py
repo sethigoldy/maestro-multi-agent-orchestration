@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_version_is_090():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert data["project"]["version"] == "0.14.0"
+    assert data["project"]["version"] == "0.15.0"
 
 
 def test_claude_rules_are_zero_discovery_and_codex_first():
