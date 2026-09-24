@@ -314,11 +314,21 @@ class Maestro:
             yield
 
     def _load_config(self) -> dict[str, Any]:
+        return self.load_config(self.user_state_dir, self.project_root, self.root)
+
+    @classmethod
+    def load_config(cls, user_state_dir: Path, project_root: Path, root: Path) -> dict[str, Any]:
+        """Read and validate the merged config: the user file, then the
+        project's .maestro/config.toml, then the worktree's; later files win.
+
+        It reads the files every time it is called. The daemon calls it with a
+        task's workspace, so a project's config applies to that project's tasks
+        and an edited file applies without restarting the daemon."""
         merged: dict[str, Any] = {}
         config_paths = [
-            self.user_state_dir / "config.toml",
-            self.project_root / ".maestro" / "config.toml",
-            self.root / ".maestro" / "config.toml",
+            user_state_dir / "config.toml",
+            project_root / ".maestro" / "config.toml",
+            root / ".maestro" / "config.toml",
         ]
         seen: set[Path] = set()
         context_layers: list[tuple[str, dict[str, Any]]] = []
@@ -345,7 +355,7 @@ class Maestro:
         codex = merged.get("codex") if isinstance(merged.get("codex"), dict) else {}
         verification = merged.get("verification") if isinstance(merged.get("verification"), dict) else {}
         storage = merged.get("storage") if isinstance(merged.get("storage"), dict) else {}
-        defaults = self._parse_defaults(merged.get("defaults"))
+        defaults = cls._parse_defaults(merged.get("defaults"))
         backend = str(storage.get("backend") or os.environ.get("MAESTRO_STORAGE", "filesystem")).lower()
         if backend not in {"filesystem", "memvara"}:
             raise ValueError(f"Unsupported storage backend: {backend}")

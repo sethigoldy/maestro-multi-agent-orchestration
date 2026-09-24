@@ -641,7 +641,27 @@ class MaestroDaemon:
         except ValueError:
             return False
 
-    def _apply_work_mode(self, doc: HandoffDoc) -> HandoffDoc:
+    def _config(self, workspace: str | Path | None = None, *, strict: bool = False) -> dict[str, Any]:
+        """The config that applies to a workspace, read from disk now.
+
+        That is the user file (<state dir>/config.toml), then the project's
+        .maestro/config.toml, then the workspace's own; later files win. Reading
+        it on every use means an edited file applies to the next task without a
+        daemon restart, and a project's [defaults] apply to that project only.
+
+        With ``strict`` an invalid file raises ValueError (delegation reports
+        it). Otherwise the config the daemon started with is used, so a file
+        edited while tasks run cannot break scheduling or verification."""
+        ws = Path(workspace) if workspace is not None else None
+        project_root = Maestro._resolve_project_root(ws) if ws is not None else self.state_dir
+        try:
+            return Maestro.load_config(self.state_dir, project_root, ws if ws is not None else self.state_dir)
+        except ValueError:
+            if strict:
+                raise
+            return self.maestro.config
+
+    def _apply_work_mode(self, doc: HandoffDoc, workspace: str | Path | None = None) -> HandoffDoc:
         """Expand a work-mode preset onto the handoff and validate its routing pins.
 
         Explicit routing fields win over the preset (see maestro/modes.py). After
@@ -650,7 +670,7 @@ class MaestroDaemon:
         implementer must be known too. Raises ValueError with an actionable message.
         """
         if doc.mode:
-            preset = resolve_mode(self.maestro.config.get("modes") or {}, doc.mode)
+            preset = resolve_mode(self._config(workspace).get("modes") or {}, doc.mode)
             expand_mode(preset, doc)
         if doc.review_agent and doc.review_agent == doc.target_agent:
             raise ValueError(f"review_agent {doc.review_agent!r} cannot equal the implementer (self-review is not a gate)")
@@ -671,14 +691,14 @@ class MaestroDaemon:
         A relative skill path is checked against the task workspace, the same
         directory that ``render_context`` later copies the skill from.
         """
-        config_entries = self.maestro.config.get("context") or {}
+        config_entries = self._config(workspace).get("context") or {}
         composed = compose_context(config_entries, doc.context_entries)
         check_skill_entries(composed, workspace)
         doc.context_entries = [e.to_dict() for e in composed]
         return doc
 
     # ------------------------------------------------- routing defaults ([defaults])
-    def _apply_defaults(self, doc: HandoffDoc) -> bool:
+    def _apply_defaults(self, doc: HandoffDoc, workspace: str | Path | None = None) -> bool:
         """Fill missing routing from the config ``[defaults]`` table.
 
         Returns True when a target agent is now resolved (the handoff named one
@@ -691,7 +711,7 @@ class MaestroDaemon:
         neither the handoff nor that agent's registry entry sets them. Explicit
         handoff values always win, and a registry value beats the default.
         """
-        defaults = self.maestro.config.get("defaults") or {}
+        defaults = self._config(workspace).get("defaults") or {}
         if not doc.explicit_target:
             agent = defaults.get("agent")
             if not agent:
@@ -801,9 +821,11 @@ class MaestroDaemon:
         from .handoff import validate_handoff
 
         doc = validate_handoff(doc)
-        doc = self._apply_work_mode(doc)
-        doc = self._apply_context(doc, Path(workspace).expanduser().resolve())
-        routing_resolved = self._apply_defaults(doc)
+        resolved_ws = Path(workspace).expanduser().resolve()
+        self._config(resolved_ws, strict=True)  # an invalid config refuses the delegation, with its reason
+        doc = self._apply_work_mode(doc, resolved_ws)
+        doc = self._apply_context(doc, resolved_ws)
+        routing_resolved = self._apply_defaults(doc, resolved_ws)
         if routing_resolved and doc.target_agent == doc.origin_agent:
             raise ValueError(
                 f"Agent {doc.target_agent!r} cannot delegate to itself (no self-review/self-delegation); "
@@ -849,9 +871,9 @@ class MaestroDaemon:
         state = self._launch(task_id, doc, ws, turn_flag, routing_resolved)
         return {"task_id": task_id, "queued": False, "run_dir": run_dir, "state": state, "ts": utcnow_iso()}
 
-    def _max_parallel(self) -> int:
+    def _max_parallel(self, workspace: str | Path | None = None) -> int:
         """How many tasks may run turns at the same time for one workspace."""
-        return int((self.maestro.config.get("defaults") or {}).get("max_parallel", 4))
+        return int((self._config(workspace).get("defaults") or {}).get("max_parallel", 4))
 
     def _is_running(self, task_id: str) -> bool:
         """True while the task runs a turn or is about to. Parked, finished
@@ -873,7 +895,7 @@ class MaestroDaemon:
         runs on a remote daemon (which never uses the local checkout), or the
         user set max_parallel = 1, which keeps the behaviour from before
         worktrees: a task for a busy workspace waits."""
-        if self._max_parallel() == 1:
+        if self._max_parallel(record["workspace"]) == 1:
             return False
         doc = record.get("doc") or {}
         if ((doc.get("expectations") or {}).get("commit_policy") or "branch") == "no-commit":
@@ -894,7 +916,7 @@ class MaestroDaemon:
         """
         record = self._tasks[task_id]
         key = record["workspace"]
-        if self._running_count(key, excluding=task_id) >= self._max_parallel():
+        if self._running_count(key, excluding=task_id) >= self._max_parallel(key):
             return None
         kind = self._run_dir_kind(record)
         if kind == "worktree":
@@ -927,7 +949,7 @@ class MaestroDaemon:
     def _queue_reason(self, task_id: str) -> str:
         """Why a task waits in the queue, in words a user can act on."""
         record = self._tasks[task_id]
-        limit = self._max_parallel()
+        limit = self._max_parallel(record["workspace"])
         if self._running_count(record["workspace"], excluding=task_id) >= limit:
             return (
                 f"the workspace is at its limit of {limit} running tasks; this task starts when one of them "
@@ -1037,7 +1059,7 @@ class MaestroDaemon:
                 thread = threading.Thread(target=self._run_task, args=(task_id, doc, ws, turn_flag), daemon=True)
                 thread.start()
                 return
-            self._launch(task_id, doc, ws, turn_flag, self._apply_defaults(doc))
+            self._launch(task_id, doc, ws, turn_flag, self._apply_defaults(doc, ws))
 
     def _persist(self, task_id: str, doc: HandoffDoc | None = None) -> None:
         record = self._tasks.get(task_id)
@@ -1742,7 +1764,7 @@ class MaestroDaemon:
         # for the agent's work.
         has_changes, evidence = self._workspace_has_changes(workspace, task_id)
         diff = subprocess.run(["git", "diff", "--check"], cwd=workspace, text=True, capture_output=True)
-        timeout_s = int(self.maestro.config.get("verification_timeout_s", 1800)) or None
+        timeout_s = int(self._config(self._context_root(task_id, workspace)).get("verification_timeout_s", 1800)) or None
         self._set_verifying(task_id, True)
         limit_text = f"time limit {_duration_text(timeout_s)}" if timeout_s else "no time limit"
         self.bus.publish(TaskEvent(task_id=task_id, type="output", data={
@@ -1982,7 +2004,7 @@ class MaestroDaemon:
         else:
             # Parked for another reason (e.g. sensitive approval) while routing was
             # never resolved: ask now instead of running under a guessed target.
-            needs_routing = not self._apply_defaults(doc)
+            needs_routing = not self._apply_defaults(doc, record["workspace"])
         routing_question = self._routing_question() if needs_routing else None
         workspace = Path(record["workspace"])
         # The state check and the start of the turn happen together under the
@@ -2212,11 +2234,12 @@ class MaestroDaemon:
         # through the standard context pipeline.
         followup_doc.context_entries = [e for e in doc.context_entries if e.get("label") != "task-knowledge"]
         raw_history = self._raw_history_bytes(task_id)
-        continuation_config = self.maestro.config.get("continuation") or {}
+        task_config = self._config((self._tasks.get(task_id) or {}).get("workspace"))
+        continuation_config = task_config.get("continuation") or {}
         context_stats: dict[str, Any] | None = None
         if context_mode == "reuse" and continuation_config.get("enabled", True):
             knowledge = self._refresh_knowledge(task_id)
-            block = render_continuation_block(knowledge, continuation_budget_chars(self.maestro.config)) if knowledge is not None else ""
+            block = render_continuation_block(knowledge, continuation_budget_chars(task_config)) if knowledge is not None else ""
             if block:
                 followup_doc.context_entries.append({"label": "task-knowledge", "kind": "text", "text": block})
             context_stats = {

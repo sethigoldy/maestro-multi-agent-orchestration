@@ -16,6 +16,15 @@ The project root is the git common directory's parent when available, else the
 workspace itself. Unreadable or unparsable files are skipped silently; an
 invalid value that *is* read raises an error (e.g. unsupported effort).
 
+The daemon reads these files for each task's workspace every time it needs
+them: at delegation, when it schedules a turn, and when it verifies. So a
+`[defaults]` table in a project's `.maestro/config.toml` applies to that
+project's tasks only, and an edit to any of the files applies to the next
+task without restarting the daemon. An invalid value refuses the delegation
+with its reason. If a file becomes invalid while tasks are running, those
+tasks keep using the config the daemon started with. `[daemon] port` and
+`[storage]` are the exceptions: the daemon reads them only when it starts.
+
 ### `[defaults]` — routing defaults
 
 ```toml
