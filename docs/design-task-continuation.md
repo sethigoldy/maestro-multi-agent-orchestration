@@ -22,7 +22,9 @@ limitations of the first release.
   `mode`, `review_agent`, `verify_agent`, `fix_agent`, `max_bounces`, fallback,
   artifacts, verification mode, commit policy, budget hint, and sensitivity;
   the target is the pinned fixer (a follow-up is a fix) or the original target.
-  `max_depth_remaining` is decremented per follow-up (nesting guard).
+  `max_depth_remaining` is carried over unchanged. (Until 0.16.1 each follow-up
+  decremented it, which refused a task's third follow-up; a follow-up is not a
+  nested delegation, so 0.16.2 stopped that.)
 - **V5 — Durable task state.** Every state change persists a `task_runtime`
   claim (JSON snapshot of the record, minus the transcript) plus individual
   claims (`task_status`, `task_workspace`, `task_branch`, `task_request`,

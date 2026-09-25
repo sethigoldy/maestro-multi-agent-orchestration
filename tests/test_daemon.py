@@ -1240,13 +1240,19 @@ def test_followup_rejects_active_and_bad_input(daemon, tmp_path, binpath):
     daemon.cancel(started["task_id"])
 
 
-def test_followup_depth_guard(daemon, tmp_path, binpath):
+def test_followups_do_not_spend_the_delegation_depth(daemon, tmp_path, binpath):
+    # A follow-up is another turn of the same task, not a nested delegation.
+    # A supervisor's review rounds must not be capped by the depth budget,
+    # which exists for tasks whose agents delegate further tasks.
     _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
     ws = _git_repo(tmp_path)
     started = daemon.delegate(_doc(title="shallow", max_depth_remaining=1), ws)
-    daemon.wait(started["task_id"], timeout=60)
-    with pytest.raises(ValueError, match="depth"):
-        daemon.followup(started["task_id"], "one more")
+    tid = started["task_id"]
+    daemon.wait(tid, timeout=60)
+    for round_number in range(4):
+        daemon.followup(tid, f"review round {round_number}")
+        assert daemon.wait(tid, timeout=60)["status"]["state"] == "completed"
+    assert daemon._tasks[tid]["doc"]["constraints"]["max_depth_remaining"] == 1
 
 
 # ------------------------------------------------------------------ M3b: task continuation + knowledge
@@ -1401,19 +1407,22 @@ def test_followup_after_restart_reconstructs_from_claims(daemon, tmp_path, binpa
         d2.stop()
 
 
-def test_followup_depth_guard_applies_after_restart(daemon, tmp_path, binpath):
+def test_a_task_whose_depth_earlier_versions_used_up_can_still_be_followed_up(daemon, tmp_path, binpath):
+    # Before 0.16.2 every follow-up spent one unit of depth, so a task that had
+    # two follow-ups was left at 0 and refused the third, even after a restart.
     _fake_bin(binpath, "codex", 'cat > /dev/null\nexit 0')
     ws = _git_repo(tmp_path)
-    started = daemon.delegate(_doc(title="depth2", max_depth_remaining=2), ws)
+    started = daemon.delegate(_doc(title="used up"), ws)
     tid = started["task_id"]
     daemon.wait(tid, timeout=60)
-    daemon.followup(tid, "one more")  # consumes one depth unit (2 -> 1)
-    daemon.wait(tid, timeout=60)
+    record = daemon._tasks[tid]
+    record["doc"]["constraints"]["max_depth_remaining"] = 0  # as an earlier version left it
+    daemon._persist(tid)
 
     d2 = MaestroDaemon(state_dir=daemon.state_dir, start_http=False, max_retries=0, backoff_s=0)
     try:
-        with pytest.raises(ValueError, match="depth"):
-            d2.followup(tid, "one more still")  # reconstructed doc has depth 1 -> follow-up would be 0
+        d2.followup(tid, "one more still")
+        assert d2.wait(tid, timeout=60)["status"]["state"] == "completed"
     finally:
         d2.stop()
 
