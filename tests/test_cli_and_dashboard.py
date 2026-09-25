@@ -268,7 +268,7 @@ def test_task_tail_follows_a_migrated_task_without_a_workspace_claim(live_daemon
     live_daemon.maestro._write_claim(tid, "task_status", "REVIEWING")
     assert "task_workspace" not in live_daemon.maestro._claims(tid)
     calls: list[str | None] = []
-    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: calls.append(task_id) or 0)
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None, **kwargs: calls.append(task_id) or 0)
     assert _run_main_with_timeout(["task", "tail", "1"]) == 0
     assert calls == [tid]
     record_workspace = live_daemon.maestro.status(tid)["workspace"]
@@ -328,7 +328,7 @@ def test_final_state_event_only_for_finished_tasks(live_daemon):
 def test_task_tail_all_needs_no_reference(monkeypatch):
     monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
     calls: list[tuple[str, str | None]] = []
-    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: calls.append((url, task_id)) or 0)
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None, **kwargs: calls.append((url, task_id)) or 0)
     assert _run_main_with_timeout(["task", "tail", "--all"]) == 0
     assert calls == [("http://127.0.0.1:9", None)]
 

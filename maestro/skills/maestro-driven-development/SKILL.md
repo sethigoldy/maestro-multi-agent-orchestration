@@ -279,10 +279,18 @@ maestro delegate [--file FILE | --title T --request R] [--target AGENT] [--mode 
 - `--context TEXT` / `--context-file PATH` / `--skill DIR`: inject standing
   context into the agent turns (text entry, inlined file, or Agent Skills
   directory containing SKILL.md).
-- Blocks until terminal state or `input-required`; prints `[state] …` lines and
-  final task JSON. If the task cannot start yet it prints
-  `{"queued": true, "reason": …}`; the reason says why (the workspace is at its
-  `max_parallel` limit, or the task must wait for the workspace).
+- `--target` and `--fallback` override the routing in a `--file` handoff, as
+  `--mode` overrides its mode.
+- Prints `[task] <task-id> …`, then the agent's output and `[state] …` lines,
+  and returns when the task completes, fails or is canceled, or when it stops
+  in `input-required` to ask a question. It does not print the task JSON: run
+  `maestro task status <task-id>` for `run_dir`, `branch`, `verification` and
+  `error`. If the task cannot start yet, it prints
+  `[task] <task-id> — queued: <reason>` and keeps waiting until the task runs
+  and ends; the reason says why (the workspace is at its `max_parallel` limit,
+  or the task must wait for the workspace). With `--no-wait`, a queued task
+  prints `{"queued": true, "task_id": …, "reason": …}`.
+- `maestro task continue` and `maestro task answer` wait the same way.
 
 ### task
 
@@ -426,7 +434,8 @@ When your environment exposes the Maestro MCP server, these tools are available
   task object (state, artifacts, workspace/run_dir/branch metadata). A task
   delegated while the workspace is busy runs in a git worktree of its own, and
   its changes are in `run_dir`, not in the workspace: review the diff there. If
-  the task cannot start yet you get `{"queued": true, "reason": …}` immediately. Routing
+  the task cannot start yet you get `{"queued": true, "task_id": …, "reason": …}`
+  immediately; wait for it with `task_wait(workspace, task_id)`. Routing
   defaults and the input-required question behave exactly as in section 3.
   `branch` names the task's git branch (default `maestro/<task-id>`); use it
   when the repository has branch naming conventions, instead of renaming later.

@@ -18,7 +18,9 @@
 #   5. Discovers locally installed coding-agent CLIs and registers them with
 #      Maestro (existing registrations are preserved, never overwritten).
 #   6. Installs the global maestro-driven-development skill into every
-#      detected supported agent.
+#      detected supported agent. For Codex it also writes the custom agent
+#      ~/.codex/agents/maestro-worker.toml, so each Maestro task shows in
+#      Codex's subagent panel.
 #   7. Starts (or restarts) the background daemon and verifies it is healthy.
 #
 # The script is idempotent: rerunning it updates Maestro in place, preserves
@@ -207,6 +209,9 @@ if installed:
     print(f"  ✓ maestro-driven-development ({len(installed)} agent(s): {', '.join(s['display_name'] for s in installed)})")
 else:
     print("  - not installed for any detected agent")
+for s in skill:
+    if s.get("subagent_installed"):
+        print(f"  ✓ {s['display_name']} subagent maestro_worker ({s['subagent_path']}): Maestro tasks show in the subagent panel")
 print()
 print("You can now open any supported coding agent and start developing normally.")
 print("Development tasks will automatically use Maestro.")

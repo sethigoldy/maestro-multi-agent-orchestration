@@ -6,6 +6,17 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Maestro tasks can show in Codex's subagent panel.** Codex lists a thread in its subagent panel only when Codex started it with its `spawn_agent` tool, and Maestro runs Codex tasks with `codex exec`, so they appeared as separate sessions, if at all. `maestro skill install` (and so `install.sh`) now also writes a Codex custom agent, `maestro_worker`, to `~/.codex/agents/maestro-worker.toml`, and adds a Codex-only section to the `~/.codex/AGENTS.md` block. The section tells Codex to spawn one `maestro_worker` for each Maestro task. The worker runs `maestro delegate`, waits, answers follow-ups with `maestro task continue` and passed-on answers with `maestro task answer`, and reports the task id, state, run directory and branch. It never writes code, never spawns another agent, and stops if `MAESTRO_AGENT_CONTEXT` is set. The panel shows the worker and its `maestro` commands, not the live output of the agent Maestro runs. When `spawn_agent` or `maestro_worker` is not available, Codex uses the CLI as before. Maestro rewrites or removes the file only when it starts with `# Managed by Maestro.`; a file of your own or a symbolic link at that path is left alone. Codex keeps only one agent per name, so when a file of yours or another `maestro_worker` role is already there (any `.toml` file under `~/.codex/agents`, or `[agents.maestro_worker]` in `~/.codex/config.toml`), the install reports an error for Codex and installs the skill without the subagent section. `maestro skill status` shows `subagent_installed` and `subagent_path` for Codex, and `subagent_conflict` when there is a conflict; the installer summary lists the agent. If Maestro's packaged Codex files are missing, only the Codex install fails, and the other agents still get the skill.
+
+### Fixed
+
+- **A queued task's id is returned.** When a workspace was at its `max_parallel` limit, the reply to a delegation had no task id: the A2A task object had `id: null`, the CLI printed `{"queued": true, "reason": …}`, and the MCP `delegate` tool returned the same. So nobody could wait for the task, although the skill told MCP clients to use `task_wait` for it. The A2A reply now carries the id, MCP returns `task_id`, and `maestro delegate` prints `[task] <task-id> — queued: <reason>` and waits for the task to run and end. With `--no-wait` it prints `{"queued": true, "task_id": …, "reason": …}`.
+- **`maestro delegate`, `task continue` and `task answer` stop when the task asks a question.** The skill said they wait until the task completes, fails or needs input, but they went on waiting when the task parked in `input-required`, until someone answered from elsewhere. They now print the `[state] input-required` line with the question and return with exit code 1. `maestro task tail` still follows the task through its questions.
+- **`--target` and `--fallback` work with `--file`.** `maestro delegate --file handoff.toml --target codex` ignored `--target` and `--fallback`, so a handoff without routing parked with the question "which agent?". They now override the file's routing, as `--mode` already did.
+- **The skill no longer says `maestro delegate` prints the task JSON.** It never did; the skill now says to run `maestro task status <task-id>` for `run_dir`, `branch`, `verification` and `error`.
+
 ## [0.16.2] — 2026-09-25
 
 ### Fixed

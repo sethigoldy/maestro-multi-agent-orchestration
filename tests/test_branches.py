@@ -444,7 +444,7 @@ def _capture_post(monkeypatch, result):
         return result
 
     monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
-    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: 0)
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None, **kwargs: 0)
     return captured
 
 
