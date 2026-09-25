@@ -422,7 +422,7 @@ watch → receipt.**
 
 | Tool | What it's for |
 |---|---|
-| **Web console** — `http://127.0.0.1:<port>/` | Full picture: all tasks, live SSE output, costs, per-attempt detail. A "Needs you" strip lists every task waiting for an answer and lets you answer it there (for "which agent?" questions, with a picker of the installed agents). The detail pane has Cancel, Follow-up, Remove worktree and Rename branch. React app served by the daemon itself. |
+| **Web console** — `http://127.0.0.1:<port>/` | Full picture: all tasks, live SSE output, costs, per-attempt detail. A "Needs you" strip lists every task waiting for an answer and lets you answer it there (for "which agent?" questions, with a picker of the installed agents). The detail pane has Cancel, Follow-up, Remove worktree and Rename branch, and tabs for the task's output, its changes (the diff to review), its verification report and its receipt. React app served by the daemon itself. |
 | **`maestro dashboard`** | Terminal full-screen view of the same data. Keys: `j`/down and `k`/up to move, `q`/Esc/Ctrl-C to quit. Pure event-streaming — it never polls. |
 | **`maestro task tail <id>`** | Follow one task's output stream in your terminal. `--all` follows everything. |
 | **`maestro task audit <id>`** | The durable record: every attempt (agent, exit code, duration, usage, error), the final state, and result files. Works after restarts. |
