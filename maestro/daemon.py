@@ -2249,10 +2249,11 @@ class MaestroDaemon:
             verification_command=doc.verification_command or (doc.request if doc.verification == "command" else None),
             budget_hint=doc.budget_hint,
             sensitive=doc.sensitive,
-            max_depth_remaining=max(0, doc.max_depth_remaining - 1),
+            # A follow-up is another turn of the same task, not a nested
+            # delegation, so it neither spends nor checks the depth budget.
+            # The budget limits tasks whose agents delegate further tasks.
+            max_depth_remaining=doc.max_depth_remaining,
         )
-        if followup_doc.max_depth_remaining <= 0:
-            raise ValueError("Max delegation depth exceeded; refusing to nest further")
         # Continuation context: carry the task's composed [[context]] entries
         # forward (follow-up turns must see what earlier turns saw), dropping
         # any stale knowledge entry from an earlier turn; in reuse mode a fresh

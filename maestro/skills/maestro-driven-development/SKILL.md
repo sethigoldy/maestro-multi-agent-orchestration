@@ -236,6 +236,13 @@ You own the final review decision:
 If Maestro cannot be used (CLI missing, daemon fails to start after one
 attempt, or repeated failures):
 
+This fallback is only for a Maestro that cannot run. A request that Maestro
+receives and refuses (a follow-up on a running task, a branch name that
+exists, a budget cap) is not "unavailable": do not switch to doing the work
+yourself. Fix what the message asks for, or report the refusal to the user
+and ask how to continue. Follow-ups have no limit; send as many review
+rounds as a task needs.
+
 1. State clearly that Maestro orchestration is unavailable and why.
 2. Continue with your normal behavior: implement the work directly, following
    the repository's own conventions.

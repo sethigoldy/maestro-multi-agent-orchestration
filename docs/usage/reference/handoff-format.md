@@ -65,7 +65,7 @@ gate fields behaves exactly as before (deterministic verification only). See
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
 | `sensitive` | boolean | `false` | no | When true, the task pauses in `input-required` with an approval question before any agent runs |
-| `max_depth_remaining` | integer | `3` | no | Must be an integer ≥ 0 (booleans, decimals such as `0.5` and strings such as `"2"` are rejected). Refuses nesting at/below 0; each follow-up decrements by one |
+| `max_depth_remaining` | integer | `3` | no | Must be an integer ≥ 0 (booleans, decimals such as `0.5` and strings such as `"2"` are rejected). Refuses a delegation at 0. It limits tasks whose agents delegate further tasks; a follow-up is another turn of the same task and neither spends nor checks it |
 
 ### `[[context]]` (array of tables)
 
