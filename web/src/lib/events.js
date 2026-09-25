@@ -49,6 +49,24 @@ export function loadReceipt(taskId) {
     .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))));
 }
 
+// A task's changes and its last verification report (docs/design-console.md, section 5).
+function getJson(path) {
+  return fetch(withToken(path), { headers: { Accept: "application/json", ...authHeaders() } })
+    .then((res) => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))));
+}
+
+export function loadDiff(taskId) {
+  return getJson(`/tasks/${encodeURIComponent(taskId)}/diff`);
+}
+
+export function loadOutput(taskId) {
+  return getJson(`/tasks/${encodeURIComponent(taskId)}/output`);
+}
+
+export function loadVerification(taskId) {
+  return getJson(`/tasks/${encodeURIComponent(taskId)}/verification`);
+}
+
 export function connectEvents(handlers) {
   const source = new EventSource(withToken("/events"));
   for (const type of ["state", "output", "usage", "branch"]) {

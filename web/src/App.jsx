@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useState } from "react";
-import { loadTasks, connectEvents, normalizeTask } from "./lib/events.js";
+import { loadTasks, connectEvents, normalizeTask, loadOutput } from "./lib/events.js";
 import { rpc } from "./lib/rpc.js";
 import { needsYou } from "./lib/actions.js";
 import TaskCard from "./components/TaskCard.jsx";
@@ -48,6 +48,12 @@ function reducer(state, action) {
       const merged = { ...existing, ...record, transcript: existing.transcript };
       const order = state.order.includes(record.task_id) ? state.order : [record.task_id, ...state.order];
       return { ...state, tasks: { ...state.tasks, [record.task_id]: merged }, order };
+    }
+    case "history": {
+      // Output from before the page was opened; live lines already received win.
+      const existing = state.tasks[action.taskId];
+      if (!existing || (existing.transcript && existing.transcript.length)) return state;
+      return { ...state, tasks: { ...state.tasks, [action.taskId]: { ...existing, transcript: action.lines.slice(-TRANSCRIPT_CAP) } } };
     }
     case "select":
       return { ...state, selected: action.taskId };
@@ -105,11 +111,19 @@ export default function App() {
   }, [state]);
 
   const selectedTask = state.selected ? state.tasks[state.selected] : null;
+
+  // Load the selected task's earlier output once, if nothing has streamed yet.
+  useEffect(() => {
+    if (!state.selected) return;
+    loadOutput(state.selected)
+      .then((body) => dispatch({ type: "history", taskId: state.selected, lines: (body && body.lines) || [] }))
+      .catch(() => {});
+  }, [state.selected]);
   const waiting = needsYou(state.tasks);
 
   return (
     <div>
-      <header style={styles.header}>
+      <header className="mc-header" style={styles.header}>
         <span style={styles.logo}>MAESTRO</span>
         <span style={{ color: "var(--dim)" }}>console</span>
         <span style={{ flex: 1 }} />
@@ -130,8 +144,8 @@ export default function App() {
         onSelect={(taskId) => dispatch({ type: "select", taskId })}
         onDone={refresh}
       />
-      <div style={styles.body}>
-        <aside style={styles.list}>
+      <div className="mc-body" style={styles.body}>
+        <aside className="mc-list" style={styles.list}>
           {!state.loaded && <div style={styles.dim}>loading tasks…</div>}
           {state.loaded && state.order.length === 0 && (
             <div style={styles.dim}>no tasks yet — delegate one from any agent or the CLI</div>
@@ -145,7 +159,7 @@ export default function App() {
             />
           ))}
         </aside>
-        <main style={styles.detail}>
+        <main className="mc-detail" style={styles.detail}>
           {selectedTask ? (
             <DetailPane task={selectedTask} onChanged={refresh} />
           ) : (

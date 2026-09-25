@@ -12,6 +12,15 @@
   body { margin:0; font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;
          background:var(--bg); color:var(--text); }
   #root { display:flex; flex-direction:column; height:100vh; }
+  /* Narrow windows (a phone, a split screen): the task list goes above the
+     detail pane instead of beside it, and the header wraps. */
+  @media (max-width: 760px) {
+    .mc-header { flex-wrap: wrap; }
+    .mc-body { flex-direction: column !important; overflow-y: auto; }
+    .mc-list { width: 100% !important; min-width: 0 !important; max-height: 38vh;
+               border-right: none !important; border-bottom: 1px solid var(--border); }
+    .mc-detail { overflow: visible !important; min-height: 60vh; }
+  }
 </style>
 </head>
 <body>

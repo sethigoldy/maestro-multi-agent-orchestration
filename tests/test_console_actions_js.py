@@ -130,3 +130,16 @@ console.log(JSON.stringify([
 ]));
 """)
     assert json.loads(out) == ["agent not chosen yet", "→ codex", ""]
+
+
+def test_parse_diff_marks_each_line_kind():
+    text = "diff --git a/app.py b/app.py\nindex 1..2 100644\n--- a/app.py\n+++ b/app.py\n@@ -1 +1,3 @@\n x = 1\n+y = 2\n-old\n"
+    out = _run(f"""
+import {{ parseDiff }} from {_import("diff.js")};
+console.log(JSON.stringify(parseDiff({json.dumps(text)})));
+""")
+    kinds = [(line["kind"], line["text"]) for line in json.loads(out)]
+    assert kinds == [
+        ("file", "diff --git a/app.py b/app.py"), ("meta", "index 1..2 100644"), ("meta", "--- a/app.py"),
+        ("meta", "+++ b/app.py"), ("hunk", "@@ -1 +1,3 @@"), ("context", " x = 1"), ("add", "+y = 2"), ("del", "-old"),
+    ]

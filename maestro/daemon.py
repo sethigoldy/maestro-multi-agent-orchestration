@@ -78,6 +78,12 @@ _STATE_BY_PHASE = {
 _ALL_STATES = (STATE_SUBMITTED, STATE_WORKING, STATE_INPUT_REQUIRED, STATE_COMPLETED, STATE_FAILED, STATE_CANCELED)
 
 
+# The most diff text GET /tasks/<id>/diff returns; the rest is cut and marked.
+DIFF_LIMIT_BYTES = 400_000
+# How many of the latest output lines GET /tasks/<id>/output returns.
+OUTPUT_TAIL_LINES = 2000
+
+
 def _duration_text(seconds: int) -> str:
     """A time limit in words: "30 minutes", "1 second", "90 seconds"."""
     if seconds >= 60 and seconds % 60 == 0:
@@ -1688,6 +1694,12 @@ class MaestroDaemon:
             if record is not None:
                 record["base_head"] = base_head  # per-turn evidence baseline for verification
             self.maestro._write_claim(task_id, "task_base_head", base_head)
+            if not ((record or {}).get("start_commit") or self.maestro._claims(task_id).get("task_start_commit")):
+                # The commit the task's first turn started from: the task's
+                # whole diff (the console's Changes view) is measured from here.
+                if record is not None:
+                    record["start_commit"] = base_head
+                self.maestro._write_claim(task_id, "task_start_commit", base_head)
         if doc.verification == "auto":
             suite = _has_python_test_suite(workspace)
             record = self._tasks.get(task_id)
@@ -2132,7 +2144,7 @@ class MaestroDaemon:
         }
         # What a parked task was waiting for (routing vs. a question), and the
         # gate and verification details the status views show.
-        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification", "run_dir", "run_dir_kind"):
+        for key in ("awaiting", "question", "gates", "bounces", "base_head", "python_test_suite", "verification", "run_dir", "run_dir_kind", "start_commit"):
             if runtime.get(key) is not None:
                 record[key] = runtime[key]
         with self._lock:
@@ -2601,6 +2613,63 @@ class MaestroDaemon:
         """Every registered agent (tokens redacted) with its live availability."""
         return [{**spec.to_dict(redact=True), "status": self.registry.status(spec.name)} for spec in self.registry.list()]
 
+    def task_diff(self, task_id: str) -> dict[str, Any]:
+        """The task's changes, for review: its run directory compared with the
+        commit the task started from, so commits the agent made count too.
+
+        Returns the changed files with line counts, the untracked files, and
+        the diff text (at most DIFF_LIMIT_BYTES, with ``truncated`` set when
+        there was more). ``available`` is false, with a reason, when the run
+        directory is gone or git cannot compare it."""
+        record = self._tasks.get(task_id) or self._durable_record(task_id)
+        if record is None:
+            raise KeyError(f"Unknown task reference {task_id!r}")
+        claims = self.maestro._claims(task_id)
+        run_dir = Path(record.get("run_dir") or claims.get("task_run_dir") or record["workspace"])
+        if not run_dir.is_dir():
+            return {"available": False, "run_dir": str(run_dir),
+                    "reason": f"the task's directory {run_dir} does not exist (it was removed or deleted)"}
+        base = record.get("start_commit") or claims.get("task_start_commit") or "HEAD"
+
+        def git(*args: str) -> subprocess.CompletedProcess:
+            return subprocess.run(["git", "-C", str(run_dir), *args], text=True, capture_output=True, errors="replace")
+
+        numstat = git("diff", "--numstat", base)
+        if numstat.returncode != 0:
+            return {"available": False, "run_dir": str(run_dir),
+                    "reason": f"git could not compare {run_dir} with {base}: {(numstat.stderr or numstat.stdout).strip()}"}
+        files = []
+        for line in numstat.stdout.splitlines():
+            added, removed, path = (line.split("\t", 2) + ["", ""])[:3]
+            files.append({"path": path, "added": int(added) if added.isdigit() else None,
+                          "removed": int(removed) if removed.isdigit() else None})
+        untracked = [p for p in git("ls-files", "--others", "--exclude-standard").stdout.splitlines() if p]
+        data = git("diff", base).stdout.encode("utf-8")
+        truncated = len(data) > DIFF_LIMIT_BYTES
+        text = data[:DIFF_LIMIT_BYTES].decode("utf-8", "ignore") if truncated else data.decode("utf-8")
+        return {"available": True, "run_dir": str(run_dir), "base": base, "files": files,
+                "untracked": untracked, "diff": text, "truncated": truncated}
+
+    def task_output(self, task_id: str) -> dict[str, Any]:
+        """The task's latest output lines, read from its agents' log files.
+
+        The live event stream carries output only while it happens, so a
+        console opened later reads the earlier output from here."""
+        if self.current_state(task_id) is None:
+            raise KeyError(f"Unknown task reference {task_id!r}")
+        logs = sorted((self.state_dir / "tasks" / task_id).glob("*.log"), key=lambda path: path.stat().st_mtime)
+        lines: list[str] = []
+        for log in logs:
+            lines.extend(log.read_text(encoding="utf-8", errors="replace").splitlines())
+        return {"lines": lines[-OUTPUT_TAIL_LINES:]}
+
+    def verification_report(self, task_id: str) -> dict[str, Any]:
+        """The text of the task's last verification report, or None."""
+        if self.current_state(task_id) is None:
+            raise KeyError(f"Unknown task reference {task_id!r}")
+        path = self.state_dir / "tasks" / task_id / "verification.txt"
+        return {"report": path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None}
+
     def discovered_agents(self) -> list[dict[str, Any]]:
         """Agent CLIs installed on PATH whose kind is not registered.
 
@@ -2851,6 +2920,13 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                     return
                 self._send_json(200, build_receipt(resolved, daemon.maestro, daemon.state_dir))
                 return
+            for suffix, read in (("/diff", daemon.task_diff), ("/verification", daemon.verification_report), ("/output", daemon.task_output)):
+                if path.startswith("/tasks/") and path.endswith(suffix):
+                    try:
+                        self._send_json(200, read(daemon.resolve(path[len("/tasks/") : -len(suffix)])))
+                    except KeyError as exc:
+                        self._send_json(404, {"error": str(exc.args[0])})
+                    return
             if path == "/events":
                 self._sse(None)  # global stream: every task, never terminates on its own
                 return

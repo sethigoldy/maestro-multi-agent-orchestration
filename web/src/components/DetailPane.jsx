@@ -2,6 +2,9 @@ import React, { useEffect, useRef, useState } from "react";
 import { stateColor } from "../App.jsx";
 import { loadReceipt } from "../lib/events.js";
 import ActionBar from "./ActionBar.jsx";
+import { ChangesPanel, VerificationPanel } from "./ReviewPanels.jsx";
+
+const TABS = ["Output", "Changes", "Verification", "Receipt"];
 
 function Meta({ label, value }) {
   if (value === null || value === undefined || value === "") return null;
@@ -18,6 +21,7 @@ export default function DetailPane({ task, onChanged }) {
   const attempts = task.attempts || [];
   const transcript = task.transcript || [];
   const scrollRef = useRef(null);
+  const [tab, setTab] = useState("Output");
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -84,9 +88,36 @@ export default function DetailPane({ task, onChanged }) {
         </div>
       )}
 
-      <ReceiptPanel taskId={task.task_id} state={task.state} />
+      <div style={{ display: "flex", gap: 4, padding: "6px 16px 0", borderBottom: "1px solid var(--border)" }}>
+        {TABS.map((name) => (
+          <button
+            key={name}
+            onClick={() => setTab(name)}
+            style={{
+              font: "inherit",
+              fontSize: 13,
+              padding: "4px 10px",
+              background: "transparent",
+              border: "none",
+              borderBottom: `2px solid ${tab === name ? "var(--accent)" : "transparent"}`,
+              color: tab === name ? "var(--text)" : "var(--dim)",
+              cursor: "pointer",
+            }}
+          >
+            {name}
+          </button>
+        ))}
+      </div>
 
-      <pre
+      {tab !== "Output" && (
+        <div style={{ flex: 1, overflowY: "auto" }}>
+          {tab === "Changes" && <ChangesPanel taskId={task.task_id} state={task.state} />}
+          {tab === "Verification" && <VerificationPanel taskId={task.task_id} state={task.state} />}
+          {tab === "Receipt" && <ReceiptPanel taskId={task.task_id} state={task.state} />}
+        </div>
+      )}
+
+      {tab === "Output" && <pre
         ref={scrollRef}
         style={{
           flex: 1,
@@ -105,7 +136,7 @@ export default function DetailPane({ task, onChanged }) {
             <div key={index}>{line}</div>
           ))
         )}
-      </pre>
+      </pre>}
     </div>
   );
 }
