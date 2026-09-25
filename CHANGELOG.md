@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-09-25
+
 ### Added
 
 - **A System view in the web console.** A "system" button in the header shows the daemon's version, address, process, uptime and state directory. It lists the registered agents and the agent CLIs installed on PATH, with versions and default models. It shows budget spend against `MAESTRO_BUDGET_*_USD` today and per agent, and for each workspace its task counts, its `max_parallel` limit, its default agent, model and effort, and its verification time limit. A workspace with no default agent says that its tasks will ask which agent to use. The daemon serves its part as `GET /system`.

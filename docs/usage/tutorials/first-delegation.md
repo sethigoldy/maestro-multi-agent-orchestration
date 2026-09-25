@@ -40,7 +40,7 @@ maestro --version
 You will see:
 
 ```text
-0.15.1
+0.16.0
 ```
 
 If you do not see a version number, your virtual environment is not active —
