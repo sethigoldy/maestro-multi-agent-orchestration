@@ -185,9 +185,14 @@ What to expect:
 - If Codex has no `spawn_agent` tool, or does not list `maestro_worker`, Codex
   runs `maestro delegate` itself, as before.
 - Maestro rewrites or removes `~/.codex/agents/maestro-worker.toml` only when
-  the file starts with the line `# Managed by Maestro.`. If you put a file of
-  your own at that path, `maestro skill install` reports an error for Codex and
-  leaves your file alone.
+  the file starts with the line `# Managed by Maestro.`. A file of your own at
+  that path, or a symbolic link there, is left alone.
+- Codex keeps only one agent per name. If a file of yours, or another
+  `maestro_worker` role (in any `.toml` file under `~/.codex/agents`, or as
+  `[agents.maestro_worker]` in `~/.codex/config.toml`), is already there,
+  `maestro skill install` reports an error for Codex. It still installs the
+  skill, but without the subagent section, so Codex runs `maestro delegate`
+  itself. `maestro skill status` shows the reason as `subagent_conflict`.
 
 `maestro skill status` reports the file as `subagent_installed` and
 `subagent_path` in the Codex entry. `maestro skill uninstall --agent codex`

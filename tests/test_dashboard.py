@@ -553,11 +553,50 @@ def test_cli_delegate_queued_behind_active(live_daemon, tmp_path, monkeypatch):
         # (A task with a branch would run in a worktree of its own instead.)
         handoff = tmp_path / "h.toml"
         handoff.write_text('[handoff]\ntitle = "T2"\nrequest = "R2"\n[expectations]\ncommit_policy = "no-commit"\n', encoding="utf-8")
-        code = clic.main(["delegate", "--file", str(handoff), "--target", "codex", "--workspace", str(ws)])
+        code = clic.main(["delegate", "--file", str(handoff), "--target", "codex", "--workspace", str(ws), "--no-wait"])
         payload = json.loads(str(captured.get("out") or "{}"))
         assert code == 0 and payload["queued"] is True
+        # The id lets the caller follow the task once it starts.
+        assert payload["task_id"] and live_daemon.status_a2a(payload["task_id"])["metadata"]["queued"] is True
+        live_daemon.wait(payload["task_id"], timeout=60)
     finally:
         live_daemon.wait(started["task_id"], timeout=60)
+
+
+def test_cli_delegate_waits_for_a_queued_task_to_run_and_finish(live_daemon, tmp_path, monkeypatch, capsys):
+    """Before this, a queued delegate returned at once without the task id, so nobody could follow the task."""
+    from maestro import cli as clic
+
+    bp = tmp_path / "bin"
+    bp.mkdir()
+    _fake_bin(bp, "codex", 'sleep 0.4\ncat > /dev/null\nexit 0')
+    monkeypatch.setenv("PATH", f"{bp}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", f"http://127.0.0.1:{live_daemon.port}")
+
+    ws = _git_repo(tmp_path)
+    started = live_daemon.delegate(_doc(), ws)  # holds the workspace slot
+    try:
+        handoff = tmp_path / "h.toml"
+        handoff.write_text('[handoff]\ntitle = "T2"\nrequest = "R2"\n[expectations]\ncommit_policy = "no-commit"\n', encoding="utf-8")
+        code = clic.main(["delegate", "--file", str(handoff), "--target", "codex", "--workspace", str(ws)])
+        out = capsys.readouterr().out
+        assert "— queued:" in out and "[state] completed" in out
+        assert code == 0
+    finally:
+        live_daemon.wait(started["task_id"], timeout=60)
+
+
+def test_cli_delegate_stops_when_the_task_asks_a_question(live_daemon, tmp_path, monkeypatch, capsys):
+    """The skill says delegate blocks until the task finishes, fails or needs input; it used to keep waiting on a question."""
+    from maestro import cli as clic
+
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", f"http://127.0.0.1:{live_daemon.port}")
+    ws = _git_repo(tmp_path)
+    # No target agent and no [defaults]: the task parks with a routing question.
+    code = clic.main(["delegate", "--title", "T", "--request", "R", "--workspace", str(ws)])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[state] input-required" in out and "question:" in out
 
 
 def test_cli_delegate_design_file(live_daemon, tmp_path, monkeypatch):

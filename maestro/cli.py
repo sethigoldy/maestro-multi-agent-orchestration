@@ -176,7 +176,16 @@ def _sse_events(url: str, path: str, token: str | None = None):
     yield from sse_events(url, path, token=token)
 
 
-def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int:
+def _current_task_state(url: str, task_id: str, token: str | None) -> str | None:
+    """Ask the daemon for a task's state now; None when it cannot say."""
+    try:
+        result = _post_jsonrpc(url, "tasks/get", {"id": task_id}, token=token)
+    except ValueError:
+        return None
+    return (((result or {}).get("task") or {}).get("status") or {}).get("state")
+
+
+def _stream_task(url: str, task_id: str | None, token: str | None = None, *, stop_when_parked: bool = False) -> int:
     """Follow one task (or the global stream when task_id is None) live.
 
     When the daemon drops this reader for falling too far behind, the stream
@@ -184,6 +193,13 @@ def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int
     output lines may be missing. A task stream that ends without a final
     state asks the daemon for the task's state (see
     :func:`maestro.a2a_client.follow_task_events`).
+
+    With ``stop_when_parked`` (delegate, continue, answer), following also
+    stops when the task starts waiting for an answer, as the skill documents:
+    the caller has to answer before the task can go on. The stream replays
+    earlier events, so a replayed ``input-required`` from before an answer is
+    checked against the task's current state and ignored when the task has
+    resumed.
     """
     from .a2a_client import follow_events, follow_task_events
 
@@ -205,6 +221,13 @@ def _stream_task(url: str, task_id: str | None, token: str | None = None) -> int
                 note += f" (question: {data['question']})" if data.get("question") else ""
                 print(f"[state] {state}{note}", flush=True)
                 final_state = state
+                if (
+                    stop_when_parked
+                    and task_id is not None
+                    and state == "input-required"
+                    and _current_task_state(url, task_id, token) == "input-required"
+                ):
+                    break
             elif event == "usage":
                 print(f"[usage] {json.dumps(data, ensure_ascii=False)}", flush=True)
     except KeyboardInterrupt:
@@ -261,6 +284,13 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
         doc = load_handoff_file(args.file)
         if args.mode:
             doc.mode = args.mode  # --mode overrides any mode named in the file
+        if args.target:
+            # --target overrides the file's target, as --mode does its mode, and
+            # counts as an explicit choice so the task does not ask which agent.
+            doc.target_agent = args.target
+            doc.explicit_target = True
+        if args.fallback:
+            doc.fallback = list(args.fallback)
     else:
         if not (args.title and args.request):
             raise ValueError("provide --file or --title/--request (plus --target or --mode unless [defaults] in .maestro/config.toml names the agent)")
@@ -306,16 +336,22 @@ def _cmd_delegate(args: argparse.Namespace) -> int:
     }}, token=token)
     task = (result or {}).get("task") or {}
     task_id = task.get("id")
-    if not task_id:  # queued: the daemon says why
-        reason = (task.get("metadata") or {}).get("reason") or "the task is waiting for a place to run"
-        print(json.dumps({"queued": True, "reason": reason}, indent=2))
-        return 0
+    metadata = task.get("metadata") or {}
+    if metadata.get("queued") or not task_id:  # the task waits for a place to run; the daemon says why
+        reason = metadata.get("reason") or "the task is waiting for a place to run"
+        if not task_id or args.no_wait:
+            # Older daemons do not return a queued task's id, so there is nothing to follow.
+            print(json.dumps({"queued": True, "task_id": task_id, "reason": reason}, indent=2))
+            return 0
+        # The task starts when a place frees; following it waits for that too.
+        print(f"[task] {task_id} — queued: {reason}", flush=True)
+        return _stream_task(url, task_id, token=token, stop_when_parked=True)
     if args.no_wait:
         print(json.dumps(result, indent=2))
         return 0
     routing = f"mode={doc.mode}" if doc.mode else f"target={doc.target_agent}"
     print(f"[task] {task_id} — {routing} workspace={workspace}", flush=True)
-    return _stream_task(url, task_id, token=token)
+    return _stream_task(url, task_id, token=token, stop_when_parked=True)
 
 
 def _cmd_task_audit(args: argparse.Namespace) -> int:
@@ -420,7 +456,7 @@ def _cmd_task_continue(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0
     print(f"[task] {task_id} — continuation (context={args.context}) resuming", flush=True)
-    return _stream_task(url, task_id, token=token)
+    return _stream_task(url, task_id, token=token, stop_when_parked=True)
 
 
 def _cmd_task_answer(args: argparse.Namespace) -> int:
@@ -435,7 +471,7 @@ def _cmd_task_answer(args: argparse.Namespace) -> int:
         print(json.dumps(result, indent=2))
         return 0
     print(f"[task] {task_id} — answered, resuming", flush=True)
-    return _stream_task(url, task_id, token=token)
+    return _stream_task(url, task_id, token=token, stop_when_parked=True)
 
 
 def _cmd_task_cancel(args: argparse.Namespace) -> int:

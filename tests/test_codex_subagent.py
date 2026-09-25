@@ -245,3 +245,148 @@ def test_cli_install_and_uninstall_manage_the_agent_file(tmp_path, monkeypatch, 
 
     assert cli.main(["skill", "uninstall", "--agent", "codex"]) == 0
     assert not _agent_path(home).exists()
+
+
+# --------------------------------------------------- the worker's CLI commands
+
+def _worker_instructions() -> str:
+    return tomllib.loads(codex_agent_source().read_text(encoding="utf-8"))["developer_instructions"]
+
+
+_PLACEHOLDERS = {
+    '"<title>"': '"T"', '"<request>"': '"R"', '"<instruction>"': '"fix it"',
+    "<absolute path>": "/ws", "<task-id>": "task-1", "<answer>": "codex", "<path>": "h.toml",
+}
+
+
+def _worker_commands() -> list[str]:
+    """Every `maestro ...` command the worker is told to run, with sample values."""
+    text = _worker_instructions()
+    commands = re.findall(r"`(maestro [^`]+)`", text)
+    commands += [line.strip() for line in text.splitlines() if line.strip().startswith("maestro delegate --")]
+    out = []
+    for command in commands:
+        for placeholder, value in _PLACEHOLDERS.items():
+            command = command.replace(placeholder, value)
+        out.append(command)
+    return sorted(set(out))
+
+
+@pytest.mark.parametrize("command", _worker_commands())
+def test_every_command_the_worker_runs_is_accepted_by_the_cli(command):
+    """The worker's instructions restate CLI commands; this fails when the CLI changes under them."""
+    import shlex
+
+    assert "<" not in command, f"unreplaced placeholder in {command!r}"
+    argv = shlex.split(command)[1:]
+    try:
+        cli.build_parser().parse_args(argv)
+    except SystemExit as exc:  # argparse rejects unknown commands and flags this way
+        pytest.fail(f"the CLI rejects {command!r} (exit {exc.code})")
+
+
+def test_every_delegate_flag_the_worker_names_exists():
+    parser = next(
+        action for action in cli.build_parser()._actions if action.__class__.__name__ == "_SubParsersAction"
+    ).choices["delegate"]
+    known = {option for action in parser._actions for option in action.option_strings}
+    named = set(re.findall(r"`(--[a-z-]+)", _worker_instructions()))
+    assert named and named <= known, named - known
+
+
+def test_the_worker_covers_queued_and_parked_tasks():
+    text = _worker_instructions()
+    assert "— queued: <reason>" in text  # the line cli.py prints for a queued task
+    assert "maestro task status <task-id>" in text  # delegate does not print run_dir or branch
+    assert "maestro task tail <task-id>" in text  # how to go on waiting after the command stopped
+    assert "3600000" not in text  # no fixed one-hour limit
+
+
+# ------------------------------------------------ files that are not Maestro's
+
+def test_a_symlink_at_the_agent_path_is_never_written_through(tmp_path):
+    home = tmp_path / "home"
+    target = tmp_path / "dotfiles" / "missing.toml"  # a broken link
+    _agent_path(home).parent.mkdir(parents=True)
+    _agent_path(home).symlink_to(target)
+    result = _codex().install_skill(home, CONTENT)
+    assert result.ok is False and "Maestro did not write" in result.detail
+    assert not target.exists() and _agent_path(home).is_symlink()
+
+
+@pytest.mark.parametrize("where", ["agents-dir", "agents-subdir"])
+def test_another_role_named_maestro_worker_blocks_the_subagent(tmp_path, where):
+    home = tmp_path / "home"
+    _codex().install_skill(home, CONTENT)  # an earlier install left Maestro's copy
+    other = home / ".codex" / "agents" / ("mine.toml" if where == "agents-dir" else "team/mine.toml")
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text('name = "maestro_worker"\ndescription = "mine"\ndeveloper_instructions = "mine"\n', encoding="utf-8")
+
+    result = _codex().install_skill(home, CONTENT)
+    assert result.ok is False and result.action == "error"
+    assert f"{other} already defines a Codex agent named maestro_worker" in result.detail
+    assert "installed without the maestro_worker subagent" in result.detail
+    # The skill itself is installed, without the section that would send Codex to the user's agent.
+    agents_md = (home / ".codex" / "AGENTS.md").read_text(encoding="utf-8")
+    assert "# Maestro-Driven Development" in agents_md and "## Codex: run each Maestro task" not in agents_md
+    assert not _agent_path(home).exists()  # Maestro's earlier copy would duplicate the role
+    assert other.is_file()
+    status = _codex().status(home)
+    assert status["subagent_installed"] is False and "already defines" in status["subagent_conflict"]
+
+
+def test_a_role_declared_in_config_toml_blocks_the_subagent(tmp_path):
+    home = tmp_path / "home"
+    config = home / ".codex" / "config.toml"
+    config.parent.mkdir(parents=True)
+    config.write_text('model = "x"\n[agents.maestro_worker]\ndescription = "mine"\n', encoding="utf-8")
+    result = _codex().install_skill(home, CONTENT)
+    assert result.ok is False and f"{config} already declares [agents.maestro_worker]" in result.detail
+    assert not _agent_path(home).exists()
+
+
+@pytest.mark.parametrize(
+    "name, content",
+    [
+        ("other.toml", b'name = "reviewer"\ndescription = "d"\ndeveloper_instructions = "i"\n'),
+        ("broken.toml", b"name = = \n"),
+        ("binary.toml", b"\xff\xfe"),
+        ("notes.md", b'name = "maestro_worker"\n'),  # Codex reads only .toml files
+    ],
+)
+def test_unrelated_or_unreadable_files_do_not_block_the_subagent(tmp_path, name, content):
+    home = tmp_path / "home"
+    other = home / ".codex" / "agents" / name
+    other.parent.mkdir(parents=True)
+    other.write_bytes(content)
+    (home / ".codex" / "config.toml").write_bytes(b"\xff not toml")
+    result = _codex().install_skill(home, CONTENT)
+    assert result.ok and _agent_path(home).is_file()
+    assert "subagent_conflict" not in _codex().status(home)
+
+
+def test_a_conflict_reports_a_failure_to_remove_the_earlier_copy(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    _codex().install_skill(home, CONTENT)
+    (home / ".codex" / "config.toml").write_text("[agents.maestro_worker]\n", encoding="utf-8")
+    agent_path = _agent_path(home)
+    real_unlink = Path.unlink
+
+    def guarded_unlink(self, *args, **kwargs):
+        if self == agent_path:
+            raise OSError("read-only")
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", guarded_unlink)
+    result = _codex().install_skill(home, CONTENT)
+    assert result.ok is False and "already declares" in result.detail and "read-only" in result.detail
+
+
+def test_missing_packaged_files_fail_codex_only(tmp_path, monkeypatch):
+    """A broken Maestro install must not stop the skill install for the other agents."""
+    home = tmp_path / "home"
+    monkeypatch.setattr(integrations, "codex_subagents_source", lambda: tmp_path / "missing.md")
+    results = {r.kind: r for r in SkillManager(home=home).install(all_agents=True)}
+    assert results["codex"].ok is False and "reinstall Maestro" in results["codex"].detail
+    assert not (home / ".codex" / "AGENTS.md").exists()
+    assert results["claude_code"].ok and results["cursor"].ok

@@ -153,7 +153,7 @@ def _delegate_capture(monkeypatch):
         return {"task": {"id": "task-x"}}
 
     monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
-    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None: 0)
+    monkeypatch.setattr(cli, "_stream_task", lambda url, task_id, token=None, **kwargs: 0)
     return captured
 
 
@@ -187,6 +187,21 @@ def test_delegate_mode_overrides_file_mode(monkeypatch, tmp_path):
     assert data["routing"]["mode"] == "economy"
 
 
+def test_delegate_target_and_fallback_override_the_file(monkeypatch, tmp_path):
+    """--target used to be ignored with --file, so the task asked which agent to use."""
+    monkeypatch.chdir(tmp_path)
+    handoff = tmp_path / "h.toml"
+    handoff.write_text('[handoff]\ntitle = "T"\nrequest = "R"\n', encoding="utf-8")
+    captured = _delegate_capture(monkeypatch)
+    rc = cli.main(["delegate", "--file", str(handoff), "--target", "claude_code", "--fallback", "codex"])
+    assert rc == 0
+    from maestro.handoff import from_dict
+
+    doc = from_dict(captured["payload"]["message"]["parts"][0]["data"])
+    assert doc.target_agent == "claude_code" and doc.explicit_target is True
+    assert doc.fallback == ["codex"]
+
+
 def test_delegate_mode_requires_title_and_request(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     _delegate_capture(monkeypatch)
@@ -203,8 +218,9 @@ def _followup_capture(monkeypatch, result=None, stream_rc=0):
         captured["payload"] = payload
         return result if result is not None else {"task": {"id": "task-c"}}
 
-    def fake_stream(url, task_id, token=None):
+    def fake_stream(url, task_id, token=None, stop_when_parked=False):
         captured["streamed"] = task_id
+        captured["stop_when_parked"] = stop_when_parked
         return stream_rc
 
     monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
@@ -260,8 +276,9 @@ def _rpc_capture(monkeypatch, result):
         captured["payload"] = payload
         return result
 
-    def fake_stream(url, task_id, token=None):
+    def fake_stream(url, task_id, token=None, stop_when_parked=False):
         captured["streamed"] = task_id
+        captured["stop_when_parked"] = stop_when_parked
         return 0
 
     monkeypatch.setattr(cli, "_post_jsonrpc", fake_post)
@@ -277,6 +294,7 @@ def test_task_answer_posts_answer_and_streams_the_resumed_task(monkeypatch, tmp_
     assert captured["method"] == "tasks/answer"
     assert captured["payload"] == {"id": "task-p", "answer": "codex"}
     assert captured.get("streamed") == "task-p"
+    assert captured["stop_when_parked"] is True  # a new question ends the wait
     assert "[task] task-p — answered, resuming" in capsys.readouterr().out
 
 
@@ -419,7 +437,39 @@ def test_delegate_prints_why_a_task_is_queued(monkeypatch, tmp_path, capsys):
     rc = cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
-    assert out == {"queued": True, "reason": reason}
+    # An older daemon returns no id for a queued task, so there is nothing to follow.
+    assert out == {"queued": True, "task_id": None, "reason": reason}
+
+
+def _queued_capture(monkeypatch, reason):
+    captured = {}
+    monkeypatch.setenv("MAESTRO_DAEMON_URL", "http://127.0.0.1:9")
+    monkeypatch.setattr(cli, "_post_jsonrpc", lambda url, method, payload, token=None: {
+        "task": {"kind": "task", "id": "task-q", "status": {"state": "submitted"}, "metadata": {"queued": True, "reason": reason, "run_dir": "/ws"}},
+    })
+
+    def fake_stream(url, task_id, token=None, stop_when_parked=False):
+        captured["streamed"] = (task_id, stop_when_parked)
+        return 0
+
+    monkeypatch.setattr(cli, "_stream_task", fake_stream)
+    return captured
+
+
+def test_delegate_follows_a_queued_task_until_it_finishes(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _queued_capture(monkeypatch, "the workspace is at its limit")
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex"]) == 0
+    assert captured["streamed"] == ("task-q", True)
+    assert "[task] task-q — queued: the workspace is at its limit" in capsys.readouterr().out
+
+
+def test_delegate_no_wait_prints_the_queued_task_id(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    captured = _queued_capture(monkeypatch, "busy")
+    assert cli.main(["delegate", "--title", "T", "--request", "R", "--target", "codex", "--no-wait"]) == 0
+    assert "streamed" not in captured
+    assert json.loads(capsys.readouterr().out) == {"queued": True, "task_id": "task-q", "reason": "busy"}
 
 
 def test_audit_reports_run_dir(monkeypatch, tmp_path, capsys):
@@ -445,3 +495,47 @@ def test_task_cleanup_posts_cleanup(monkeypatch, tmp_path, capsys):
     assert captured["method"] == "tasks/cleanup"
     assert captured["payload"] == {"id": "t", "force": True}
     assert json.loads(capsys.readouterr().out)["cleanup"]["removed"] is True
+
+
+def _fake_task_events(monkeypatch, events):
+    import maestro.a2a_client as a2a_client
+
+    monkeypatch.setattr(
+        a2a_client, "follow_task_events",
+        lambda url, task_id, token=None, stream=None: iter([(name, {"data": data}) for name, data in events]),
+    )
+
+
+def test_stream_stops_when_the_task_asks_a_question(monkeypatch, capsys):
+    _fake_task_events(monkeypatch, [("state", {"state": "working"}), ("state", {"state": "input-required", "question": "which agent?"}), ("output", {"line": "never printed"})])
+    monkeypatch.setattr(cli, "_post_jsonrpc", lambda url, method, payload, token=None: {"task": {"status": {"state": "input-required"}}})
+    assert cli._stream_task("http://x", "task-1", stop_when_parked=True) == 1
+    out = capsys.readouterr().out
+    assert "[state] input-required (question: which agent?)" in out and "never printed" not in out
+
+
+def test_stream_ignores_a_replayed_question_the_task_has_moved_past(monkeypatch, capsys):
+    """After `task answer`, the stream replays the old input-required event; the task is working again."""
+    _fake_task_events(monkeypatch, [("state", {"state": "input-required"}), ("state", {"state": "working"}), ("state", {"state": "completed"})])
+    monkeypatch.setattr(cli, "_post_jsonrpc", lambda url, method, payload, token=None: {"task": {"status": {"state": "working"}}})
+    assert cli._stream_task("http://x", "task-1", stop_when_parked=True) == 0
+    assert "[state] completed" in capsys.readouterr().out
+
+
+def test_stream_keeps_following_when_the_daemon_cannot_say_the_state(monkeypatch, capsys):
+    _fake_task_events(monkeypatch, [("state", {"state": "input-required"}), ("state", {"state": "completed"})])
+
+    def unreachable(url, method, payload, token=None):
+        raise ValueError("cannot reach A2A endpoint")
+
+    monkeypatch.setattr(cli, "_post_jsonrpc", unreachable)
+    assert cli._current_task_state("http://x", "task-1", None) is None
+    assert cli._stream_task("http://x", "task-1", stop_when_parked=True) == 0
+
+
+def test_tail_follows_a_task_through_its_questions(monkeypatch, capsys):
+    _fake_task_events(monkeypatch, [("state", {"state": "input-required"}), ("state", {"state": "completed"})])
+    asked = []
+    monkeypatch.setattr(cli, "_post_jsonrpc", lambda *a, **k: asked.append(a))
+    assert cli._stream_task("http://x", "task-1") == 0
+    assert asked == []  # tail does not ask for the state; it follows the task through its questions

@@ -145,7 +145,9 @@ today's behaviour exactly.
 - **The result of delegating** says where the task runs. It says "queued" only
   when the limit is reached, or when a `no-commit` task or a task whose run
   directory is the workspace has to wait for the workspace. The CLI and MCP
-  messages name which of these applies.
+  messages name which of these applies, and include the queued task's id. The
+  CLI `delegate` then waits for the queued task to run and end; with
+  `--no-wait`, and in MCP, the caller waits later with the id (`task_wait`).
 - **`rename-branch`** keeps working. Git allows renaming a branch that is checked
   out in a worktree.
 

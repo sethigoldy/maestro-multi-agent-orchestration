@@ -189,7 +189,7 @@ class A2ADispatcher:
         except (ValueError, KeyError) as exc:
             return jsonrpc_error(request_id, ERR_INVALID_PARAMS, str(exc))
         if result.get("queued"):
-            task_obj = {"kind": "task", "id": None, "status": {"state": STATE_SUBMITTED, "timestamp": result["ts"]}, "metadata": {"queued": True, "reason": result.get("reason"), "run_dir": result.get("run_dir")}}
+            task_obj = {"kind": "task", "id": result.get("task_id"), "status": {"state": STATE_SUBMITTED, "timestamp": result["ts"]}, "metadata": {"queued": True, "reason": result.get("reason"), "run_dir": result.get("run_dir")}}
         else:
             task_obj = self.daemon.status_a2a(str(result["task_id"]))
         return jsonrpc_ok(request_id, {"task": task_obj})

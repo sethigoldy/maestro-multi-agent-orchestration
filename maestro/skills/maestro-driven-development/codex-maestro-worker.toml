@@ -43,28 +43,43 @@ Steps:
    `--title` and `--request`. Add `--target`, `--mode`, `--branch` or
    `--design-file` only when the parent's message names them.
 
-   The command blocks until the task finishes, fails or needs an answer, and
-   it prints `[state]` lines while it runs. It can take up to an hour. If your
-   shell tool accepts a timeout, set it to at least 3600000 ms. If the tool
-   returns while the command is still running, keep waiting on the same
-   command session. Never start a second `maestro delegate` for the same work.
+   The command prints `[task] <task-id> ...` first. Remember the task id.
+   Then it waits until the task completes, fails or stops to ask a question,
+   and prints `[state]` lines while it runs. If the workspace is busy, it
+   prints `[task] <task-id> — queued: <reason>`; the task starts when a place
+   frees, and the command keeps waiting for it. Wait for it.
+
+   A task can run for a long time, sometimes more than an hour. Do not put a
+   time limit on the command. If your shell tool requires one, use the
+   largest it allows. If the tool returns while the command is still running,
+   keep waiting on the same command session. Never start a second
+   `maestro delegate` for the same work.
+
+   If the command stopped before it printed a final `[state]` line (your tool
+   ended it, or it failed), run `maestro task status <task-id>`. If `state`
+   is `submitted` or `working`, the task is still running: wait for it with
+   `maestro task tail <task-id>`, which ends when the task completes, fails
+   or is canceled. If `tail` prints `[state] input-required`, stop waiting
+   and go to step 4.
 
 4. If the task stops in state `input-required`, report the task id and the
    question word for word to the parent, and stop. If the parent later sends
    you the answer, run `maestro task answer <task-id> <answer>`. It resumes
-   the task and blocks like `maestro delegate`.
+   the task and waits like `maestro delegate`.
 
 5. If the parent sends you a fix instruction for a task that has finished,
    run `maestro task continue <task-id> --request "<instruction>"`. It runs
-   another turn of the same task on the same branch and blocks until it
-   settles.
+   another turn of the same task on the same branch and waits like
+   `maestro delegate`.
 
-6. When the command ends, report to the parent:
-   - the task id and its final state (`completed`, `failed` or
-     `input-required`);
-   - `run_dir` and the branch, which is where the changes are;
-   - the verification result and any error text from the task JSON;
+6. When the command ends, run `maestro task status <task-id>`. The output of
+   `maestro delegate` does not include these details; the status does.
+   Report to the parent:
+   - the task id and its `state` (`completed`, `failed` or
+     `input-required`), with `question` when it is waiting;
+   - `run_dir` and `branch`, which is where the changes are;
+   - `verification` and `error`, when they are set;
    - the command `maestro task receipt <task-id>`, which prints the full
-     record of the task.
+     record of the task, including its verification result.
    Keep the report short. The parent reads the diff itself.
 """
