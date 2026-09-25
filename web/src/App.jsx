@@ -6,6 +6,7 @@ import { rpc } from "./lib/rpc.js";
 import { needsYou } from "./lib/actions.js";
 import DetailPane from "./components/DetailPane.jsx";
 import NeedsYou from "./components/NeedsYou.jsx";
+import SystemView from "./components/SystemView.jsx";
 
 const TRANSCRIPT_CAP = 2000;
 
@@ -71,6 +72,7 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState([]);
   const [filters, setFilters] = useState(() => readSetting("maestro_filters", {}));
   const [notify, setNotify] = useState(() => readSetting("maestro_notify", false));
+  const [showSystem, setShowSystem] = useState(false);
   // The latest state and settings, for the event handlers set up once below.
   const latest = useRef({ state, notify });
   latest.current = { state, notify };
@@ -161,6 +163,13 @@ export default function App() {
           </span>
         ))}
         <button
+          onClick={() => setShowSystem(!showSystem)}
+          title="The daemon, its agents, budget spend and each workspace's config"
+          style={{ font: "inherit", fontSize: 12, padding: "2px 8px", borderRadius: 10, background: "transparent", cursor: "pointer", border: `1px solid ${showSystem ? "var(--accent)" : "var(--border)"}`, color: showSystem ? "var(--text)" : "var(--dim)" }}
+        >
+          system
+        </button>
+        <button
           onClick={toggleNotify}
           title="Show a browser notification when a task needs you, completes or fails"
           style={{ font: "inherit", fontSize: 12, padding: "2px 8px", borderRadius: 10, background: "transparent", cursor: "pointer", border: `1px solid ${notify ? "var(--accent)" : "var(--border)"}`, color: notify ? "var(--text)" : "var(--dim)" }}
@@ -187,12 +196,17 @@ export default function App() {
             filters={filters}
             setFilters={setFilters}
             selected={state.selected}
-            onSelect={(taskId) => dispatch({ type: "select", taskId })}
+            onSelect={(taskId) => {
+              setShowSystem(false);
+              dispatch({ type: "select", taskId });
+            }}
             loaded={state.loaded}
           />
         </aside>
         <main className="mc-detail" style={styles.detail}>
-          {selectedTask ? (
+          {showSystem ? (
+            <SystemView agents={agents.agents} discovered={agents.discovered} workspaces={workspaces} />
+          ) : selectedTask ? (
             <DetailPane task={selectedTask} onChanged={refresh} />
           ) : (
             <div style={{ ...styles.dim, padding: 24 }}>select a task</div>

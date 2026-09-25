@@ -8,6 +8,8 @@ semantic versioning.
 
 ### Added
 
+- **A System view in the web console.** A "system" button in the header shows the daemon's version, address, process, uptime and state directory. It lists the registered agents and the agent CLIs installed on PATH, with versions and default models. It shows budget spend against `MAESTRO_BUDGET_*_USD` today and per agent, and for each workspace its task counts, its `max_parallel` limit, its default agent, model and effort, and its verification time limit. A workspace with no default agent says that its tasks will ask which agent to use. The daemon serves its part as `GET /system`.
+
 - **Find what needs you in the web console.** The task list has a search box (title, task id or workspace), views (All, Needs you, Running, Queued, Finished), an agent filter, and grouping by workspace. Each workspace heading shows how much of its `max_parallel` limit is in use and how many tasks are queued. A queued task's card says why it waits. Tasks are listed newest first. A "notifications" switch in the header shows a browser notification when a task starts waiting for an answer, completes or fails; it is off until you turn it on. The console remembers the filters and the switch in this browser. The daemon serves the workspace figures as `GET /workspaces`, with each workspace's running, queued, parked and finished counts, its `max_parallel`, and the effective `[defaults]` and verification time limit its next task would get.
 
 - **Review a task's work in the web console.** The detail pane has tabs: Output, Changes, Verification and Receipt. Changes shows the task's run directory compared with the commit the task started from, so commits the agent made count too: the changed files with added and removed line counts, new files that are not added to git, and the coloured diff. Verification shows the last verification report. The daemon serves these as `GET /tasks/<id>/diff` (at most 400 KB of diff text, with `truncated: true` when there is more; `available: false` with a reason when the directory is gone or git cannot compare it) and `GET /tasks/<id>/verification`. It records the commit a task started from on its first turn (`task_start_commit`).
@@ -19,6 +21,7 @@ semantic versioning.
 
 ### Fixed
 
+- **A task that a daemon restart failed is no longer reported as queued.** The daemon fails tasks that were still queued when it restarts, but their saved record kept `queued: true`, so the console listed them under Queued and counted them in each workspace's queue. A task is now reported as queued only while it is still waiting to start.
 - **A new task branch is announced.** The daemon published a `branch` event only when a task's branch was renamed, so the console and the terminal dashboard learned a new task's branch only on their next full reload. It now also publishes one when the branch is first created.
 - **The console's receipt updates when the task's state changes.** It loaded once, when a task was selected, and kept showing "Final: WORKING" after the task finished or was canceled.
 

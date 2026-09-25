@@ -205,3 +205,15 @@ console.log(JSON.stringify([
     assert got[1] == {"title": "Maestro: task completed", "body": "Fix login completed."}
     assert got[2] == {"title": "Maestro: task failed", "body": "Fix login failed."}
     assert got[3] is None and got[4] is None  # starting to work, or no change, does not notify
+
+
+def test_budget_rows_compare_spend_with_caps():
+    out = _run(f"""
+import {{ budgetRows }} from {_import("overview.js")};
+console.log(JSON.stringify(budgetRows({{ per_agent_usd: 2, daily_usd: 5, spent_today_usd: 5.5, spent_by_agent: {{ codex: 2.5, claude: 0.25 }} }})));
+""")
+    assert json.loads(out) == [
+        {"label": "today, all agents", "spent": "$5.50", "cap": "$5.00", "over": True},
+        {"label": "codex", "spent": "$2.50", "cap": "$2.00", "over": True},
+        {"label": "claude", "spent": "$0.25", "cap": "$2.00", "over": False},
+    ]

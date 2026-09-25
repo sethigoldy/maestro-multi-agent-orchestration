@@ -139,3 +139,17 @@ def test_workspaces_lists_counts_limits_and_effective_config(daemon, tmp_path, b
 def test_workspaces_skips_tasks_without_a_workspace(daemon, monkeypatch):
     monkeypatch.setattr(daemon, "list_tasks", lambda: [{"status": {"state": "completed"}, "metadata": {"workspace": None}}])
     assert daemon.workspaces() == []
+
+
+def test_a_queued_task_failed_by_a_restart_is_no_longer_reported_as_queued(daemon, tmp_path, binpath):
+    gate = tmp_path / "go"
+    _fake_bin(binpath, "codex", f'cat > /dev/null\nwhile [ ! -f "{gate}" ]; do sleep 0.05; done\nexit 0')
+    ws = _repo(tmp_path)
+    try:
+        daemon.delegate(_doc(), ws)
+        waiting = daemon.delegate(_doc(), ws)
+        daemon._tasks[waiting["task_id"]]["state"] = "failed"  # as the startup check leaves a task that was queued
+        meta = daemon.status_a2a(waiting["task_id"])["metadata"]
+        assert meta["queued"] is False and "queue_reason" not in meta
+    finally:
+        gate.touch()

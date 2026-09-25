@@ -53,3 +53,14 @@ export function notificationFor(previousState, task) {
   if (task.state === "failed") return { title: "Maestro: task failed", body: `${name} failed.` };
   return null;
 }
+
+// Budget spend against the caps (MAESTRO_BUDGET_*_USD), one row per cap.
+export function budgetRows(budgets) {
+  const money = (value) => (typeof value === "number" ? `$${value.toFixed(2)}` : "none");
+  const b = budgets || {};
+  const rows = [{ label: "today, all agents", spent: money(b.spent_today_usd || 0), cap: money(b.daily_usd), over: typeof b.daily_usd === "number" && (b.spent_today_usd || 0) >= b.daily_usd }];
+  for (const [agent, spent] of Object.entries(b.spent_by_agent || {})) {
+    rows.push({ label: agent, spent: money(spent), cap: money(b.per_agent_usd), over: typeof b.per_agent_usd === "number" && spent >= b.per_agent_usd });
+  }
+  return rows;
+}
