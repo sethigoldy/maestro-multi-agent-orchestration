@@ -2670,6 +2670,40 @@ class MaestroDaemon:
         path = self.state_dir / "tasks" / task_id / "verification.txt"
         return {"report": path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None}
 
+    def workspaces(self) -> list[dict[str, Any]]:
+        """Every workspace with tasks: how many are running, queued, parked and
+        finished, its max_parallel limit, and the effective config its next
+        task would get (docs/design-console.md, sections 6 and 7)."""
+        counts: dict[str, dict[str, int]] = {}
+        for task in self.list_tasks():
+            meta = task.get("metadata") or {}
+            workspace = meta.get("workspace")
+            if not workspace:
+                continue
+            entry = counts.setdefault(workspace, {"running": 0, "queued": 0, "parked": 0, "finished": 0})
+            state = (task.get("status") or {}).get("state")
+            if meta.get("queued"):
+                entry["queued"] += 1
+            elif state == STATE_INPUT_REQUIRED:
+                entry["parked"] += 1
+            elif state in (STATE_SUBMITTED, STATE_WORKING):
+                entry["running"] += 1
+            else:
+                entry["finished"] += 1
+        out = []
+        for workspace, entry in sorted(counts.items()):
+            config = self._config(workspace)
+            defaults = config.get("defaults") or {}
+            limit = int(defaults.get("max_parallel", 4))
+            out.append({
+                "workspace": workspace, **entry, "max_parallel": limit,
+                "config": {
+                    "agent": defaults.get("agent"), "model": defaults.get("model"), "effort": defaults.get("effort"),
+                    "max_parallel": limit, "verification_timeout_s": config.get("verification_timeout_s", 1800),
+                },
+            })
+        return out
+
     def discovered_agents(self) -> list[dict[str, Any]]:
         """Agent CLIs installed on PATH whose kind is not registered.
 
@@ -2900,6 +2934,9 @@ def _make_handler(daemon: MaestroDaemon) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/tasks":
                 self._send_json(200, {"tasks": daemon.list_tasks()})
+                return
+            if path == "/workspaces":
+                self._send_json(200, {"workspaces": daemon.workspaces()})
                 return
             if path.startswith("/tasks/") and path.endswith("/receipt"):
                 from .receipt import build_receipt

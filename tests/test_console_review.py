@@ -165,3 +165,12 @@ def test_a_run_dir_that_git_cannot_compare_says_why(daemon, tmp_path, binpath):
     shutil.rmtree(ws / ".git")  # the directory is still there, but it is no longer a repository
     diff = daemon.task_diff(started["task_id"])
     assert diff["available"] is False and "git could not compare" in diff["reason"]
+
+
+def test_workspaces_route(daemon, tmp_path, binpath):
+    ws = _repo(tmp_path)
+    started = daemon.delegate(_doc(), ws)
+    daemon.wait(started["task_id"], timeout=60)
+    status, body = _get(daemon, "/workspaces")
+    assert status == 200 and [w["workspace"] for w in body["workspaces"]] == [str(ws)]
+    assert body["workspaces"][0]["finished"] == 1

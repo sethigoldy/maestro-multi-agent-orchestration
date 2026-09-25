@@ -5,7 +5,7 @@ import AnswerForm from "./AnswerForm.jsx";
 export default function NeedsYou({ tasks, agents, discovered, onSelect, onDone }) {
   if (!tasks.length) return null;
   return (
-    <section style={{ borderBottom: "1px solid var(--border)", background: "#1d1a10", padding: "10px 16px" }}>
+    <section style={{ borderBottom: "1px solid var(--border)", background: "#1d1a10", padding: "10px 16px", maxHeight: "40vh", overflowY: "auto", flexShrink: 0 }}>
       <div style={{ color: "var(--warn)", fontSize: 12, marginBottom: 8 }}>
         NEEDS YOU · {tasks.length} task{tasks.length === 1 ? "" : "s"} waiting for an answer
       </div>

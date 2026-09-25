@@ -116,3 +116,26 @@ def test_a_new_task_branch_is_announced_so_the_console_shows_it(daemon, tmp_path
         sub.close()
     assert event is not None and event.data["branch"] == f"maestro/{started['task_id']}"
     assert event.data.get("old_branch") is None
+
+
+def test_workspaces_lists_counts_limits_and_effective_config(daemon, tmp_path, binpath):
+    gate = tmp_path / "go"
+    _fake_bin(binpath, "codex", f'cat > /dev/null\nwhile [ ! -f "{gate}" ]; do sleep 0.05; done\nexit 0')
+    ws = _repo(tmp_path)
+    (ws / ".maestro").mkdir()
+    (ws / ".maestro" / "config.toml").write_text('[defaults]\nagent = "codex"\nmax_parallel = 3\n[verification]\ntimeout_s = 600\n', encoding="utf-8")
+    try:
+        daemon.delegate(_doc(), ws)                     # running in the workspace
+        daemon.delegate(_doc(), ws)                     # no-commit: waits for the workspace
+        daemon.delegate(_doc(sensitive=True, commit_policy="branch"), ws)  # parked for approval, in a worktree
+        (entry,) = [w for w in daemon.workspaces() if w["workspace"] == str(ws)]
+        assert (entry["running"], entry["queued"], entry["parked"]) == (1, 1, 1)
+        assert entry["max_parallel"] == 3
+        assert entry["config"] == {"agent": "codex", "model": None, "effort": None, "max_parallel": 3, "verification_timeout_s": 600}
+    finally:
+        gate.touch()
+
+
+def test_workspaces_skips_tasks_without_a_workspace(daemon, monkeypatch):
+    monkeypatch.setattr(daemon, "list_tasks", lambda: [{"status": {"state": "completed"}, "metadata": {"workspace": None}}])
+    assert daemon.workspaces() == []

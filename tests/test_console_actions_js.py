@@ -143,3 +143,65 @@ console.log(JSON.stringify(parseDiff({json.dumps(text)})));
         ("file", "diff --git a/app.py b/app.py"), ("meta", "index 1..2 100644"), ("meta", "--- a/app.py"),
         ("meta", "+++ b/app.py"), ("hunk", "@@ -1 +1,3 @@"), ("context", " x = 1"), ("add", "+y = 2"), ("del", "-old"),
     ]
+
+
+_TASKS = """{
+  a: { task_id: "task-a", title: "Fix login", state: "working", target_agent: "codex", workspace: "/w1", started_at: "2026-09-25T10:00:00+00:00" },
+  b: { task_id: "task-b", title: "Write docs", state: "input-required", target_agent: "claude", workspace: "/w2", started_at: "2026-09-25T11:00:00+00:00" },
+  c: { task_id: "task-c", title: "Tidy CSS", state: "submitted", queued: true, target_agent: "codex", workspace: "/w1", started_at: "2026-09-25T09:00:00+00:00" },
+  d: { task_id: "task-d", title: "Old work", state: "completed", target_agent: "codex", workspace: "/w1", started_at: "2026-09-24T09:00:00+00:00" },
+}"""
+
+
+def test_filters_search_and_newest_first_order():
+    out = _run(f"""
+import {{ filterTasks }} from {_import("overview.js")};
+const tasks = {_TASKS};
+const ids = (f) => filterTasks(tasks, f).map((t) => t.task_id);
+console.log(JSON.stringify({{
+  all: ids({{}}),
+  needs: ids({{ view: "needs-you" }}),
+  running: ids({{ view: "running" }}),
+  queued: ids({{ view: "queued" }}),
+  done: ids({{ view: "finished" }}),
+  codex: ids({{ agent: "codex" }}),
+  search: ids({{ query: "LOGIN" }}),
+  byId: ids({{ query: "task-d" }}),
+}}));
+""")
+    got = json.loads(out)
+    assert got["all"] == ["task-b", "task-a", "task-c", "task-d"]  # newest first
+    assert got["needs"] == ["task-b"] and got["running"] == ["task-a"] and got["queued"] == ["task-c"] and got["done"] == ["task-d"]
+    assert got["codex"] == ["task-a", "task-c", "task-d"] and got["search"] == ["task-a"] and got["byId"] == ["task-d"]
+
+
+def test_grouping_by_workspace_with_limits():
+    out = _run(f"""
+import {{ filterTasks, groupByWorkspace }} from {_import("overview.js")};
+const tasks = filterTasks({_TASKS}, {{}});
+const workspaces = [{{ workspace: "/w1", running: 1, queued: 1, max_parallel: 4 }}];
+console.log(JSON.stringify(groupByWorkspace(tasks, workspaces).map((g) => [g.workspace, g.label, g.tasks.map((t) => t.task_id)])));
+""")
+    assert json.loads(out) == [
+        ["/w2", "/w2", ["task-b"]],
+        ["/w1", "/w1 · 1 of 4 running · 1 queued", ["task-a", "task-c", "task-d"]],
+    ]
+
+
+def test_which_state_changes_notify():
+    out = _run(f"""
+import {{ notificationFor }} from {_import("overview.js")};
+const t = {{ task_id: "task-a", title: "Fix login" }};
+console.log(JSON.stringify([
+  notificationFor("working", {{ ...t, state: "input-required" }}),
+  notificationFor("working", {{ ...t, state: "completed" }}),
+  notificationFor("working", {{ ...t, state: "failed" }}),
+  notificationFor("submitted", {{ ...t, state: "working" }}),
+  notificationFor("completed", {{ ...t, state: "completed" }}),
+]));
+""")
+    got = json.loads(out)
+    assert got[0] == {"title": "Maestro: a task needs you", "body": "Fix login is waiting for an answer."}
+    assert got[1] == {"title": "Maestro: task completed", "body": "Fix login completed."}
+    assert got[2] == {"title": "Maestro: task failed", "body": "Fix login failed."}
+    assert got[3] is None and got[4] is None  # starting to work, or no change, does not notify
