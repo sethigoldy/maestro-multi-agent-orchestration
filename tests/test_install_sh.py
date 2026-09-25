@@ -82,7 +82,7 @@ case "$1 $2" in
   "daemon restart") mkdir -p "$FAKE_STATE_DIR"; touch "$FAKE_STATE_DIR/running"; echo "Maestro daemon restarted" ;;
   "daemon stop") rm -f "$FAKE_STATE_DIR/running"; echo "stopped" ;;
   "agents list") echo '[{"name":"codex","display_name":"Codex"},{"name":"claude_code","display_name":"Claude Code"}]' ;;
-  "skill status") echo '[{"kind":"codex","display_name":"Codex","installed":true},{"kind":"claude_code","display_name":"Claude Code","installed":false}]' ;;
+  "skill status") echo '[{"kind":"codex","display_name":"Codex","installed":true,"subagent_installed":true,"subagent_path":"/fake/home/.codex/agents/maestro-worker.toml"},{"kind":"claude_code","display_name":"Claude Code","installed":false}]' ;;
   *) echo "maestro-stub" ;;
 esac
 """,
@@ -168,6 +168,7 @@ def test_fresh_install_end_to_end(fake_env: FakeEnv):
     assert "✓ running" in out and "PID: 4242" in out and "URL: http://127.0.0.1:8790" in out
     assert "✓ Codex" in out and "✓ Claude Code" in out
     assert "maestro-driven-development" in out
+    assert "✓ Codex subagent maestro_worker (/fake/home/.codex/agents/maestro-worker.toml)" in out
 
     # Install layout (feature 8).
     install_root = fake_env.home / ".local" / "share" / "maestro"

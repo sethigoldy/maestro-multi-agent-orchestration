@@ -10,7 +10,9 @@ Mechanisms (all under the user's home directory, never system paths):
 
 - Claude Code: global Agent Skill at ``~/.claude/skills/maestro-driven-development/SKILL.md``
 - Codex: managed block in ``~/.codex/AGENTS.md`` (global instructions; a block left
-  in the legacy ``~/.codex/instructions.md`` by older releases is removed)
+  in the legacy ``~/.codex/instructions.md`` by older releases is removed), plus the
+  custom agent ``~/.codex/agents/maestro-worker.toml``, which a Codex session spawns
+  so that each Maestro task shows in Codex's subagent panel
 - GitHub Copilot CLI: managed block in ``~/.copilot/instructions.md``
 - Cursor: global user rule at ``~/.cursor/rules/maestro-driven-development.mdc``
 - Hermes: managed block in ``~/.hermes/instructions.md``
@@ -46,6 +48,25 @@ def skill_source() -> Path:
 
 def load_skill_content() -> str:
     return skill_source().read_text(encoding="utf-8")
+
+
+#: Role name of the Codex custom agent that runs one Maestro task as a subagent.
+CODEX_AGENT_NAME = "maestro_worker"
+
+#: First line of the Codex agent file. Maestro only rewrites or removes a file
+#: at that path when it starts with this line, so a file the user wrote there
+#: is never touched.
+_CODEX_AGENT_MARKER = "# Managed by Maestro."
+
+
+def codex_agent_source() -> Path:
+    """Path of the packaged Codex custom agent file (``maestro_worker``)."""
+    return skill_source().parent / "codex-maestro-worker.toml"
+
+
+def codex_subagents_source() -> Path:
+    """Path of the Codex-only skill section that tells Codex to use ``maestro_worker``."""
+    return skill_source().parent / "codex-subagents.md"
 
 
 def _strip_frontmatter(text: str) -> str:
@@ -212,6 +233,13 @@ class CodexIntegration(_BlockIntegration):
     which current Codex CLIs do not read. Installing or uninstalling therefore
     also removes a managed block left in that legacy file, and deletes the
     legacy file when the block was all it held.
+
+    Codex also gets the custom agent ``maestro_worker`` in
+    ``~/.codex/agents/maestro-worker.toml`` and a Codex-only section in its
+    block that tells Codex to spawn that agent for each Maestro task. Codex
+    shows a thread in its subagent panel only when Codex spawned it, so this
+    is how a Maestro task appears there. Maestro rewrites or removes the agent
+    file only when it starts with Maestro's marker line.
     """
 
     kind = "codex"
@@ -246,12 +274,69 @@ class CodexIntegration(_BlockIntegration):
             return f"cannot clean the legacy block from {path}: {exc}"
         return None
 
+    def agent_path(self, home: Path) -> Path:
+        return home / ".codex" / "agents" / "maestro-worker.toml"
+
+    def _agent_file(self, home: Path) -> tuple[str, str]:
+        """Return (state, text) for the Codex agent file.
+
+        The state is ``absent``, ``managed`` (the file starts with Maestro's
+        marker line) or ``foreign``. A file that cannot be read counts as
+        foreign, because Maestro cannot tell who wrote it and must leave it alone.
+        """
+        path = self.agent_path(home)
+        if not path.exists():
+            return "absent", ""
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return "foreign", ""
+        return ("managed", text) if text.startswith(_CODEX_AGENT_MARKER) else ("foreign", "")
+
+    def _install_agent_file(self, home: Path) -> tuple[bool, str | None]:
+        """Write the Codex agent file; return (changed, error text or None)."""
+        path = self.agent_path(home)
+        state, existing = self._agent_file(home)
+        if state == "foreign":
+            return False, (
+                f"did not write {path}: a file that Maestro did not write is already there. "
+                "Move it away and run `maestro skill install` again."
+            )
+        content = codex_agent_source().read_text(encoding="utf-8")
+        if existing == content:
+            return False, None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return False, f"cannot write {path}: {exc}"
+        return True, None
+
+    def _remove_agent_file(self, home: Path) -> tuple[bool, str | None]:
+        """Remove the Codex agent file if Maestro wrote it; return (removed, error text or None)."""
+        if self._agent_file(home)[0] != "managed":
+            return False, None
+        path = self.agent_path(home)
+        try:
+            path.unlink()
+        except OSError as exc:
+            return False, f"cannot remove {path}: {exc}"
+        return True, None
+
     def install_skill(self, home: Path, content: str) -> IntegrationResult:
-        result = super().install_skill(home, content)
-        if result.ok:
-            error = self._remove_legacy_block(home)
-            if error:
-                return IntegrationResult(self.kind, self.display_name, False, "error", error, result.path)
+        section = codex_subagents_source().read_text(encoding="utf-8")
+        result = super().install_skill(home, f"{content.rstrip()}\n\n{section.strip()}")
+        if not result.ok:
+            return result
+        error = self._remove_legacy_block(home)
+        if error:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error, result.path)
+        changed, error = self._install_agent_file(home)
+        if error:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error, str(self.agent_path(home)))
+        result.detail = f"{result.detail}; subagent {CODEX_AGENT_NAME} in {self.agent_path(home)}"
+        if changed and result.action == "already-installed":
+            result.action = "installed"  # the block was there, the agent file is new or updated
         return result
 
     def uninstall_skill(self, home: Path) -> IntegrationResult:
@@ -262,8 +347,15 @@ class CodexIntegration(_BlockIntegration):
         error = self._remove_legacy_block(home)
         if error:
             return IntegrationResult(self.kind, self.display_name, False, "error", error, str(self.legacy_path(home)))
+        agent_removed, error = self._remove_agent_file(home)
+        if error:
+            return IntegrationResult(self.kind, self.display_name, False, "error", error, str(self.agent_path(home)))
         if had_legacy and result.action == "skipped":
             return IntegrationResult(self.kind, self.display_name, True, "uninstalled", "legacy instructions block removed", str(self.legacy_path(home)))
+        if agent_removed and result.action == "skipped":
+            return IntegrationResult(self.kind, self.display_name, True, "uninstalled", "subagent file removed", str(self.agent_path(home)))
+        if agent_removed:
+            result.detail = f"{result.detail}; subagent file removed"
         return result
 
     def status(self, home: Path) -> dict[str, Any]:
@@ -271,6 +363,8 @@ class CodexIntegration(_BlockIntegration):
         # A block in the legacy file is not read by Codex, so it does not count
         # as installed; it is reported separately so uninstall can clean it.
         info["legacy_installed"] = self._legacy_block_present(home)
+        info["subagent_path"] = str(self.agent_path(home))
+        info["subagent_installed"] = self._agent_file(home)[0] == "managed"
         return info
 
 
@@ -595,7 +689,7 @@ class SkillManager:
             state = integration.status(self.home)
             # A file that cannot be read may still hold the block, so it is
             # included; its uninstall reports the problem and leaves it alone.
-            if state["installed"] or state.get("legacy_installed") or state.get("error"):
+            if state["installed"] or state.get("legacy_installed") or state.get("subagent_installed") or state.get("error"):
                 results.append(integration.uninstall_skill(self.home))
         return results
 

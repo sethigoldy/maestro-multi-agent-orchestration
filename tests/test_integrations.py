@@ -138,13 +138,20 @@ def test_block_install_read_error(tmp_path, monkeypatch):
     path = integration.instructions_path(home)
     path.parent.mkdir(parents=True)
     path.write_text("user content\n", encoding="utf-8")
+    real_read_text = Path.read_text
 
-    def _boom(*a, **k):
-        raise OSError("read denied")
+    # Only the user's instructions file fails; Maestro's packaged files
+    # (the Codex subagent section and agent file) still read normally.
+    def _boom(self, *a, **k):
+        if self == path:
+            raise OSError("read denied")
+        return real_read_text(self, *a, **k)
 
     monkeypatch.setattr(Path, "read_text", _boom)
     result = integration.install_skill(home, CONTENT)
     assert result.ok is False and result.action == "error"
+    monkeypatch.undo()
+    assert path.read_text(encoding="utf-8") == "user content\n"  # left unchanged
 
 
 def test_block_install_write_error(tmp_path, monkeypatch):

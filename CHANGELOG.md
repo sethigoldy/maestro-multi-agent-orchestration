@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Maestro tasks can show in Codex's subagent panel.** Codex lists a thread in its subagent panel only when Codex started it with its `spawn_agent` tool, and Maestro runs Codex tasks with `codex exec`, so they appeared as separate sessions, if at all. `maestro skill install` (and so `install.sh`) now also writes a Codex custom agent, `maestro_worker`, to `~/.codex/agents/maestro-worker.toml`, and adds a Codex-only section to the `~/.codex/AGENTS.md` block. The section tells Codex to spawn one `maestro_worker` for each Maestro task. The worker runs `maestro delegate`, waits, answers follow-ups with `maestro task continue` and passed-on answers with `maestro task answer`, and reports the task id, state, run directory and branch. It never writes code, never spawns another agent, and stops if `MAESTRO_AGENT_CONTEXT` is set. The panel shows the worker and its `maestro` commands, not the live output of the agent Maestro runs. When `spawn_agent` or `maestro_worker` is not available, Codex uses the CLI as before. Maestro rewrites or removes the file only when it starts with `# Managed by Maestro.`; a file of your own at that path is reported as an error and left alone. `maestro skill status` shows `subagent_installed` and `subagent_path` for Codex, and the installer summary lists the agent.
+
 ## [0.16.2] — 2026-09-25
 
 ### Fixed

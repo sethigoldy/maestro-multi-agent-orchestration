@@ -43,7 +43,10 @@ curl -fsSL https://raw.githubusercontent.com/sethigoldy/maestro-multi-agent-orch
 4. **installs the global `maestro-driven-development` skill** into every
    detected agent, using each agent's own global instruction/skill mechanism
    (e.g. `~/.claude/skills/…` for Claude Code, a managed block in
-   `~/.codex/AGENTS.md` for Codex, a global rule for Cursor).
+   `~/.codex/AGENTS.md` for Codex, a global rule for Cursor). For Codex it
+   also writes the custom agent `~/.codex/agents/maestro-worker.toml`, so each
+   Maestro task that Codex starts shows in Codex's subagent panel (see
+   [Maestro tasks in the Codex subagent panel](#maestro-tasks-in-the-codex-subagent-panel)).
 5. **starts the daemon in the background** (`maestro daemon start`) and
    verifies it is healthy before printing a summary of what it did.
 
@@ -156,6 +159,39 @@ maestro skill install --all          # every supported agent, even undetected
 maestro skill uninstall              # remove everywhere it is installed
 maestro skill uninstall --agent codex
 ```
+
+### Maestro tasks in the Codex subagent panel
+
+Codex lists a thread in its subagent panel only when Codex itself started it
+with its `spawn_agent` tool. A task that Maestro runs is a separate process, so
+Codex cannot show it there directly. To make Maestro tasks visible, the
+installer gives Codex a custom agent named `maestro_worker`, in
+`~/.codex/agents/maestro-worker.toml`, and adds a Codex-only section to the
+`~/.codex/AGENTS.md` block that tells Codex to use it.
+
+When Codex routes work through Maestro, it spawns one `maestro_worker` for each
+task. The worker runs `maestro delegate`, waits for the task, and reports the
+task id, final state, run directory and branch back to the Codex session. The
+worker does not write code; the agent that Maestro chooses does. In the
+subagent panel you see the worker, its status and its `maestro` commands. You
+do not see the live output of the agent that Maestro runs; `maestro task tail
+<task-id>` and the web console show that.
+
+What to expect:
+
+- The worker is a Codex thread, so it uses a small amount of model time to run
+  the commands and report the result.
+- Codex's own limits on how many subagents run at once still apply.
+- If Codex has no `spawn_agent` tool, or does not list `maestro_worker`, Codex
+  runs `maestro delegate` itself, as before.
+- Maestro rewrites or removes `~/.codex/agents/maestro-worker.toml` only when
+  the file starts with the line `# Managed by Maestro.`. If you put a file of
+  your own at that path, `maestro skill install` reports an error for Codex and
+  leaves your file alone.
+
+`maestro skill status` reports the file as `subagent_installed` and
+`subagent_path` in the Codex entry. `maestro skill uninstall --agent codex`
+removes it together with the `AGENTS.md` block.
 
 To **disable** the global integration without uninstalling Maestro, run
 `maestro skill uninstall` — agents go back to their normal behavior and nothing
