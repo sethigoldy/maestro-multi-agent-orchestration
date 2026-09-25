@@ -6,6 +6,16 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **Act on tasks from the web console.** The console at `http://127.0.0.1:9785/` could only show tasks, so a parked task had to be answered from the CLI or an MCP client. A "Needs you" strip now lists every task waiting for input, with its question and a way to answer it. For "which agent?" questions it offers a picker of the registered agents and of agent CLIs installed on PATH, with an optional model. Sensitive-workspace approvals get Approve and Cancel buttons. Agent questions and failed checks get a text box. The detail pane shows the actions the task's state allows: Cancel, Follow-up, Remove worktree and Rename branch. The daemon's message is shown when it refuses. The console calls the same JSON-RPC methods as the CLI and MCP, so the daemon's existing rules against requests from other web pages cover every action. The design is in `docs/design-console.md`.
+- **Task metadata for acting on tasks.** A2A task metadata (and so `tasks/get`, `GET /tasks` and the MCP results) now includes `question` and `awaiting` for a parked task, `run_dir_kind`, `queued`, `queue_reason` for a queued task, and `started_at`. The `agents/list` JSON-RPC result also has a `discovered` list: agent CLIs on PATH that are not registered, which the daemon can still run.
+
+### Fixed
+
+- **A new task branch is announced.** The daemon published a `branch` event only when a task's branch was renamed, so the console and the terminal dashboard learned a new task's branch only on their next full reload. It now also publishes one when the branch is first created.
+- **The console's receipt updates when the task's state changes.** It loaded once, when a task was selected, and kept showing "Final: WORKING" after the task finished or was canceled.
+
 ## [0.15.1] — 2026-09-25
 
 ### Fixed

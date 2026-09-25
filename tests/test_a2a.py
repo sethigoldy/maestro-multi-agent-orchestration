@@ -356,3 +356,12 @@ def test_cleanup_method():
     assert no_id["error"]["code"] == ERR_INVALID_PARAMS
     bad_force = dispatcher.handle(_req("tasks/cleanup", {"id": "task-1", "force": "yes"}))
     assert bad_force["error"]["code"] == ERR_INVALID_PARAMS
+
+
+def test_agents_list_without_discovery_returns_only_registered_agents():
+    class Registered:
+        def agents(self):
+            return [{"name": "codex"}]
+
+    resp = A2ADispatcher(Registered()).handle(_req("agents/list", {}))
+    assert resp["result"] == {"agents": [{"name": "codex"}]}

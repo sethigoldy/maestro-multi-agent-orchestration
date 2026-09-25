@@ -1232,9 +1232,9 @@ class MaestroDaemon:
             if record is not None:
                 record["branch"] = branch
             self.maestro._write_claim(task_id, "task_branch", branch)
-            if recorded and branch != recorded:
-                # The branch was renamed by hand since the last turn and this
-                # turn adopted the new name: tell every view.
+            if branch != recorded:
+                # A new task branch, or one renamed by hand since the last turn
+                # that this turn adopted: tell every view.
                 self.bus.publish(TaskEvent(task_id=task_id, type="branch", data={"old_branch": recorded, "branch": branch}))
         self._record_turn_baseline(task_id, run_dir, doc)
         chain = [doc.target_agent] + [a for a in doc.fallback if a != doc.target_agent]
@@ -2507,6 +2507,7 @@ class MaestroDaemon:
             error = record.get("error")
             gates = record.get("gates")
             bounces = record.get("bounces")
+            live = record
         else:  # durable fallback for tasks from earlier daemon runs
             claims = self.maestro._claims(task_id)
             runtime = _runtime_from_claims(claims)
@@ -2528,6 +2529,7 @@ class MaestroDaemon:
             error = runtime.get("error")
             gates = runtime.get("gates")
             bounces = runtime.get("bounces")
+            live = runtime
         artifacts: list[dict[str, Any]] = []
         task_dir = self.state_dir / "tasks" / task_id
         if task_dir.is_dir():
@@ -2547,6 +2549,15 @@ class MaestroDaemon:
             "error": error,
         }
         run_dir_kind = record.get("run_dir_kind") if record is not None else claims.get("task_run_dir_kind")
+        # What the console needs to act on the task (docs/design-console.md).
+        metadata["run_dir_kind"] = run_dir_kind or "workspace"
+        metadata["queued"] = bool(live.get("queued"))
+        metadata["started_at"] = live.get("started_at")
+        if state == STATE_INPUT_REQUIRED:
+            metadata["question"] = live.get("question")
+            metadata["awaiting"] = live.get("awaiting")
+        if record is not None and record.get("queued"):
+            metadata["queue_reason"] = self._queue_reason(task_id)
         if run_dir_kind == "worktree" and run_dir and not Path(run_dir).is_dir():
             # Removed by task cleanup or deleted by hand; the next turn creates it again.
             metadata["run_dir_missing"] = True
@@ -2589,6 +2600,19 @@ class MaestroDaemon:
     def agents(self) -> list[dict[str, Any]]:
         """Every registered agent (tokens redacted) with its live availability."""
         return [{**spec.to_dict(redact=True), "status": self.registry.status(spec.name)} for spec in self.registry.list()]
+
+    def discovered_agents(self) -> list[dict[str, Any]]:
+        """Agent CLIs installed on PATH whose kind is not registered.
+
+        The daemon can run them without registration (a routing answer such
+        as "codex" works), so the console offers them in its agent picker."""
+        registered = {spec.kind for spec in self.registry.list()}
+        return [
+            {"name": item["kind"], "kind": item["kind"], "display_name": item.get("display_name"),
+             "registered": False, "status": {"found": True, "path": item.get("path")}}
+            for item in self.registry.discover()
+            if item.get("found") and item["kind"] not in registered
+        ]
 
     def current_state(self, task_id: str) -> str | None:
         """The task's state without building its full status, or None for an unknown task."""
