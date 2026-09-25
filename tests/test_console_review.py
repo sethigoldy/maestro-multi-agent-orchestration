@@ -165,3 +165,24 @@ def test_a_run_dir_that_git_cannot_compare_says_why(daemon, tmp_path, binpath):
     shutil.rmtree(ws / ".git")  # the directory is still there, but it is no longer a repository
     diff = daemon.task_diff(started["task_id"])
     assert diff["available"] is False and "git could not compare" in diff["reason"]
+
+
+def test_workspaces_route(daemon, tmp_path, binpath):
+    ws = _repo(tmp_path)
+    started = daemon.delegate(_doc(), ws)
+    daemon.wait(started["task_id"], timeout=60)
+    status, body = _get(daemon, "/workspaces")
+    assert status == 200 and [w["workspace"] for w in body["workspaces"]] == [str(ws)]
+    assert body["workspaces"][0]["finished"] == 1
+
+
+def test_system_reports_the_daemon_and_budgets(daemon, tmp_path, binpath, monkeypatch):
+    from maestro import VERSION
+
+    monkeypatch.setenv("MAESTRO_BUDGET_DAILY_USD", "5")
+    status, body = _get(daemon, "/system")
+    assert status == 200
+    assert body["version"] == VERSION and body["pid"] == os.getpid() and body["port"] == daemon.port
+    assert body["state_dir"] == str(daemon.state_dir) and body["bind"] == "127.0.0.1"
+    assert body["uptime_s"] >= 0 and body["started_at"]
+    assert body["budgets"] == {"per_agent_usd": None, "daily_usd": 5.0, "spent_today_usd": 0.0, "spent_by_agent": {}}

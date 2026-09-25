@@ -1,10 +1,12 @@
-import React, { useCallback, useEffect, useMemo, useReducer, useState } from "react";
-import { loadTasks, connectEvents, normalizeTask, loadOutput } from "./lib/events.js";
+import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { loadTasks, connectEvents, normalizeTask, loadOutput, loadWorkspaces } from "./lib/events.js";
+import { notificationFor } from "./lib/overview.js";
+import TaskList from "./components/TaskList.jsx";
 import { rpc } from "./lib/rpc.js";
 import { needsYou } from "./lib/actions.js";
-import TaskCard from "./components/TaskCard.jsx";
 import DetailPane from "./components/DetailPane.jsx";
 import NeedsYou from "./components/NeedsYou.jsx";
+import SystemView from "./components/SystemView.jsx";
 
 const TRANSCRIPT_CAP = 2000;
 
@@ -67,6 +69,28 @@ function reducer(state, action) {
 export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, emptyState);
   const [agents, setAgents] = useState({ agents: [], discovered: [] });
+  const [workspaces, setWorkspaces] = useState([]);
+  const [filters, setFilters] = useState(() => readSetting("maestro_filters", {}));
+  const [notify, setNotify] = useState(() => readSetting("maestro_notify", false));
+  const [showSystem, setShowSystem] = useState(false);
+  // The latest state and settings, for the event handlers set up once below.
+  const latest = useRef({ state, notify });
+  latest.current = { state, notify };
+
+  useEffect(() => writeSetting("maestro_filters", filters), [filters]);
+  useEffect(() => writeSetting("maestro_notify", notify), [notify]);
+
+  const reloadWorkspaces = useCallback(() => {
+    loadWorkspaces().then(setWorkspaces).catch(() => {});
+  }, []);
+  useEffect(reloadWorkspaces, [reloadWorkspaces]);
+
+  async function toggleNotify() {
+    if (notify) return setNotify(false);
+    if (typeof Notification === "undefined") return window.alert("This browser cannot show notifications.");
+    const permission = await Notification.requestPermission();
+    setNotify(permission === "granted");
+  }
 
   // Re-read one task from the daemon: after an action, and on every state
   // change, so the page shows the current question, queue reason and run dir.
@@ -89,8 +113,14 @@ export default function App() {
       .catch(() => dispatch({ type: "live", live: false }));
     source = connectEvents({
       state: (taskId, data) => {
+        const before = latest.current.state.tasks[taskId] || { task_id: taskId };
+        const note = notificationFor(before.state, { ...before, state: data.state });
+        if (note && latest.current.notify && typeof Notification !== "undefined" && Notification.permission === "granted") {
+          new Notification(note.title, { body: note.body });
+        }
         dispatch({ kind: "event", taskId, type: "state", data });
         refresh(taskId);
+        reloadWorkspaces();
       },
       output: (taskId, data) => dispatch({ kind: "event", taskId, type: "output", data }),
       usage: (taskId, data) => dispatch({ kind: "event", taskId, type: "usage", data }),
@@ -132,6 +162,20 @@ export default function App() {
             {n} {s}
           </span>
         ))}
+        <button
+          onClick={() => setShowSystem(!showSystem)}
+          title="The daemon, its agents, budget spend and each workspace's config"
+          style={{ font: "inherit", fontSize: 12, padding: "2px 8px", borderRadius: 10, background: "transparent", cursor: "pointer", border: `1px solid ${showSystem ? "var(--accent)" : "var(--border)"}`, color: showSystem ? "var(--text)" : "var(--dim)" }}
+        >
+          system
+        </button>
+        <button
+          onClick={toggleNotify}
+          title="Show a browser notification when a task needs you, completes or fails"
+          style={{ font: "inherit", fontSize: 12, padding: "2px 8px", borderRadius: 10, background: "transparent", cursor: "pointer", border: `1px solid ${notify ? "var(--accent)" : "var(--border)"}`, color: notify ? "var(--text)" : "var(--dim)" }}
+        >
+          notifications {notify ? "on" : "off"}
+        </button>
         <span
           title={state.live ? "event stream connected" : "event stream disconnected"}
           style={{ ...styles.dot, background: state.live ? "var(--ok)" : "var(--err)" }}
@@ -146,21 +190,23 @@ export default function App() {
       />
       <div className="mc-body" style={styles.body}>
         <aside className="mc-list" style={styles.list}>
-          {!state.loaded && <div style={styles.dim}>loading tasks…</div>}
-          {state.loaded && state.order.length === 0 && (
-            <div style={styles.dim}>no tasks yet — delegate one from any agent or the CLI</div>
-          )}
-          {state.order.map((id) => (
-            <TaskCard
-              key={id}
-              task={state.tasks[id]}
-              selected={id === state.selected}
-              onSelect={() => dispatch({ type: "select", taskId: id })}
-            />
-          ))}
+          <TaskList
+            tasks={state.tasks}
+            workspaces={workspaces}
+            filters={filters}
+            setFilters={setFilters}
+            selected={state.selected}
+            onSelect={(taskId) => {
+              setShowSystem(false);
+              dispatch({ type: "select", taskId });
+            }}
+            loaded={state.loaded}
+          />
         </aside>
         <main className="mc-detail" style={styles.detail}>
-          {selectedTask ? (
+          {showSystem ? (
+            <SystemView agents={agents.agents} discovered={agents.discovered} workspaces={workspaces} />
+          ) : selectedTask ? (
             <DetailPane task={selectedTask} onChanged={refresh} />
           ) : (
             <div style={{ ...styles.dim, padding: 24 }}>select a task</div>
@@ -169,6 +215,25 @@ export default function App() {
       </div>
     </div>
   );
+}
+
+// Per-browser settings (filters, notifications). Storage can be unavailable
+// (a private window, blocked site data), so every access is guarded.
+function readSetting(key, fallback) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw === null ? fallback : JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeSetting(key, value) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // not stored; the setting still applies to this page
+  }
 }
 
 export function stateColor(state) {

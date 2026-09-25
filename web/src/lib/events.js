@@ -59,6 +59,14 @@ export function loadDiff(taskId) {
   return getJson(`/tasks/${encodeURIComponent(taskId)}/diff`);
 }
 
+export function loadSystem() {
+  return getJson("/system");
+}
+
+export function loadWorkspaces() {
+  return getJson("/workspaces").then((body) => body.workspaces || []);
+}
+
 export function loadOutput(taskId) {
   return getJson(`/tasks/${encodeURIComponent(taskId)}/output`);
 }

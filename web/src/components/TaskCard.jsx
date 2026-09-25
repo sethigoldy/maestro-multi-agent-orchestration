@@ -41,6 +41,9 @@ export default function TaskCard({ task, selected, onSelect }) {
           <span>${task.usage.cost_usd.toFixed(3)}</span>
         )}
       </div>
+      {task.queued && task.queue_reason && (
+        <div style={{ marginTop: 4, fontSize: 12, color: "var(--warn)" }}>queued: {task.queue_reason}</div>
+      )}
     </button>
   );
 }
