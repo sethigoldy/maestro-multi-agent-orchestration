@@ -30,6 +30,8 @@ const record = {{
   status: {{ state: "completed" }},
   metadata: {{
     title: "T", workspace: "/w", run_dir: "/home/worktrees/task-1", branch: "maestro/task-1",
+    run_dir_kind: "worktree", run_dir_missing: true, queued: true, queue_reason: "busy",
+    question: "which db?", awaiting: "question", started_at: "2026-09-25T10:00:00+00:00",
     origin_agent: "human", target_agent: "codex",
     usage: {{ cost_usd: 0.5 }}, attempts: [{{ agent: "codex" }}], error: null,
   }},
@@ -40,6 +42,10 @@ assert(flat.task_id === "task-1", "task_id");
 assert(flat.state === "completed", "state");
 assert(flat.title === "T", "title");
 assert(flat.run_dir === "/home/worktrees/task-1", "run_dir");
+assert(flat.run_dir_kind === "worktree" && flat.run_dir_missing === true, "run_dir_kind");
+assert(flat.queued === true && flat.queue_reason === "busy", "queue");
+assert(flat.question === "which db?" && flat.awaiting === "question", "question");
+assert(flat.started_at === "2026-09-25T10:00:00+00:00", "started_at");
 assert(flat.usage.cost_usd === 0.5, "usage");
 assert(flat.attempts.length === 1, "attempts");
 const bare = normalizeTask({{ id: "x" }});

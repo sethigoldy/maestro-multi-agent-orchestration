@@ -141,7 +141,10 @@ class A2ADispatcher:
         if method == "tasks/answer":
             return self._answer(request_id, params)
         if method == "agents/list":
-            return jsonrpc_ok(request_id, {"agents": self.daemon.agents()})
+            result = {"agents": self.daemon.agents()}
+            if hasattr(self.daemon, "discovered_agents"):  # a daemon client forwards only the registered list
+                result["discovered"] = self.daemon.discovered_agents()
+            return jsonrpc_ok(request_id, result)
         return jsonrpc_error(request_id, ERR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
     def _send(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 import React from "react";
 import { stateColor } from "../App.jsx";
+import { routeLabel } from "../lib/actions.js";
 
 export default function TaskCard({ task, selected, onSelect }) {
   const state = task.state || "unknown";
@@ -35,7 +36,7 @@ export default function TaskCard({ task, selected, onSelect }) {
       </div>
       <div style={{ display: "flex", gap: 8, marginTop: 4, fontSize: 12, color: "var(--dim)" }}>
         <span>{state}</span>
-        {task.target_agent && <span>→ {task.target_agent}</span>}
+        {routeLabel(task) && <span>{routeLabel(task)}</span>}
         {typeof task.usage?.cost_usd === "number" && (
           <span>${task.usage.cost_usd.toFixed(3)}</span>
         )}

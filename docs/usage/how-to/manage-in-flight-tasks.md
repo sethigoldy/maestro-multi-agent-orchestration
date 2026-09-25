@@ -7,17 +7,19 @@ block until completion. For reading finished state, see
 
 ## Know which interface can do what
 
-| Action | CLI | MCP tools |
-|---|---|---|
-| Watch live output | `maestro task tail <id>` | (console/dashboard) |
-| Answer an agent question | `maestro task answer <id> <answer>` | `answer_task_question` |
-| Send a follow-up instruction | `maestro task continue <id>` | `followup` |
-| Rename a finished task's branch | `maestro task rename-branch <id> <name>` | `rename_task_branch` |
-| Cancel the task | `maestro task cancel <id>` | `cancel_task` |
-| Block until done or input needed | `maestro task tail <id>` (streams to the end) | `task_wait` |
+| Action | CLI | MCP tools | Web console |
+|---|---|---|---|
+| Watch live output | `maestro task tail <id>` | (console/dashboard) | the task's detail pane |
+| Answer an agent question | `maestro task answer <id> <answer>` | `answer_task_question` | the "Needs you" strip |
+| Send a follow-up instruction | `maestro task continue <id>` | `followup` | Follow-up… |
+| Rename a task's branch | `maestro task rename-branch <id> <name>` | `rename_task_branch` | Rename branch… |
+| Remove a task's worktree | `maestro task cleanup <id>` | `cleanup_task_worktree` | Remove worktree |
+| Cancel the task | `maestro task cancel <id>` | `cancel_task` | Cancel task |
+| Block until done or input needed | `maestro task tail <id>` (streams to the end) | `task_wait` | — |
 
-You can steer a task from the shell or from an MCP client. Both go through the
-same running daemon, so an answer or a cancel sent from either one has the same
+You can steer a task from the shell, from an MCP client, or from the web
+console at `http://127.0.0.1:9785/`. All three go through the same running
+daemon, so an answer or a cancel sent from any of them has the same
 effect.
 
 ## Watch a task live

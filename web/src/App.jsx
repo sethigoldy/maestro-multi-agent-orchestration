@@ -1,7 +1,10 @@
-import React, { useEffect, useMemo, useReducer } from "react";
-import { loadTasks, connectEvents } from "./lib/events.js";
+import React, { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import { loadTasks, connectEvents, normalizeTask } from "./lib/events.js";
+import { rpc } from "./lib/rpc.js";
+import { needsYou } from "./lib/actions.js";
 import TaskCard from "./components/TaskCard.jsx";
 import DetailPane from "./components/DetailPane.jsx";
+import NeedsYou from "./components/NeedsYou.jsx";
 
 const TRANSCRIPT_CAP = 2000;
 
@@ -38,6 +41,14 @@ function reducer(state, action) {
       for (const record of action.records) tasks[record.task_id] = record;
       return { ...state, tasks, order: action.records.map((r) => r.task_id), loaded: true };
     }
+    case "upsert": {
+      // A task's full record from the daemon; keep the output already streamed.
+      const record = action.record;
+      const existing = state.tasks[record.task_id] || {};
+      const merged = { ...existing, ...record, transcript: existing.transcript };
+      const order = state.order.includes(record.task_id) ? state.order : [record.task_id, ...state.order];
+      return { ...state, tasks: { ...state.tasks, [record.task_id]: merged }, order };
+    }
     case "select":
       return { ...state, selected: action.taskId };
     case "live":
@@ -49,6 +60,21 @@ function reducer(state, action) {
 
 export default function App() {
   const [state, dispatch] = useReducer(reducer, undefined, emptyState);
+  const [agents, setAgents] = useState({ agents: [], discovered: [] });
+
+  // Re-read one task from the daemon: after an action, and on every state
+  // change, so the page shows the current question, queue reason and run dir.
+  const refresh = useCallback((taskId) => {
+    rpc("tasks/get", { id: taskId })
+      .then((result) => result && result.task && dispatch({ type: "upsert", record: normalizeTask(result.task) }))
+      .catch(() => {}); // the daemon went away or forgot the task: keep what is shown
+  }, []);
+
+  useEffect(() => {
+    rpc("agents/list", {})
+      .then((result) => setAgents({ agents: (result && result.agents) || [], discovered: (result && result.discovered) || [] }))
+      .catch(() => setAgents({ agents: [], discovered: [] }));
+  }, []);
 
   useEffect(() => {
     let source = null;
@@ -56,7 +82,10 @@ export default function App() {
       .then((records) => dispatch({ type: "load", records }))
       .catch(() => dispatch({ type: "live", live: false }));
     source = connectEvents({
-      state: (taskId, data) => dispatch({ kind: "event", taskId, type: "state", data }),
+      state: (taskId, data) => {
+        dispatch({ kind: "event", taskId, type: "state", data });
+        refresh(taskId);
+      },
       output: (taskId, data) => dispatch({ kind: "event", taskId, type: "output", data }),
       usage: (taskId, data) => dispatch({ kind: "event", taskId, type: "usage", data }),
       branch: (taskId, data) => dispatch({ kind: "event", taskId, type: "branch", data }),
@@ -76,6 +105,7 @@ export default function App() {
   }, [state]);
 
   const selectedTask = state.selected ? state.tasks[state.selected] : null;
+  const waiting = needsYou(state.tasks);
 
   return (
     <div>
@@ -93,6 +123,13 @@ export default function App() {
           style={{ ...styles.dot, background: state.live ? "var(--ok)" : "var(--err)" }}
         />
       </header>
+      <NeedsYou
+        tasks={waiting}
+        agents={agents.agents}
+        discovered={agents.discovered}
+        onSelect={(taskId) => dispatch({ type: "select", taskId })}
+        onDone={refresh}
+      />
       <div style={styles.body}>
         <aside style={styles.list}>
           {!state.loaded && <div style={styles.dim}>loading tasks…</div>}
@@ -110,7 +147,7 @@ export default function App() {
         </aside>
         <main style={styles.detail}>
           {selectedTask ? (
-            <DetailPane task={selectedTask} />
+            <DetailPane task={selectedTask} onChanged={refresh} />
           ) : (
             <div style={{ ...styles.dim, padding: 24 }}>select a task</div>
           )}

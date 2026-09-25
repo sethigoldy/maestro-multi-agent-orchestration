@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { stateColor } from "../App.jsx";
 import { loadReceipt } from "../lib/events.js";
+import ActionBar from "./ActionBar.jsx";
 
 function Meta({ label, value }) {
   if (value === null || value === undefined || value === "") return null;
@@ -12,7 +13,7 @@ function Meta({ label, value }) {
   );
 }
 
-export default function DetailPane({ task }) {
+export default function DetailPane({ task, onChanged }) {
   const state = task.state || "unknown";
   const attempts = task.attempts || [];
   const transcript = task.transcript || [];
@@ -49,12 +50,15 @@ export default function DetailPane({ task }) {
           <Meta label="cost" value={`$${task.usage.cost_usd.toFixed(4)}`} />
         )}
         {task.question && <Meta label="question" value={task.question} />}
+        {task.queued && <Meta label="waiting because" value={task.queue_reason} />}
         {task.error && (
           <div style={{ marginTop: 6, color: "var(--err)", whiteSpace: "pre-wrap" }}>
             {task.error}
           </div>
         )}
       </div>
+
+      <ActionBar key={task.task_id} task={task} onDone={onChanged || (() => {})} />
 
       {attempts.length > 0 && (
         <div style={{ padding: "10px 16px", borderBottom: "1px solid var(--border)" }}>
@@ -80,7 +84,7 @@ export default function DetailPane({ task }) {
         </div>
       )}
 
-      <ReceiptPanel taskId={task.task_id} />
+      <ReceiptPanel taskId={task.task_id} state={task.state} />
 
       <pre
         ref={scrollRef}
@@ -108,7 +112,7 @@ export default function DetailPane({ task }) {
 
 // Durable execution receipt for the selected task (GET /tasks/<id>/receipt):
 // the IMPLEMENT/VERIFY/REVIEW/FIX chain, final verification, and final state.
-function ReceiptPanel({ taskId }) {
+function ReceiptPanel({ taskId, state }) {
   const [receipt, setReceipt] = useState(null);
 
   useEffect(() => {
@@ -122,7 +126,7 @@ function ReceiptPanel({ taskId }) {
     return () => {
       cancelled = true;
     };
-  }, [taskId]);
+  }, [taskId, state]); // reload when the task's state changes, so "Final" is current
 
   if (!receipt) return null;
   const attempts = receipt.attempts || [];
