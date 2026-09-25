@@ -276,14 +276,14 @@ python3.11 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\Activate.ps1
 python -m pip install -U pip
 python -m pip install .            # or: python -m pip install -e . for development
-maestro --version                  # → 0.16.0
+maestro --version                  # → 0.16.1
 ```
 
 > **Note on the name:** `maestro` is already taken on PyPI by an unrelated
 > project (a VLM fine-tuning library). This package is **not published to
 > PyPI**; install it from this repository (as above), from a release artifact
 > attached to a [GitHub Release](https://github.com/sethigoldy/maestro-multi-agent-orchestration/releases)
-> (`pip install maestro-0.16.0-py3-none-any.whl`), or from a locally built wheel
+> (`pip install maestro-0.16.1-py3-none-any.whl`), or from a locally built wheel
 > (`python -m build`). The CLI command stays `maestro`.
 
 ### 2. Check your environment

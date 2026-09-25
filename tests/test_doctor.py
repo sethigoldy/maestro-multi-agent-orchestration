@@ -451,7 +451,7 @@ def test_cli_doctor_human_and_json(home, tmp_path, capsys):
 
 def test_format_doctor_synthetic_branches():
     base = {
-        "maestro": {"version": "0.16.0"},
+        "maestro": {"version": "0.16.1"},
         "python": {"version": "3.11", "executable": "/x/python"},
         "system": {"os": "darwin", "arch": "arm64"},
         "state": {"dir": "/s", "exists": True, "writable": True, "config_paths": ["/s/config.toml"], "storage_backend": None},
