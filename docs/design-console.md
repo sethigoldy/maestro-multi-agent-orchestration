@@ -81,7 +81,11 @@ system) sit behind the same token check as `/tasks`.
   with `truncated: true` when there was more.
 - `GET /tasks/<id>/verification` returns the text of the last verification
   report.
+- `GET /tasks/<id>/output` returns the latest 2000 lines of the task's agent
+  logs, because the event stream carries output only while it happens and a
+  page opened later would otherwise show none.
 - The detail pane gets tabs: Output, Changes, Verification, Receipt.
+- Below 760 pixels wide, the task list goes above the detail pane.
 
 ## 6. See what needs you
 
