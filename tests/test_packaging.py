@@ -101,7 +101,7 @@ def test_installed_maestro_mcp_speaks_mcp_over_stdio():
 
 def test_version_is_090_and_single_sourced():
     data = _pyproject()
-    assert data["project"]["version"] == "0.16.0"
+    assert data["project"]["version"] == "0.16.1"
     from maestro import VERSION
 
     assert VERSION == data["project"]["version"], (
