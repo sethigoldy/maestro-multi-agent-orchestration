@@ -6,6 +6,8 @@ semantic versioning.
 
 ## [Unreleased]
 
+## [0.16.2] — 2026-09-25
+
 ### Fixed
 
 - **A task can have as many follow-ups as it needs.** Every follow-up spent one unit of the task's delegation depth (`max_depth_remaining`, 3 by default), so the third follow-up of any task was refused with "Max delegation depth exceeded". On 2026-09-25 a Codex session reviewing its tasks hit this on its third review round and fell back to editing the task branches itself, outside Maestro. The depth budget limits tasks whose agents delegate further tasks; a follow-up is another turn of the same task. Follow-ups now neither spend nor check it, and tasks whose budget earlier follow-ups used up can be followed up again.
