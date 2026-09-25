@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -303,6 +304,7 @@ class BaseAdapter:
             )
         except (OSError, ValueError) as exc:
             return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")
+        _register_agent(task_id, process)
         line_q: "_queue.Queue[str | None]" = _queue.Queue()
 
         def _reader() -> None:
@@ -544,6 +546,7 @@ class BaseAdapter:
             )
         except (OSError, ValueError) as exc:
             return AdapterResult(ok=False, error=f"Failed to launch agent {self.kind!r}: {exc}")
+        _register_agent(task_id, process)
 
         def _send(obj: dict[str, Any]) -> None:
             # stdin is always a PIPE in rpc mode; writes can still fail once the
@@ -809,6 +812,38 @@ def _exit_watch(process: subprocess.Popen) -> Callable[[], bool]:
 # new process makes itself the leader of a group with that id. That needs the
 # whole pid range to wrap within microseconds, and the window is only the time
 # between two system calls.
+
+
+# Agent processes by task id, so the daemon can stop the ones it started when
+# it stops (stop_task_agents). An entry is dropped once its process group is
+# gone; the adapter stops the group itself at the end of every run.
+_AGENTS_LOCK = threading.Lock()
+_AGENTS: dict[str, list[subprocess.Popen]] = {}
+
+
+def _register_agent(task_id: str, process: subprocess.Popen) -> None:
+    with _AGENTS_LOCK:
+        for key in list(_AGENTS):
+            _AGENTS[key] = [p for p in _AGENTS[key] if _group_alive(p)]
+            if not _AGENTS[key]:
+                del _AGENTS[key]
+        _AGENTS.setdefault(task_id, []).append(process)
+
+
+def stop_task_agents(task_ids: list[str]) -> int:
+    """Stop the agent process groups started for these tasks, and every
+    process in them, with the same SIGTERM, grace, SIGKILL steps as a
+    timeout or cancel. Processes started for other tasks are not touched.
+    The groups are stopped at the same time, so the whole call takes at most
+    about one grace period. Returns how many groups were stopped."""
+    with _AGENTS_LOCK:
+        processes = [p for task_id in task_ids for p in _AGENTS.pop(task_id, []) if _group_alive(p)]
+    threads = [threading.Thread(target=_kill_group, args=(p,), daemon=True) for p in processes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return len(processes)
 
 
 def _group_alive(process: subprocess.Popen) -> bool:

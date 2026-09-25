@@ -516,13 +516,24 @@ class MaestroDaemon:
         # exits, no thread remains to drive them to a terminal state, and their
         # durable status must not keep claiming "working". Parked (input-required)
         # tasks are left for the next daemon; already-terminal ones need nothing.
+        running: list[str] = []
         for task_id, record in list(self._tasks.items()):
             if record.get("state") in TERMINAL_STATES or record.get("state") == STATE_INPUT_REQUIRED:
                 continue
+            running.append(task_id)
+            flag = self._cancel_flags.get(task_id)
+            if flag is not None:
+                flag.set()  # the turn stops here: no retry or next agent starts
             try:
                 self._set_state(task_id, STATE_FAILED, error="daemon stopped while the task was running; re-delegate, or continue this task to resume.")
             except Exception:
                 traceback.print_exc(file=sys.stderr)
+        # Stop the agents those turns started, and everything they started,
+        # so none keeps running after the daemon is gone. Only this daemon's
+        # tasks are stopped; other processes are left alone.
+        from .adapters.base import stop_task_agents
+
+        stop_task_agents(running)
         if self._presence is not None:
             self._presence.stop()
             self._presence = None

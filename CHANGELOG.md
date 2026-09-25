@@ -6,6 +6,10 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stopping the daemon stops the agents it started.** `maestro daemon stop`, `maestro daemon restart` and stopping `maestro-daemon` marked each running task as failed, but left its agent running with no daemon to report to. On 2026-09-25 an agent kept running after its daemon had stopped. The daemon now cancels its running turns first, so no retry starts a new agent, and then stops each of those agents' process groups, including anything the agent started. It sends SIGTERM, gives the processes the same grace period a timeout or a cancel gives them, and then sends SIGKILL. Only the processes this daemon started for its own tasks are stopped; other processes, including agents started by another daemon, are left alone.
+
 ## [0.16.0] — 2026-09-25
 
 ### Added
